@@ -322,6 +322,9 @@ members = [
 [profile.release]
 lto = "fat"
 codegen-units = 1
+debug = 2            # DWARF line info embedded in the binary
+strip = false        # do NOT strip symbols (keep everything)
+panic = "unwind"     # nicer stacks for perf/profilers
 
 # Inherit from release, because we are not rebuilding often,
 # and we don't want the huge binary sizes from debug builds.
