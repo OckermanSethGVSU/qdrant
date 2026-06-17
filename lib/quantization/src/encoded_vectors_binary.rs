@@ -1,17 +1,21 @@
 use std::alloc::Layout;
+use std::borrow::Cow;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::fs::atomic_save_json;
+use common::mmap::MmapFlusher;
+#[expect(deprecated, reason = "legacy code")]
+use common::mmap::{transmute_from_u8_to_slice, transmute_to_u8_slice};
 use common::typelevel::True;
 use common::types::PointOffsetType;
-use io::file_operations::atomic_save_json;
-use memory::mmap_ops::{transmute_from_u8_to_slice, transmute_to_u8_slice};
-use memory::mmap_type::MmapFlusher;
+use fs_err as fs;
 use serde::{Deserialize, Serialize};
 use strum::EnumIter;
 
+use crate::encoded_storage::validate_storage_vector_size;
 use crate::encoded_vectors::validate_vector_parameters;
 use crate::vector_stats::{VectorElementStats, VectorStats};
 use crate::{
@@ -283,6 +287,23 @@ impl BitsStoreType for u128 {
     fn xor_popcnt(v1: &[Self], v2: &[Self]) -> usize {
         debug_assert!(v1.len() == v2.len());
 
+        #[cfg(target_arch = "x86_64")]
+        if is_x86_feature_detected!("avx512vl")
+            && is_x86_feature_detected!("avx512vpopcntdq")
+            && is_x86_feature_detected!("avx2")
+            && is_x86_feature_detected!("avx")
+            && is_x86_feature_detected!("sse4.1")
+            && is_x86_feature_detected!("sse2")
+        {
+            unsafe {
+                return impl_xor_popcnt_avx512_uint128(
+                    v1.as_ptr().cast::<u8>(),
+                    v2.as_ptr().cast::<u8>(),
+                    v1.len() as u32,
+                ) as usize;
+            }
+        }
+
         #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
         if is_x86_feature_detected!("sse4.2") {
             unsafe {
@@ -427,7 +448,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         };
 
         let vector_stats = if storage_encoding_needs_states || query_encoding_needs_stats {
-            Some(VectorStats::build(orig_data.clone(), vector_parameters))
+            Some(VectorStats::build(orig_data.clone(), vector_parameters.dim))
         } else {
             None
         };
@@ -439,7 +460,9 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
 
             let encoded_vector = Self::encode_vector(vector.as_ref(), &vector_stats, encoding);
             let encoded_vector_slice = encoded_vector.encoded_vector.as_slice();
-            let bytes = transmute_to_u8_slice(encoded_vector_slice);
+            // TODO Safety: bytemuck::Pod type, but is it enough for slice?
+            #[expect(deprecated, reason = "legacy code")]
+            let bytes = unsafe { transmute_to_u8_slice(encoded_vector_slice) };
             storage_builder.push_vector_data(bytes).map_err(|e| {
                 EncodingError::EncodingError(format!("Failed to push encoded vector: {e}",))
             })?;
@@ -450,7 +473,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             .map_err(|e| EncodingError::EncodingError(format!("Failed to build storage: {e}",)))?;
 
         let metadata = Metadata {
-            vector_parameters: vector_parameters.clone(),
+            vector_parameters: *vector_parameters,
             encoding,
             query_encoding,
             vector_stats,
@@ -464,7 +487,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
                         "Path must have a parent directory",
                     )
                 })
-                .and_then(std::fs::create_dir_all)
+                .and_then(fs::create_dir_all)
                 .map_err(|e| {
                     EncodingError::EncodingError(format!(
                         "Failed to create metadata directory: {e}",
@@ -484,7 +507,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
     }
 
     pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
-        let contents = std::fs::read_to_string(meta_path)?;
+        let contents = fs::read_to_string(meta_path)?;
         let metadata: Metadata = serde_json::from_str(&contents)?;
         let result = Self {
             metadata,
@@ -492,6 +515,12 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             encoded_vectors,
             bits_store_type: PhantomData,
         };
+
+        // Validate the storage's vector size against the metadata once here, so the size
+        // invariant the scoring hot path relies on (it XORs the stored vector against an
+        // equally-sized query) also holds in release builds without a per-score check.
+        validate_storage_vector_size(&result.encoded_vectors, result.quantized_vector_size())?;
+
         Ok(result)
     }
 
@@ -501,7 +530,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         encoding: Encoding,
     ) -> EncodedBinVector<TBitsStoreType> {
         let encoded_vector_size =
-            Self::get_quantized_vector_size_from_params(vector.len(), encoding)
+            get_quantized_vector_size_from_params::<TBitsStoreType>(vector.len(), encoding)
                 / std::mem::size_of::<TBitsStoreType>();
         let mut encoded_vector = vec![Default::default(); encoded_vector_size];
 
@@ -719,18 +748,8 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
         }
     }
 
-    pub fn get_quantized_vector_size_from_params(dim: usize, encoding: Encoding) -> usize {
-        let extended_dim = match encoding {
-            Encoding::OneBit => dim,
-            Encoding::TwoBits => dim * 2,
-            Encoding::OneAndHalfBits => (dim * 3).div_ceil(2), // ceil(dim * 1.5)
-        };
-        TBitsStoreType::get_storage_size(extended_dim.max(1))
-            * std::mem::size_of::<TBitsStoreType>()
-    }
-
     fn get_quantized_vector_size(&self) -> usize {
-        Self::get_quantized_vector_size_from_params(
+        get_quantized_vector_size_from_params::<TBitsStoreType>(
             self.metadata.vector_parameters.dim,
             self.metadata.encoding,
         )
@@ -774,15 +793,15 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
             self.metadata.vector_parameters.invert,
         ) {
             // So if `invert` is true we return XOR, otherwise we return (dim - XOR)
-            (DistanceType::Dot, true) => xor_product - zeros_count,
-            (DistanceType::Dot, false) => zeros_count - xor_product,
+            (DistanceType::Dot | DistanceType::Cosine, true) => xor_product - zeros_count,
+            (DistanceType::Dot | DistanceType::Cosine, false) => zeros_count - xor_product,
             // This also results in exact ordering as L1 and L2 but reversed.
             (DistanceType::L1 | DistanceType::L2, true) => zeros_count - xor_product,
             (DistanceType::L1 | DistanceType::L2, false) => xor_product - zeros_count,
         }
     }
 
-    pub fn get_quantized_vector(&self, i: PointOffsetType) -> &[u8] {
+    pub fn get_quantized_vector(&self, i: PointOffsetType) -> Cow<'_, [u8]> {
         self.encoded_vectors.get_vector_data(i as _)
     }
 
@@ -797,22 +816,28 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage>
     pub fn get_vector_parameters(&self) -> &VectorParameters {
         &self.metadata.vector_parameters
     }
+}
 
-    pub fn encode_internal_query(&self, point_id: u32) -> EncodedQueryBQ<TBitsStoreType> {
-        // For internal queries we use the same encoding as for storage
-        EncodedQueryBQ::Binary(EncodedBinVector {
-            encoded_vector: bytemuck::cast_slice::<u8, TBitsStoreType>(
-                self.get_quantized_vector(point_id),
-            )
-            .to_vec(),
-        })
-    }
+pub fn get_quantized_vector_size_from_params<TBitsStoreType: BitsStoreType>(
+    dim: usize,
+    encoding: Encoding,
+) -> usize {
+    let extended_dim = match encoding {
+        Encoding::OneBit => dim,
+        Encoding::TwoBits => dim * 2,
+        Encoding::OneAndHalfBits => (dim * 3).div_ceil(2), // ceil(dim * 1.5)
+    };
+    TBitsStoreType::get_storage_size(extended_dim.max(1)) * std::mem::size_of::<TBitsStoreType>()
 }
 
 impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
     for EncodedVectorsBin<TBitsStoreType, TStorage>
 {
     type EncodedQuery = EncodedQueryBQ<TBitsStoreType>;
+
+    fn is_in_ram_or_mmap() -> bool {
+        TStorage::is_in_ram_or_mmap()
+    }
 
     fn is_on_disk(&self) -> bool {
         self.encoded_vectors.is_on_disk()
@@ -828,6 +853,22 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         )
     }
 
+    fn iter_batch(
+        &self,
+        offsets: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
+        self.encoded_vectors.iter_batch(offsets)
+    }
+
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        self.score_bytes(True, query, encoded_vector, hw_counter)
+    }
+
     fn score_point(
         &self,
         query: &EncodedQueryBQ<TBitsStoreType>,
@@ -836,7 +877,7 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
     ) -> f32 {
         let vector_data = self.encoded_vectors.get_vector_data(i);
 
-        self.score_bytes(True, query, vector_data, hw_counter)
+        self.score_bytes(True, query, &vector_data, hw_counter)
     }
 
     fn score_internal(
@@ -852,8 +893,12 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
             .vector_io_read()
             .incr_delta(vector_data_1.len() + vector_data_2.len());
 
-        let vector_data_usize_1 = transmute_from_u8_to_slice(vector_data_1);
-        let vector_data_usize_2 = transmute_from_u8_to_slice(vector_data_2);
+        // TODO Safety
+        #[expect(deprecated, reason = "legacy code")]
+        let vector_data_usize_1 = unsafe { transmute_from_u8_to_slice(&vector_data_1) };
+        // TODO Safety
+        #[expect(deprecated, reason = "legacy code")]
+        let vector_data_usize_2 = unsafe { transmute_from_u8_to_slice(&vector_data_2) };
 
         hw_counter
             .cpu_counter()
@@ -870,9 +915,12 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         &self,
         id: PointOffsetType,
     ) -> Option<EncodedQueryBQ<TBitsStoreType>> {
+        #[expect(deprecated, reason = "legacy code")]
         Some(EncodedQueryBQ::Binary(EncodedBinVector {
-            encoded_vector: transmute_from_u8_to_slice(self.encoded_vectors.get_vector_data(id))
-                .to_vec(),
+            // TODO Safety
+            encoded_vector: unsafe {
+                transmute_from_u8_to_slice(&self.encoded_vectors.get_vector_data(id)).to_vec()
+            },
         }))
     }
 
@@ -915,7 +963,19 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         files
     }
 
+    fn heap_size_bytes(&self) -> usize {
+        let storage_heap = self.encoded_vectors.heap_size_bytes();
+        let vector_stats_heap = self
+            .metadata
+            .vector_stats
+            .as_ref()
+            .map(|vs| vs.elements_stats.capacity() * std::mem::size_of::<VectorElementStats>())
+            .unwrap_or(0);
+        storage_heap + vector_stats_heap
+    }
+
     type SupportsBytes = True;
+
     fn score_bytes(
         &self,
         _: Self::SupportsBytes,
@@ -923,7 +983,9 @@ impl<TBitsStoreType: BitsStoreType, TStorage: EncodedStorage> EncodedVectors
         bytes: &[u8],
         hw_counter: &HardwareCounterCell,
     ) -> f32 {
-        let vector_data_usize = transmute_from_u8_to_slice(bytes);
+        // TODO Safety
+        #[expect(deprecated, reason = "legacy code")]
+        let vector_data_usize = unsafe { transmute_from_u8_to_slice(bytes) };
 
         hw_counter.cpu_counter().incr_delta(bytes.len());
 
@@ -1020,4 +1082,55 @@ unsafe extern "C" {
         vector_ptr: *const u8,
         count: u32,
     ) -> u32;
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512vl")]
+#[target_feature(enable = "avx512vpopcntdq")]
+#[target_feature(enable = "avx2")]
+#[target_feature(enable = "avx")]
+#[target_feature(enable = "sse4.1")]
+#[target_feature(enable = "sse2")]
+unsafe fn impl_xor_popcnt_avx512_uint128(
+    query_ptr: *const u8,
+    vector_ptr: *const u8,
+    u128_count: u32,
+) -> u32 {
+    use std::arch::x86_64::*;
+
+    let mut query_ptr = query_ptr.cast::<__m256i>();
+    let mut vector_ptr = vector_ptr.cast::<__m256i>();
+    let m256_count = u128_count / 2;
+    let mut sum = _mm256_setzero_si256();
+    for _ in 0..m256_count {
+        let query_chunk = unsafe { _mm256_loadu_si256(query_ptr) };
+        let vector_chunk = unsafe { _mm256_loadu_si256(vector_ptr) };
+        sum = _mm256_add_epi64(
+            _mm256_popcnt_epi64(_mm256_xor_si256(query_chunk, vector_chunk)),
+            sum,
+        );
+
+        query_ptr = unsafe { query_ptr.add(1) };
+        vector_ptr = unsafe { vector_ptr.add(1) };
+    }
+
+    if m256_count * 2 != u128_count {
+        let vector_chunk = unsafe { _mm_loadu_si128(vector_ptr.cast::<__m128i>()) };
+        let query_chunk = unsafe { _mm_loadu_si128(query_ptr.cast::<__m128i>()) };
+
+        let popcnt = _mm_popcnt_epi64(_mm_xor_si128(query_chunk, vector_chunk));
+
+        sum = _mm256_add_epi64(_mm256_set_m128i(popcnt, _mm_setzero_si128()), sum);
+    }
+
+    // Extract high and low 128-bit lanes
+    let low = _mm256_castsi256_si128(sum); // Elements 0,1
+    let high = _mm256_extracti128_si256(sum, 1); // Elements 2,3
+    let sum128 = _mm_add_epi64(low, high);
+
+    // Extract and add the two 64-bit elements
+    let low64 = _mm_extract_epi64(sum128, 0);
+    let high64 = _mm_extract_epi64(sum128, 1);
+
+    (low64 + high64) as u32
 }

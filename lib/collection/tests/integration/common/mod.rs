@@ -10,7 +10,8 @@ use collection::optimizers_builder::OptimizersConfig;
 use collection::shards::CollectionId;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
+use collection::shards::replica_set::replica_set_state::ReplicaState;
+use collection::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
 use common::budget::ResourceBudget;
 use segment::types::Distance;
 
@@ -31,6 +32,7 @@ pub const TEST_OPTIMIZERS_CONFIG: OptimizersConfig = OptimizersConfig {
     indexing_threshold: Some(50_000),
     flush_interval_sec: 30,
     max_optimization_threads: Some(2),
+    prevent_unoptimized: None,
 };
 
 #[cfg(test)]
@@ -100,7 +102,7 @@ pub async fn new_local_collection(
         Default::default(),
         CollectionShardDistribution::all_local(Some(config.params.shard_number.into()), 0),
         None,
-        ChannelService::new(REST_PORT, None),
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
@@ -135,7 +137,7 @@ pub async fn load_local_collection(
         path,
         snapshots_path,
         Default::default(),
-        ChannelService::new(REST_PORT, None),
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),

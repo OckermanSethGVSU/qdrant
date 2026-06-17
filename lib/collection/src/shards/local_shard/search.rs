@@ -3,13 +3,14 @@ use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use segment::types::ScoredPoint;
-use tokio::runtime::Handle;
+use shard::common::stopping_guard::StoppingGuard;
+use shard::query::query_enum::QueryEnum;
+use shard::search::CoreSearchRequestBatch;
 
 use super::LocalShard;
 use crate::collection_manager::segments_searcher::SegmentsSearcher;
-use crate::common::stopping_guard::StoppingGuard;
-use crate::operations::query_enum::QueryEnum;
-use crate::operations::types::{CollectionError, CollectionResult, CoreSearchRequestBatch};
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
+use crate::operations::types::{CollectionError, CollectionResult};
 
 // Chunk requests for parallelism in certain scenarios
 //
@@ -29,8 +30,8 @@ impl LocalShard {
     pub async fn do_search(
         &self,
         core_request: Arc<CoreSearchRequestBatch>,
-        search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        search_runtime_handle: &AdaptiveSearchHandle,
+        timeout: Duration,
         hw_counter_acc: HwMeasurementAcc,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
         if core_request.searches.is_empty() {
@@ -98,18 +99,20 @@ impl LocalShard {
     async fn do_search_impl(
         &self,
         core_request: Arc<CoreSearchRequestBatch>,
-        search_runtime_handle: &Handle,
-        timeout: Option<Duration>,
+        search_runtime_handle: &AdaptiveSearchHandle,
+        timeout: Duration,
         hw_counter_acc: HwMeasurementAcc,
         is_stopped_guard: &StoppingGuard,
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>> {
+        let start = std::time::Instant::now();
         let (query_context, collection_params) = {
             let collection_config = self.collection_config.read().await;
-
             let query_context_opt = SegmentsSearcher::prepare_query_context(
                 self.segments.clone(),
                 &core_request,
                 &collection_config,
+                timeout,
+                search_runtime_handle,
                 is_stopped_guard,
                 hw_counter_acc.clone(),
             )
@@ -123,22 +126,24 @@ impl LocalShard {
             (query_context, collection_config.params.clone())
         };
 
+        // update timeout
+        let timeout = timeout.saturating_sub(start.elapsed());
+
         let search_request = SegmentsSearcher::search(
-            Arc::clone(&self.segments),
-            Arc::clone(&core_request),
+            self.segments.clone(),
+            core_request.clone(),
             search_runtime_handle,
             true,
             query_context,
+            timeout,
         );
-
-        let timeout = timeout.unwrap_or(self.shared_storage_config.search_timeout);
 
         let res = tokio::time::timeout(timeout, search_request)
             .await
             .map_err(|_| {
-                log::debug!("Search timeout reached: {} seconds", timeout.as_secs());
+                log::debug!("Search timeout reached: {timeout:?}");
                 // StoppingGuard takes care of setting is_stopped to true
-                CollectionError::timeout(timeout.as_secs() as usize, "Search")
+                CollectionError::timeout(timeout, "Search")
             })??;
 
         let top_results = res
@@ -156,7 +161,8 @@ impl LocalShard {
                         QueryEnum::RecommendBestScore(_)
                         | QueryEnum::RecommendSumScores(_)
                         | QueryEnum::Discover(_)
-                        | QueryEnum::Context(_) => {}
+                        | QueryEnum::Context(_)
+                        | QueryEnum::FeedbackNaive(_) => {}
                     };
                     scored_point
                 });

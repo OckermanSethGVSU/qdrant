@@ -2,15 +2,17 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::future::BoxFuture;
+use storage::audit::{audit_trust_forwarded_headers, extract_tracing_id};
 use storage::rbac::Access;
 use tonic::Status;
-use tonic::body::BoxBody;
 use tower::{Layer, Service};
 
-use crate::common::auth::{AuthError, AuthKeys};
+use super::forwarded;
+use crate::common::auth::{Auth, AuthError, AuthKeys, AuthType, log_denied_auth};
+use crate::common::inference::api_keys::InferenceToken;
 
-type Request = tonic::codegen::http::Request<tonic::transport::Body>;
-type Response = tonic::codegen::http::Response<BoxBody>;
+type Request<Body> = http::Request<Body>;
+type Response<Body> = http::Response<Body>;
 
 #[derive(Clone)]
 pub struct AuthMiddleware<S> {
@@ -18,34 +20,74 @@ pub struct AuthMiddleware<S> {
     service: S,
 }
 
-async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, Status> {
+async fn check<Body>(
+    auth_keys: Arc<AuthKeys>,
+    mut req: Request<Body>,
+) -> Result<Request<Body>, Status>
+where
+    Body: Send + 'static,
+{
+    // When the audit logger trusts forwarded headers, prefer the raw
+    // `X-Forwarded-For` value so audit entries record the real client address
+    // rather than the proxy address.  Fall back to the TCP peer address.
+    let remote = if audit_trust_forwarded_headers() {
+        forwarded::forwarded_for(&req)
+    } else {
+        None
+    }
+    .or_else(|| {
+        req.extensions()
+            .get::<tonic::transport::server::TcpConnectInfo>()
+            .and_then(|info| info.remote_addr())
+            .map(|addr| addr.ip().to_string())
+    });
+
+    let tracing_id = extract_tracing_id(|h| {
+        req.headers()
+            .get(h)
+            .and_then(|val| val.to_str().ok())
+            .map(str::to_string)
+    });
+
     // Allow health check endpoints to bypass authentication
     let path = req.uri().path();
     if path == "/qdrant.Qdrant/HealthCheck" || path == "/grpc.health.v1.Health/Check" {
         // Set default full access for health check endpoints
-        let access = Access::full("Health check endpoints have full access without authentication");
-        let inference_token = crate::common::inference::InferenceToken(None);
+        let auth = Auth::new(
+            Access::full("Health check endpoints have full access without authentication"),
+            None,
+            remote,
+            AuthType::None,
+            tracing_id,
+        );
+        let inference_token = InferenceToken(None);
 
-        req.extensions_mut().insert::<Access>(access);
+        req.extensions_mut().insert(auth);
         req.extensions_mut().insert(inference_token);
 
         return Ok(req);
     }
 
-    let (access, inference_token) = auth_keys
-        .validate_request(|key| req.headers().get(key).and_then(|val| val.to_str().ok()))
+    let headers = req.headers();
+    let (access, inference_token, auth_type, subject) = auth_keys
+        .validate_request(move |key| headers.get(key).and_then(|val| val.to_str().ok()))
         .await
-        .map_err(|e| match e {
-            AuthError::Unauthorized(e) => Status::unauthenticated(e),
-            AuthError::Forbidden(e) => Status::permission_denied(e),
-            AuthError::StorageError(e) => Status::from(e),
+        .map_err(|e| {
+            log_denied_auth(path, remote.clone(), tracing_id.clone(), &e);
+            match e {
+                AuthError::Unauthorized(e) => Status::unauthenticated(e),
+                AuthError::Forbidden(e) => Status::permission_denied(e),
+                AuthError::StorageError(e) => Status::from(e),
+            }
         })?;
 
-    let previous = req.extensions_mut().insert::<Access>(access);
+    let auth = Auth::new(access, subject, remote, auth_type, tracing_id).with_api(path.to_string());
+
+    let previous = req.extensions_mut().insert(auth);
 
     debug_assert!(
         previous.is_none(),
-        "Previous access object should not exist in the request"
+        "Previous auth object should not exist in the request"
     );
 
     let previous_token = req.extensions_mut().insert(inference_token);
@@ -58,10 +100,12 @@ async fn check(auth_keys: Arc<AuthKeys>, mut req: Request) -> Result<Request, St
     Ok(req)
 }
 
-impl<S> Service<Request> for AuthMiddleware<S>
+impl<S, ReqBody, RespBody> Service<Request<ReqBody>> for AuthMiddleware<S>
 where
-    S: Service<Request, Response = Response> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<RespBody>> + Clone + Send + 'static,
     S::Future: Send + 'static,
+    ReqBody: Send + 'static,
+    RespBody: Default,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -71,14 +115,14 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(&mut self, request: Request) -> Self::Future {
+    fn call(&mut self, request: Request<ReqBody>) -> Self::Future {
         let auth_keys = self.auth_keys.clone();
         let mut service = self.service.clone();
 
         Box::pin(async move {
             match check(auth_keys, request).await {
                 Ok(req) => service.call(req).await,
-                Err(e) => Ok(e.to_http()),
+                Err(e) => Ok(e.into_http()),
             }
         })
     }
@@ -108,8 +152,23 @@ impl<S> Layer<S> for AuthLayer {
     }
 }
 
-pub fn extract_access<R>(req: &mut tonic::Request<R>) -> Access {
-    req.extensions_mut().remove::<Access>().unwrap_or_else(|| {
-        Access::full("All requests have full by default access when API key is not configured")
+/// Extract the per-request [`Auth`] context from a tonic request.
+///
+/// When no authentication middleware is configured, a default `Auth` with full
+/// access is returned.
+pub fn extract_auth<R>(req: &mut tonic::Request<R>) -> Auth {
+    req.extensions_mut().remove::<Auth>().unwrap_or_else(|| {
+        Auth::new(
+            Access::full("All requests have full by default access when API key is not configured"),
+            None,
+            None,
+            AuthType::None,
+            extract_tracing_id(|h| {
+                req.metadata()
+                    .get(h)
+                    .and_then(|val| val.to_str().ok())
+                    .map(str::to_string)
+            }),
+        )
     })
 }

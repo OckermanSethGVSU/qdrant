@@ -1,6 +1,9 @@
 use segment::data_types::vectors::{MultiDenseVectorInternal, NamedQuery, VectorInternal};
-use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
-use shard::search::QueryEnum;
+use segment::vector_storage::query::{
+    ContextPair, ContextQuery, DiscoverQuery, FeedbackItem, NaiveFeedbackCoefficients,
+    NaiveFeedbackQuery, RecoQuery,
+};
+use shard::query::query_enum::QueryEnum;
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::types::DimId;
 
@@ -109,6 +112,9 @@ impl Generalizer for QueryEnum {
             }
             QueryEnum::Discover(disocover) => QueryEnum::Discover(disocover.remove_details()),
             QueryEnum::Context(context) => QueryEnum::Context(context.remove_details()),
+            QueryEnum::FeedbackNaive(feedback) => {
+                QueryEnum::FeedbackNaive(feedback.remove_details())
+            }
         }
     }
 }
@@ -151,9 +157,9 @@ impl Generalizer for VectorInternal {
     }
 }
 
-impl<T: Generalizer> Generalizer for DiscoveryQuery<T> {
+impl<T: Generalizer> Generalizer for DiscoverQuery<T> {
     fn remove_details(&self) -> Self {
-        let DiscoveryQuery { target, pairs } = self;
+        let DiscoverQuery { target, pairs } = self;
         Self {
             target: target.remove_details(),
             pairs: pairs.iter().map(|p| p.remove_details()).collect(),
@@ -189,6 +195,42 @@ impl<T: Generalizer> Generalizer for RecoQuery<T> {
         Self {
             positives: positives.iter().map(|p| p.remove_details()).collect(),
             negatives: negatives.iter().map(|p| p.remove_details()).collect(),
+        }
+    }
+}
+
+impl<T: Generalizer> Generalizer for NaiveFeedbackQuery<T> {
+    fn remove_details(&self) -> Self {
+        let Self {
+            target,
+            feedback,
+            coefficients,
+        } = self;
+        Self {
+            target: target.remove_details(),
+            feedback: feedback.iter().map(|p| p.remove_details()).collect(),
+            coefficients: coefficients.remove_details(),
+        }
+    }
+}
+
+impl<T: Generalizer> Generalizer for FeedbackItem<T> {
+    fn remove_details(&self) -> Self {
+        let FeedbackItem { vector, score: _ } = self;
+        Self {
+            vector: vector.remove_details(),
+            score: 0.0.into(),
+        }
+    }
+}
+
+impl Generalizer for NaiveFeedbackCoefficients {
+    fn remove_details(&self) -> Self {
+        let NaiveFeedbackCoefficients { a: _, b: _, c: _ } = self;
+        Self {
+            a: 0.0.into(),
+            b: 0.0.into(),
+            c: 0.0.into(),
         }
     }
 }

@@ -1,14 +1,15 @@
-use api::rest::SearchRequestInternal;
 use common::types::ScoreType;
+#[cfg(feature = "api")]
 use itertools::Itertools as _;
-use segment::data_types::vectors::{
-    DenseVector, Named as _, NamedQuery, NamedVectorStruct, QueryVector, VectorInternal,
-};
-use segment::types::{Filter, SearchParams, VectorName, WithPayloadInterface, WithVector};
-use segment::vector_storage::query::{ContextPair, ContextQuery, DiscoveryQuery, RecoQuery};
-use serde::Serialize;
-use sparse::common::sparse_vector::{SparseVector, validate_sparse_vector_impl};
+#[cfg(feature = "api")]
+use segment::data_types::vectors::NamedQuery;
+use segment::types::{Filter, SearchParams, WithPayloadInterface, WithVector};
+#[cfg(feature = "api")]
+use segment::{data_types::vectors::VectorInternal, vector_storage::query::ContextPair};
 
+use crate::query::query_enum::QueryEnum;
+
+/// DEPRECATED: Search method should be removed and replaced with `ShardQueryRequest`
 #[derive(Clone, Debug, PartialEq)]
 pub struct CoreSearchRequest {
     /// Every kind of query that can be performed on segment level
@@ -42,9 +43,13 @@ impl CoreSearchRequest {
     }
 }
 
-impl From<SearchRequestInternal> for CoreSearchRequest {
-    fn from(request: SearchRequestInternal) -> Self {
-        let SearchRequestInternal {
+#[cfg(feature = "api")]
+impl From<api::rest::SearchRequestInternal> for CoreSearchRequest {
+    fn from(request: api::rest::SearchRequestInternal) -> Self {
+        #[cfg(feature = "api")]
+        use segment::data_types::vectors::NamedVectorStruct;
+
+        let api::rest::SearchRequestInternal {
             vector,
             filter,
             score_threshold,
@@ -67,10 +72,14 @@ impl From<SearchRequestInternal> for CoreSearchRequest {
     }
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<api::grpc::qdrant::CoreSearchPoints> for CoreSearchRequest {
     type Error = tonic::Status;
 
     fn try_from(value: api::grpc::qdrant::CoreSearchPoints) -> Result<Self, Self::Error> {
+        use segment::data_types::vectors::VectorInternal;
+        use segment::vector_storage::query::{ContextQuery, DiscoverQuery, RecoQuery};
+
         let query = value
             .query
             .and_then(|query| query.query)
@@ -109,7 +118,7 @@ impl TryFrom<api::grpc::qdrant::CoreSearchPoints> for CoreSearchRequest {
                             .try_collect()?;
 
                         QueryEnum::Discover(NamedQuery {
-                            query: DiscoveryQuery::new(target.try_into()?, pairs),
+                            query: DiscoverQuery::new(target.try_into()?, pairs),
                             using: value.vector_name,
                         })
                     }
@@ -133,21 +142,17 @@ impl TryFrom<api::grpc::qdrant::CoreSearchPoints> for CoreSearchRequest {
         Ok(Self {
             query,
             filter: value.filter.map(|f| f.try_into()).transpose()?,
-            params: value.params.map(|p| p.into()),
+            params: value.params.map(Into::into),
             limit: value.limit as usize,
             offset: value.offset.unwrap_or_default() as usize,
             with_payload: value.with_payload.map(|wp| wp.try_into()).transpose()?,
-            with_vector: Some(
-                value
-                    .with_vectors
-                    .map(|with_vectors| with_vectors.into())
-                    .unwrap_or_default(),
-            ),
+            with_vector: Some(value.with_vectors.map(Into::into).unwrap_or_default()),
             score_threshold: value.score_threshold,
         })
     }
 }
 
+#[cfg(feature = "api")]
 fn try_context_pair_from_grpc(
     pair: api::grpc::qdrant::ContextPair,
 ) -> Result<ContextPair<VectorInternal>, tonic::Status> {
@@ -163,10 +168,13 @@ fn try_context_pair_from_grpc(
     }
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<api::grpc::qdrant::SearchPoints> for CoreSearchRequest {
     type Error = tonic::Status;
 
     fn try_from(value: api::grpc::qdrant::SearchPoints) -> Result<Self, Self::Error> {
+        use sparse::common::sparse_vector::validate_sparse_vector_impl;
+
         let api::grpc::qdrant::SearchPoints {
             collection_name: _,
             vector,
@@ -214,181 +222,7 @@ impl TryFrom<api::grpc::qdrant::SearchPoints> for CoreSearchRequest {
     }
 }
 
-/// Every kind of vector query that can be performed on segment level.
-#[derive(Clone, Debug, PartialEq, Hash, Serialize)]
-pub enum QueryEnum {
-    Nearest(NamedQuery<VectorInternal>),
-    RecommendBestScore(NamedQuery<RecoQuery<VectorInternal>>),
-    RecommendSumScores(NamedQuery<RecoQuery<VectorInternal>>),
-    Discover(NamedQuery<DiscoveryQuery<VectorInternal>>),
-    Context(NamedQuery<ContextQuery<VectorInternal>>),
-}
-
-impl QueryEnum {
-    pub fn get_vector_name(&self) -> &VectorName {
-        match self {
-            QueryEnum::Nearest(vector) => vector.get_name(),
-            QueryEnum::RecommendBestScore(reco_query) => reco_query.get_name(),
-            QueryEnum::RecommendSumScores(reco_query) => reco_query.get_name(),
-            QueryEnum::Discover(discovery_query) => discovery_query.get_name(),
-            QueryEnum::Context(context_query) => context_query.get_name(),
-        }
-    }
-
-    /// Only when the distance is the scoring, this will return true.
-    pub fn is_distance_scored(&self) -> bool {
-        match self {
-            QueryEnum::Nearest(_) => true,
-            QueryEnum::RecommendBestScore(_)
-            | QueryEnum::RecommendSumScores(_)
-            | QueryEnum::Discover(_)
-            | QueryEnum::Context(_) => false,
-        }
-    }
-
-    pub fn iterate_sparse(&self, mut f: impl FnMut(&VectorName, &SparseVector)) {
-        match self {
-            QueryEnum::Nearest(named) => match &named.query {
-                VectorInternal::Sparse(sparse_vector) => f(named.get_name(), sparse_vector),
-                VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
-            },
-            QueryEnum::RecommendBestScore(reco_query)
-            | QueryEnum::RecommendSumScores(reco_query) => {
-                let name = reco_query.get_name();
-                for vector in reco_query.query.flat_iter() {
-                    match vector {
-                        VectorInternal::Sparse(sparse_vector) => f(name, sparse_vector),
-                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
-                    }
-                }
-            }
-            QueryEnum::Discover(discovery_query) => {
-                let name = discovery_query.get_name();
-                for pair in discovery_query.query.flat_iter() {
-                    match pair {
-                        VectorInternal::Sparse(sparse_vector) => f(name, sparse_vector),
-                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
-                    }
-                }
-            }
-            QueryEnum::Context(context_query) => {
-                let name = context_query.get_name();
-                for pair in context_query.query.flat_iter() {
-                    match pair {
-                        VectorInternal::Sparse(sparse_vector) => f(name, sparse_vector),
-                        VectorInternal::Dense(_) | VectorInternal::MultiDense(_) => {}
-                    }
-                }
-            }
-        }
-    }
-
-    /// Returns the estimated cost of using this query in terms of number of vectors.
-    /// The cost approximates how many similarity comparisons this query will make against one point.
-    fn search_cost(&self) -> usize {
-        match self {
-            QueryEnum::Nearest(named_query) => search_cost([&named_query.query]),
-            QueryEnum::RecommendBestScore(named_query) => {
-                search_cost(named_query.query.flat_iter())
-            }
-            QueryEnum::RecommendSumScores(named_query) => {
-                search_cost(named_query.query.flat_iter())
-            }
-            QueryEnum::Discover(named_query) => search_cost(named_query.query.flat_iter()),
-            QueryEnum::Context(named_query) => search_cost(named_query.query.flat_iter()),
-        }
-    }
-}
-
-fn search_cost<'a>(vectors: impl IntoIterator<Item = &'a VectorInternal>) -> usize {
-    vectors
-        .into_iter()
-        .map(VectorInternal::similarity_cost)
-        .sum()
-}
-
-impl AsRef<QueryEnum> for QueryEnum {
-    fn as_ref(&self) -> &QueryEnum {
-        self
-    }
-}
-
-impl From<DenseVector> for QueryEnum {
-    fn from(vector: DenseVector) -> Self {
-        QueryEnum::Nearest(NamedQuery {
-            query: VectorInternal::Dense(vector),
-            using: None,
-        })
-    }
-}
-
-impl From<NamedQuery<DiscoveryQuery<VectorInternal>>> for QueryEnum {
-    fn from(query: NamedQuery<DiscoveryQuery<VectorInternal>>) -> Self {
-        QueryEnum::Discover(query)
-    }
-}
-
-impl From<QueryEnum> for QueryVector {
-    fn from(query: QueryEnum) -> Self {
-        match query {
-            QueryEnum::Nearest(named) => QueryVector::Nearest(named.query),
-            QueryEnum::RecommendBestScore(named) => QueryVector::RecommendBestScore(named.query),
-            QueryEnum::RecommendSumScores(named) => QueryVector::RecommendSumScores(named.query),
-            QueryEnum::Discover(named) => QueryVector::Discovery(named.query),
-            QueryEnum::Context(named) => QueryVector::Context(named.query),
-        }
-    }
-}
-
-impl From<QueryEnum> for api::grpc::qdrant::QueryEnum {
-    fn from(value: QueryEnum) -> Self {
-        match value {
-            QueryEnum::Nearest(vector) => api::grpc::qdrant::QueryEnum {
-                query: Some(api::grpc::qdrant::query_enum::Query::NearestNeighbors(
-                    api::grpc::qdrant::Vector::from(vector.query),
-                )),
-            },
-            QueryEnum::RecommendBestScore(named) => api::grpc::qdrant::QueryEnum {
-                query: Some(api::grpc::qdrant::query_enum::Query::RecommendBestScore(
-                    named.query.into(),
-                )),
-            },
-            QueryEnum::RecommendSumScores(named) => api::grpc::qdrant::QueryEnum {
-                query: Some(api::grpc::qdrant::query_enum::Query::RecommendSumScores(
-                    named.query.into(),
-                )),
-            },
-            QueryEnum::Discover(named) => api::grpc::qdrant::QueryEnum {
-                query: Some(api::grpc::qdrant::query_enum::Query::Discover(
-                    api::grpc::qdrant::DiscoveryQuery {
-                        target: Some(named.query.target.into()),
-                        context: named
-                            .query
-                            .pairs
-                            .into_iter()
-                            .map(|pair| api::grpc::qdrant::ContextPair {
-                                positive: { Some(pair.positive.into()) },
-                                negative: { Some(pair.negative.into()) },
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-            QueryEnum::Context(named) => api::grpc::qdrant::QueryEnum {
-                query: Some(api::grpc::qdrant::query_enum::Query::Context(
-                    api::grpc::qdrant::ContextQuery {
-                        context: named
-                            .query
-                            .pairs
-                            .into_iter()
-                            .map(|pair| api::grpc::qdrant::ContextPair {
-                                positive: { Some(pair.positive.into()) },
-                                negative: { Some(pair.negative.into()) },
-                            })
-                            .collect(),
-                    },
-                )),
-            },
-        }
-    }
+#[derive(Debug, Clone)]
+pub struct CoreSearchRequestBatch {
+    pub searches: Vec<CoreSearchRequest>,
 }

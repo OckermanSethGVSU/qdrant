@@ -8,8 +8,8 @@ use segment::types::ShardKey;
 use serde::Serialize;
 
 use crate::collection_manager::optimizers::TrackerTelemetry;
-use crate::operations::types::{OptimizersStatus, ShardStatus};
-use crate::shards::replica_set::ReplicaState;
+use crate::operations::types::{OptimizersStatus, ShardStatus, ShardUpdateQueueInfo};
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId};
 
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
@@ -30,12 +30,12 @@ pub struct RemoteShardTelemetry {
     #[anonymize(false)]
     pub shard_id: ShardId,
     #[anonymize(false)]
-    pub peer_id: Option<PeerId>,
-    pub searches: OperationDurationStatistics,
-    pub updates: OperationDurationStatistics,
+    pub peer_id: PeerId,
+    pub searches: Option<OperationDurationStatistics>,
+    pub updates: Option<OperationDurationStatistics>,
 }
 
-#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize)]
+#[derive(Serialize, Clone, Debug, JsonSchema, Anonymize, Default)]
 pub struct LocalShardTelemetry {
     #[anonymize(false)]
     pub variant_name: Option<String>,
@@ -60,11 +60,21 @@ pub struct LocalShardTelemetry {
     /// Do NOT rely on this number unless you know what you are doing
     #[serde(skip_serializing_if = "Option::is_none")]
     pub num_vectors: Option<usize>,
+    /// Sum of number of vectors across all segments, grouped by their name.
+    /// This is an approximate number.
+    /// Do NOT rely on this number unless you know what you are doing
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub num_vectors_by_name: Option<HashMap<String, usize>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub segments: Option<Vec<SegmentTelemetry>>,
-    pub optimizations: OptimizerTelemetry,
+    pub optimizations: Option<OptimizerTelemetry>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub async_scorer: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexed_only_excluded_vectors: Option<HashMap<String, usize>>,
+    /// Update queue status
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub update_queue: Option<ShardUpdateQueueInfo>,
 }
 
 #[derive(Serialize, Clone, Debug, JsonSchema, Anonymize, Default)]
@@ -75,7 +85,7 @@ pub struct OptimizerTelemetry {
     pub log: Option<Vec<TrackerTelemetry>>,
 }
 
-#[derive(Copy, Clone, Debug, Serialize, JsonSchema, Anonymize)]
+#[derive(Copy, Clone, PartialEq, Debug, Serialize, JsonSchema, Anonymize)]
 pub struct PartialSnapshotTelemetry {
     #[anonymize(false)]
     pub ongoing_create_snapshot_requests: usize,
@@ -83,4 +93,14 @@ pub struct PartialSnapshotTelemetry {
     pub is_recovering: bool,
     #[anonymize(false)]
     pub recovery_timestamp: u64,
+}
+
+impl PartialSnapshotTelemetry {
+    pub fn is_empty(&self) -> bool {
+        self == &Self {
+            ongoing_create_snapshot_requests: 0,
+            is_recovering: false,
+            recovery_timestamp: 0,
+        }
+    }
 }

@@ -5,9 +5,11 @@ use std::sync::atomic::AtomicBool;
 use atomic_refcell::AtomicRefCell;
 use common::budget::ResourcePermit;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::ScoredPointOffset;
+use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, DenseVector, QueryVector, only_default_vector,
@@ -16,7 +18,7 @@ use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_dense_byte_vector, random_int_payload};
 use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, VectorIndexRead};
 use segment::segment_constructor::build_segment;
 use segment::types::{
     BinaryQuantizationConfig, CompressionRatio, Condition, Distance, FieldCondition, Filter,
@@ -48,6 +50,7 @@ where
             vector
         }
         VectorStorageDatatype::Uint8 => random_dense_byte_vector(rnd_gen, dim),
+        VectorStorageDatatype::Turbo4 => unreachable!(),
     }
 }
 
@@ -70,6 +73,7 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
         .count()
 }
 
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 #[rstest]
 #[case::nearest_binary_dot(
     QueryVariant::Nearest,
@@ -89,8 +93,8 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     32, // ef
     5., // min_acc out of 100
 )]
-#[case::discovery_binary_dot(
-    QueryVariant::Discovery,
+#[case::discover_binary_dot(
+    QueryVariant::Discover,
     VectorStorageDatatype::Uint8,
     QuantizationVariant::Binary,
     Distance::Dot,
@@ -125,8 +129,8 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     32, // ef
     25., // min_acc out of 100
 )]
-#[case::discovery_binary_cosine(
-    QueryVariant::Discovery,
+#[case::discover_binary_cosine(
+    QueryVariant::Discover,
     VectorStorageDatatype::Uint8,
     QuantizationVariant::Binary,
     Distance::Cosine,
@@ -235,23 +239,17 @@ fn test_byte_storage_binary_quantization_hnsw(
 
     let int_key = "int";
 
-    let mut segment_byte = build_segment(dir_byte.path(), &config_byte, true).unwrap();
+    let mut segment_byte = build_segment(dir_byte.path(), &config_byte, None, true).unwrap();
     // check that `segment_byte` uses byte or half storage
     {
         let borrowed_storage = segment_byte.vector_data[DEFAULT_VECTOR_NAME]
             .vector_storage
             .borrow();
         let raw_storage: &VectorStorageEnum = &borrowed_storage;
-        #[cfg(feature = "rocksdb")]
         assert!(matches!(
             raw_storage,
-            &VectorStorageEnum::DenseSimpleByte(_) | &VectorStorageEnum::DenseSimpleHalf(_),
-        ));
-        #[cfg(not(feature = "rocksdb"))]
-        assert!(matches!(
-            raw_storage,
-            &VectorStorageEnum::DenseAppendableInRamByte(_)
-                | &VectorStorageEnum::DenseAppendableInRamHalf(_),
+            &VectorStorageEnum::DenseAppendableMemmapByte(_)
+                | &VectorStorageEnum::DenseAppendableMemmapHalf(_),
         ));
     }
 
@@ -331,7 +329,7 @@ fn test_byte_storage_binary_quantization_hnsw(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
-        copy_vectors: None,
+        inline_storage: None,
     };
 
     let permit_cpu_count = 1; // single-threaded for deterministic build
@@ -357,6 +355,7 @@ fn test_byte_storage_binary_quantization_hnsw(
             stopped: &stopped,
             hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -376,8 +375,8 @@ fn test_byte_storage_binary_quantization_hnsw(
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

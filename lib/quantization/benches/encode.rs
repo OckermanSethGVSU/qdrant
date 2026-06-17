@@ -2,10 +2,10 @@ use std::sync::atomic::AtomicBool;
 
 use criterion::{Criterion, criterion_group, criterion_main};
 use permutation_iterator::Permutor;
-use quantization::encoded_storage::{TestEncodedStorage, TestEncodedStorageBuilder};
+use quantization::encoded_storage::TestEncodedStorageBuilder;
 use quantization::encoded_vectors::{DistanceType, EncodedVectors, VectorParameters};
-use quantization::encoded_vectors_u8::EncodedVectorsU8;
-use rand::Rng;
+use quantization::encoded_vectors_u8::{self, EncodedVectorsU8, ScalarQuantizationMethod};
+use rand::RngExt;
 
 fn encode_dot_bench(c: &mut Criterion) {
     let mut group = c.benchmark_group("encode dot");
@@ -25,14 +25,14 @@ fn encode_dot_bench(c: &mut Criterion) {
         distance_type: DistanceType::Dot,
         invert: false,
     };
-    let quantized_vector_size =
-        EncodedVectorsU8::<TestEncodedStorage>::get_quantized_vector_size(&vector_parameters);
+    let quantized_vector_size = encoded_vectors_u8::get_quantized_vector_size(&vector_parameters);
     let i8_encoded = EncodedVectorsU8::encode(
         (0..vectors_count).map(|i| &list[i * vector_dim..(i + 1) * vector_dim]),
         TestEncodedStorageBuilder::new(None, quantized_vector_size),
         &vector_parameters,
         vectors_count,
         None,
+        ScalarQuantizationMethod::Int8,
         None,
         &AtomicBool::new(false),
     )
@@ -46,7 +46,8 @@ fn encode_dot_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = i8_encoded.score_point_avx(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_avx(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -56,7 +57,8 @@ fn encode_dot_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = i8_encoded.score_point_sse(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_sse(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -66,7 +68,8 @@ fn encode_dot_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = i8_encoded.score_point_neon(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_neon(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -79,7 +82,8 @@ fn encode_dot_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for &i in &permutation {
-                _s = i8_encoded.score_point_avx(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_avx(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -89,7 +93,8 @@ fn encode_dot_bench(c: &mut Criterion) {
         let mut _s = 0.0;
         b.iter(|| {
             for &i in &permutation {
-                _s = i8_encoded.score_point_sse(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_sse(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -99,7 +104,8 @@ fn encode_dot_bench(c: &mut Criterion) {
         let mut _s = 0.0;
         b.iter(|| {
             for &i in &permutation {
-                _s = i8_encoded.score_point_neon(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_neon(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -123,14 +129,14 @@ fn encode_l1_bench(c: &mut Criterion) {
         distance_type: DistanceType::L1,
         invert: true,
     };
-    let quantized_vector_size =
-        EncodedVectorsU8::<TestEncodedStorage>::get_quantized_vector_size(&vector_parameters);
+    let quantized_vector_size = encoded_vectors_u8::get_quantized_vector_size(&vector_parameters);
     let i8_encoded = EncodedVectorsU8::encode(
         (0..vectors_count).map(|i| &list[i * vector_dim..(i + 1) * vector_dim]),
         TestEncodedStorageBuilder::new(None, quantized_vector_size),
         &vector_parameters,
         vectors_count,
         None,
+        ScalarQuantizationMethod::Int8,
         None,
         &AtomicBool::new(false),
     )
@@ -144,7 +150,8 @@ fn encode_l1_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = i8_encoded.score_point_avx(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_avx(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -154,7 +161,8 @@ fn encode_l1_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = i8_encoded.score_point_sse(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_sse(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -164,7 +172,8 @@ fn encode_l1_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for i in 0..vectors_count as u32 {
-                _s = i8_encoded.score_point_neon(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_neon(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -177,7 +186,8 @@ fn encode_l1_bench(c: &mut Criterion) {
         b.iter(|| {
             let mut _s = 0.0;
             for &i in &permutation {
-                _s = i8_encoded.score_point_avx(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_avx(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -187,7 +197,8 @@ fn encode_l1_bench(c: &mut Criterion) {
         let mut _s = 0.0;
         b.iter(|| {
             for &i in &permutation {
-                _s = i8_encoded.score_point_sse(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_sse(&encoded_query, &quantized_vector);
             }
         });
     });
@@ -197,7 +208,8 @@ fn encode_l1_bench(c: &mut Criterion) {
         let mut _s = 0.0;
         b.iter(|| {
             for &i in &permutation {
-                _s = i8_encoded.score_point_neon(&encoded_query, i);
+                let quantized_vector = i8_encoded.get_quantized_vector(i);
+                _s = i8_encoded.score_point_neon(&encoded_query, &quantized_vector);
             }
         });
     });

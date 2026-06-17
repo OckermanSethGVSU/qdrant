@@ -6,9 +6,11 @@ use atomic_refcell::AtomicRefCell;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::ScoredPointOffset;
+use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, QueryVector, only_default_multi_vector,
@@ -17,7 +19,7 @@ use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_multi_vector};
 use segment::fixtures::query_fixtures::QueryVariant;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, VectorIndexRead};
 use segment::json_path::JsonPath;
 use segment::segment_constructor::build_segment;
 use segment::types::{
@@ -61,6 +63,7 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
         .count()
 }
 
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 #[rstest]
 #[case::nearest_binary_dot(
     QueryVariant::Nearest,
@@ -71,8 +74,8 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     false,
     25., // min_acc out of 100
 )]
-#[case::discovery_binary_dot(
-    QueryVariant::Discovery,
+#[case::discover_binary_dot(
+    QueryVariant::Discover,
     QuantizationVariant::Binary,
     Distance::Dot,
     128, // dim
@@ -107,8 +110,8 @@ fn sames_count(a: &[Vec<ScoredPointOffset>], b: &[Vec<ScoredPointOffset>]) -> us
     false,
     25., // min_acc out of 100
 )]
-#[case::discovery_binary_cosine(
-    QueryVariant::Discovery,
+#[case::discover_binary_cosine(
+    QueryVariant::Discover,
     QuantizationVariant::Binary,
     Distance::Cosine,
     128, // dim
@@ -200,14 +203,7 @@ fn test_multivector_quantization_hnsw(
     let storage_type = if on_disk {
         VectorStorageType::ChunkedMmap
     } else {
-        #[cfg(feature = "rocksdb")]
-        {
-            VectorStorageType::Memory
-        }
-        #[cfg(not(feature = "rocksdb"))]
-        {
-            VectorStorageType::InRamChunkedMmap
-        }
+        VectorStorageType::InRamChunkedMmap
     };
     let config = SegmentConfig {
         vector_data: HashMap::from([(
@@ -228,7 +224,7 @@ fn test_multivector_quantization_hnsw(
 
     let int_key = "int";
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_segment(dir.path(), &config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -314,7 +310,7 @@ fn test_multivector_quantization_hnsw(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
-        copy_vectors: None,
+        inline_storage: None,
     };
 
     let permit_cpu_count = 1; // single-threaded for deterministic build
@@ -340,6 +336,7 @@ fn test_multivector_quantization_hnsw(
             stopped: &stopped,
             hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -359,8 +356,8 @@ fn test_multivector_quantization_hnsw(
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

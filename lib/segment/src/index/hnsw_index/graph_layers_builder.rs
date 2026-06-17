@@ -1,16 +1,18 @@
 use std::borrow::Cow;
 use std::cmp::{max, min};
 use std::io::Write;
+use std::ops::ControlFlow;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicUsize};
 
-use bitvec::prelude::BitVec;
-use common::ext::BitSliceExt;
+use bitvec::vec::BitVec;
+use common::bitvec::BitSliceExt;
+use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
+use common::fs::{atomic_save, atomic_save_bin};
 use common::types::{PointOffsetType, ScoredPointOffset};
-use io::file_operations::{atomic_save, atomic_save_bin};
 use parking_lot::{Mutex, MutexGuard, RwLock};
-use rand::Rng;
 use rand::distr::Uniform;
+use rand::{Rng, RngExt};
 
 use super::HnswM;
 use super::graph_layers::GraphLayerData;
@@ -18,10 +20,11 @@ use super::graph_links::{GraphLinks, GraphLinksFormatParam};
 use super::links_container::{ItemsBuffer, LinksContainer};
 use crate::common::operation_error::OperationResult;
 use crate::index::hnsw_index::entry_points::EntryPoints;
+#[cfg(test)]
+use crate::index::hnsw_index::graph_layers::SearchAlgorithm;
 use crate::index::hnsw_index::graph_layers::{GraphLayers, GraphLayersBase};
 use crate::index::hnsw_index::graph_links::serialize_graph_links;
 use crate::index::hnsw_index::point_scorer::FilteredScorer;
-use crate::index::hnsw_index::search_context::SearchContext;
 use crate::index::visited_pool::{VisitedListHandle, VisitedPool};
 
 pub type LockedLinkContainer = RwLock<LinksContainer>;
@@ -44,7 +47,7 @@ pub struct GraphLayersBuilder {
     visited_pool: VisitedPool,
 
     // List of bool flags, which defines if the point is already indexed or not
-    ready_list: RwLock<BitVec>,
+    ready_list: BitVec<AtomicUsize>,
 }
 
 impl GraphLayersBase for GraphLayersBuilder {
@@ -57,12 +60,29 @@ impl GraphLayersBase for GraphLayersBuilder {
         F: FnMut(PointOffsetType),
     {
         let links = self.links_layers[point_id as usize][level].read();
-        let ready_list = self.ready_list.read();
         for link in links.iter() {
-            if ready_list[link as usize] {
+            if self.ready_list[link as usize] {
                 f(link);
             }
         }
+    }
+
+    fn try_for_each_link<F>(
+        &self,
+        point_id: PointOffsetType,
+        level: usize,
+        mut f: F,
+    ) -> ControlFlow<(), ()>
+    where
+        F: FnMut(PointOffsetType) -> ControlFlow<(), ()>,
+    {
+        let links = self.links_layers[point_id as usize][level].read();
+        for link in links.iter() {
+            if self.ready_list[link as usize] {
+                f(link)?;
+            }
+        }
+        ControlFlow::Continue(())
     }
 
     fn get_m(&self, level: usize) -> usize {
@@ -87,7 +107,12 @@ impl GraphLayersBuilder {
     ///  - Return the fraction of reachable nodes to the total number of nodes in the sub-graph.
     ///
     /// Coin probability `q` is a parameter of this function. By default, it is 0.5.
-    pub fn subgraph_connectivity(&self, points: &[PointOffsetType], q: f32) -> f32 {
+    pub fn subgraph_connectivity<R: Rng + ?Sized>(
+        &self,
+        rng: &mut R,
+        points: &[PointOffsetType],
+        q: f32,
+    ) -> f32 {
         if points.is_empty() {
             return 1.0;
         }
@@ -101,14 +126,12 @@ impl GraphLayersBuilder {
             point_selection.set(*point_id as usize, true);
         }
 
-        let mut rnd = rand::rng();
-
         // Try to get entry point from the entry points list
         // If not found, select the point with the highest level
         let entry_point = self
             .entry_points
             .lock()
-            .get_random_entry_point(&mut rnd, |point_id| {
+            .get_random_entry_point(rng, |point_id| {
                 point_selection.get_bit(point_id as usize).unwrap_or(false)
             })
             .map(|ep| ep.point_id);
@@ -133,6 +156,7 @@ impl GraphLayersBuilder {
 
         // Retry loop, in case some budget is left.
         loop {
+            let budget_before_iteration = spent_budget;
             visited.set(entry_point as usize, true);
 
             // Points visited in the previous layer (Get used as entry point in the iteration over the next layer)
@@ -151,7 +175,7 @@ impl GraphLayersBuilder {
                         spent_budget += 1;
 
                         // Flip a coin to decide if the edge is removed or not
-                        let coin_flip = rnd.random_range(0.0..1.0);
+                        let coin_flip = rng.random_range(0.0..1.0);
                         if coin_flip < q {
                             continue;
                         }
@@ -169,8 +193,12 @@ impl GraphLayersBuilder {
                 }
             }
 
-            // Budget exhausted, don't retry.
-            if spent_budget > SUBGRAPH_CONNECTIVITY_SEARCH_BUDGET {
+            // Budget exhausted, don't retry. Also stop if this iteration made no
+            // progress: BFS traversed zero edges, so retrying cannot discover more
+            // (the graph is immutable and coin flips only gate enumerated links).
+            if spent_budget > SUBGRAPH_CONNECTIVITY_SEARCH_BUDGET
+                || spent_budget == budget_before_iteration
+            {
                 break;
             }
 
@@ -197,7 +225,7 @@ impl GraphLayersBuilder {
             atomic_save(&links_path, |writer| {
                 serialize_graph_links(edges, format_param, self.hnsw_m, writer)
             })?;
-            links = GraphLinks::load_from_file(&links_path, true, format_param.as_format())?;
+            links = GraphLinks::load_from_mmap(&links_path, format_param.as_format())?;
         } else {
             // Since we'll keep it in the RAM anyway, we can afford to build in the RAM too.
             links = GraphLinks::new_from_edges(edges, format_param, self.hnsw_m)?;
@@ -257,13 +285,12 @@ impl GraphLayersBuilder {
 
     #[cfg(feature = "gpu")]
     pub fn fill_ready_list(&mut self) {
-        let num_vectors = self.num_points();
-        self.ready_list = RwLock::new(BitVec::repeat(true, num_vectors));
+        self.ready_list.fill(true);
     }
 
     #[cfg(feature = "gpu")]
     pub fn set_ready(&mut self, point_id: PointOffsetType) -> bool {
-        self.ready_list.write().replace(point_id as usize, true)
+        self.ready_list.replace(point_id as usize, true)
     }
 
     pub fn new_with_params(
@@ -281,7 +308,7 @@ impl GraphLayersBuilder {
         .take(num_vectors)
         .collect();
 
-        let ready_list = RwLock::new(BitVec::repeat(false, num_vectors));
+        let ready_list = BitVec::repeat(false, num_vectors);
 
         Self {
             max_level: AtomicUsize::new(0),
@@ -430,8 +457,11 @@ impl GraphLayersBuilder {
             // New point is a new empty entry (for this filter, at least)
             // We can't do much here, so just quit
         }
-        let was_ready = self.ready_list.write().replace(point_id as usize, true);
-        debug_assert!(!was_ready, "Point {point_id} was already marked as ready");
+        debug_assert!(
+            !self.ready_list[point_id as usize],
+            "Point {point_id} was already marked as ready"
+        );
+        self.ready_list.set_aliased(point_id as usize, true);
         self.entry_points
             .lock()
             .new_point(point_id, level, |point_id| {
@@ -454,8 +484,11 @@ impl GraphLayersBuilder {
             links.fill_from(neighbours.iter().copied());
         }
 
-        let was_ready = self.ready_list.write().replace(point_id as usize, true);
-        debug_assert!(!was_ready);
+        debug_assert!(
+            !self.ready_list[point_id as usize],
+            "Point {point_id} was already marked as ready"
+        );
+        self.ready_list.set_aliased(point_id as usize, true);
         self.entry_points
             .lock()
             .new_point(point_id, level, |_| true);
@@ -470,36 +503,24 @@ impl GraphLayersBuilder {
         points_scorer: &mut FilteredScorer,
         mut level_entry: ScoredPointOffset,
     ) -> ScoredPointOffset {
-        let mut visited_list = self.get_visited_list_from_pool();
+        let nearest = self
+            .search_on_level(
+                level_entry,
+                curr_level,
+                self.ef_construct,
+                points_scorer,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
 
-        visited_list.check_and_update_visited(level_entry.idx);
-
-        let mut search_context = SearchContext::new(self.ef_construct);
-        search_context.process_candidate(level_entry);
-
-        self._search_on_level(
-            &mut search_context,
-            curr_level,
-            &mut visited_list,
-            points_scorer,
-            &AtomicBool::new(false),
-        )
-        .unwrap();
-
-        if let Some(the_nearest) = search_context.nearest.iter_unsorted().max() {
+        if let Some(the_nearest) = nearest.iter_unsorted().max() {
             level_entry = *the_nearest;
         }
 
         if self.use_heuristic {
-            self.link_with_heuristic(
-                point_id,
-                curr_level,
-                &visited_list,
-                points_scorer,
-                search_context,
-            );
+            self.link_with_heuristic(point_id, curr_level, points_scorer, nearest);
         } else {
-            self.link_without_heuristic(point_id, curr_level, points_scorer, search_context);
+            self.link_without_heuristic(point_id, curr_level, points_scorer, nearest);
         }
 
         level_entry
@@ -509,28 +530,15 @@ impl GraphLayersBuilder {
         &self,
         point_id: PointOffsetType,
         curr_level: usize,
-        visited_list: &VisitedListHandle,
         points_scorer: &FilteredScorer,
-        mut search_context: SearchContext,
+        nearest: FixedLengthPriorityQueue<ScoredPointOffset>,
     ) {
         let level_m = self.hnsw_m.level_m(curr_level);
         let scorer = |a, b| points_scorer.score_internal(a, b);
 
         let selected_nearest = {
+            let iter = nearest.into_iter_sorted();
             let mut existing_links = self.links_layers[point_id as usize][curr_level].write();
-            {
-                let ready_list = self.ready_list.read();
-                for existing_link in existing_links.iter() {
-                    if !visited_list.check(existing_link) && ready_list[existing_link as usize] {
-                        search_context.process_candidate(ScoredPointOffset {
-                            idx: existing_link,
-                            score: points_scorer.score_point(existing_link),
-                        });
-                    }
-                }
-            }
-
-            let iter = search_context.nearest.into_iter_sorted();
             existing_links.fill_from_sorted_with_heuristic(iter, level_m, scorer);
             existing_links.links().to_vec()
         };
@@ -549,11 +557,11 @@ impl GraphLayersBuilder {
         point_id: PointOffsetType,
         curr_level: usize,
         points_scorer: &FilteredScorer,
-        search_context: SearchContext,
+        nearest: FixedLengthPriorityQueue<ScoredPointOffset>,
     ) {
         let level_m = self.hnsw_m.level_m(curr_level);
         let scorer = |a, b| points_scorer.score_internal(a, b);
-        for nearest_point in search_context.nearest.iter_unsorted() {
+        for nearest_point in nearest.iter_unsorted() {
             {
                 let mut links = self.links_layers[point_id as usize][curr_level].write();
                 links.connect(nearest_point.idx, point_id, level_m, scorer);
@@ -576,7 +584,7 @@ impl GraphLayersBuilder {
     pub fn get_average_connectivity_on_level(&self, level: usize) -> f32 {
         let mut sum = 0;
         let mut count = 0;
-        for links in self.links_layers.iter() {
+        for links in &self.links_layers {
             if links.len() > level {
                 sum += links[level].read().links().len();
                 count += 1;
@@ -603,7 +611,7 @@ mod tests {
     use crate::index::hnsw_index::graph_links::{GraphLinksFormat, normalize_links};
     use crate::index::hnsw_index::tests::create_graph_layer_fixture;
     use crate::types::Distance;
-    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage as _};
+    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorageRead as _};
 
     const M: usize = 8;
 
@@ -764,7 +772,14 @@ mod tests {
         let scorer = vector_holder.scorer(query);
         let ef = 16;
         let graph_search = graph
-            .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+            .search(
+                top,
+                ef,
+                SearchAlgorithm::Hnsw,
+                scorer,
+                None,
+                &DEFAULT_STOPPED,
+            )
             .unwrap();
 
         assert_eq!(reference_top.into_sorted_vec(), graph_search);
@@ -870,7 +885,14 @@ mod tests {
         let scorer = vector_holder.scorer(query);
         let ef = 16;
         let graph_search = graph
-            .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+            .search(
+                top,
+                ef,
+                SearchAlgorithm::Hnsw,
+                scorer,
+                None,
+                &DEFAULT_STOPPED,
+            )
             .unwrap();
         assert_eq!(reference_top.into_sorted_vec(), graph_search);
     }
@@ -927,5 +949,54 @@ mod tests {
             .sum();
         let avg_connectivity = total_edges as f64 / NUM_VECTORS as f64;
         eprintln!("avg_connectivity = {avg_connectivity:#?}");
+    }
+
+    /// Regression test: `subgraph_connectivity` must not hang when the chosen
+    /// entry point has no outgoing links on any of its layers. In that case the
+    /// inner BFS iterates zero edges, so `spent_budget` stays at 0 and the
+    /// retry `loop` never observes `spent_budget > SUBGRAPH_CONNECTIVITY_SEARCH_BUDGET`.
+    ///
+    /// The state is reachable through normal graph construction: the very first
+    /// point inserted via `link_new_point` has no pre-existing neighbors, so it
+    /// is registered in `EntryPoints` with empty `links_layers` on every layer.
+    #[test]
+    fn test_subgraph_connectivity_isolated_entry_point_does_not_hang() {
+        use std::sync::Arc;
+        use std::thread;
+        use std::time::{Duration, Instant};
+
+        const DIM: usize = 4;
+        let mut rng = StdRng::seed_from_u64(42);
+
+        // Build a one-point graph the normal way. `link_new_point` sees an
+        // empty entry-points list, takes the "new empty entry" branch, and
+        // registers point 0 with no outgoing links on any of its layers.
+        let vector_holder = TestRawScorerProducer::new(DIM, Distance::Cosine, 1, false, &mut rng);
+        let mut builder = GraphLayersBuilder::new(1, HnswM::new2(M), 16, 10, false);
+        let level = builder.get_random_layer(&mut rng);
+        builder.set_levels(0, level);
+        builder.link_new_point(0, vector_holder.internal_scorer(0));
+        let builder = Arc::new(builder);
+
+        // Run on a background thread so the test can bound wall-clock time
+        // rather than hanging the whole test runner.
+        let builder_clone = Arc::clone(&builder);
+        let handle = thread::spawn(move || {
+            let mut rng = rand::rng();
+            builder_clone.subgraph_connectivity(&mut rng, &[0], 0.5)
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !handle.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            handle.is_finished(),
+            "subgraph_connectivity hung on an isolated entry point",
+        );
+        handle
+            .join()
+            .expect("subgraph_connectivity thread panicked");
     }
 }

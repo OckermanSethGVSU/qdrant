@@ -74,6 +74,16 @@ impl Validate for grpc::vectors_config_diff::Config {
     }
 }
 
+impl Validate for grpc::create_vector_name_request::VectorConfig {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        use grpc::create_vector_name_request::VectorConfig;
+        match self {
+            VectorConfig::DenseConfig(dense) => dense.validate(),
+            VectorConfig::SparseConfig(sparse) => sparse.validate(),
+        }
+    }
+}
+
 impl Validate for grpc::quantization_config::Quantization {
     fn validate(&self) -> Result<(), ValidationErrors> {
         use grpc::quantization_config::Quantization;
@@ -81,6 +91,7 @@ impl Validate for grpc::quantization_config::Quantization {
             Quantization::Scalar(scalar) => scalar.validate(),
             Quantization::Product(product) => product.validate(),
             Quantization::Binary(binary) => binary.validate(),
+            Quantization::Turboquant(turbo) => turbo.validate(),
         }
     }
 }
@@ -92,6 +103,7 @@ impl Validate for grpc::quantization_config_diff::Quantization {
             Quantization::Scalar(scalar) => scalar.validate(),
             Quantization::Product(product) => product.validate(),
             Quantization::Binary(binary) => binary.validate(),
+            Quantization::Turboquant(turbo) => turbo.validate(),
             Quantization::Disabled(_) => Ok(()),
         }
     }
@@ -108,6 +120,7 @@ impl Validate for grpc::update_collection_cluster_setup_request::Operation {
             Operation::CreateShardKey(op) => op.validate(),
             Operation::DeleteShardKey(op) => op.validate(),
             Operation::RestartTransfer(op) => op.validate(),
+            Operation::ReplicatePoints(op) => op.validate(),
         }
     }
 }
@@ -177,7 +190,27 @@ impl Validate for grpc::DeleteShardKey {
 
 impl Validate for grpc::RestartTransfer {
     fn validate(&self) -> Result<(), ValidationErrors> {
-        Ok(())
+        validate_shard_different_peers(
+            self.from_peer_id,
+            self.to_peer_id,
+            self.shard_id,
+            self.to_shard_id,
+        )
+    }
+}
+
+impl Validate for grpc::ReplicatePoints {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        if self.from_shard_key != self.to_shard_key {
+            return Ok(());
+        }
+
+        let mut errors = ValidationErrors::new();
+        errors.add(
+            "to_shard_key",
+            validator::ValidationError::new("must be different from from_shard_key"),
+        );
+        Err(errors)
     }
 }
 
@@ -211,6 +244,8 @@ impl Validate for grpc::update_operation::Update {
             Update::ClearPayload(op) => op.validate(),
             Update::CreateFieldIndex(op) => op.validate(),
             Update::DeleteFieldIndex(op) => op.validate(),
+            Update::CreateVectorName(op) => op.validate(),
+            Update::DeleteVectorName(op) => op.validate(),
         }
     }
 }
@@ -255,6 +290,7 @@ impl Validate for grpc::FieldCondition {
 
 impl Validate for grpc::Vector {
     fn validate(&self) -> Result<(), ValidationErrors> {
+        #[expect(deprecated)]
         let grpc::Vector {
             data,
             indices,
@@ -345,6 +381,7 @@ impl Validate for super::qdrant::query::Variant {
             grpc::query::Variant::Context(q) => q.validate(),
             grpc::query::Variant::Formula(q) => q.validate(),
             grpc::query::Variant::Rrf(q) => q.validate(),
+            grpc::query::Variant::RelevanceFeedback(q) => q.validate(),
             grpc::query::Variant::Sample(_)
             | grpc::query::Variant::Fusion(_)
             | grpc::query::Variant::OrderBy(_) => Ok(()),
@@ -400,6 +437,16 @@ impl Validate for super::qdrant::expression::Variant {
     }
 }
 
+impl Validate for grpc::feedback_strategy::Variant {
+    fn validate(&self) -> Result<(), ValidationErrors> {
+        match self {
+            grpc::feedback_strategy::Variant::Naive(naive_feedback_strategy) => {
+                naive_feedback_strategy.validate()
+            }
+        }
+    }
+}
+
 /// Validate that GeoLineString has at least 4 points and is closed.
 pub fn validate_geo_polygon_line_helper(line: &grpc::GeoLineString) -> Result<(), ValidationError> {
     let points = &line.points;
@@ -433,6 +480,15 @@ pub fn validate_geo_polygon_interiors(
 ) -> Result<(), ValidationError> {
     for line in lines {
         validate_geo_polygon_line_helper(line)?;
+    }
+    Ok(())
+}
+
+/// Reject the `Turbo4` datatype on sparse vector configs.
+/// `validator` unwraps `Option<i32>` before calling, so we receive `&i32`.
+pub fn validate_sparse_datatype(datatype: &i32) -> Result<(), ValidationError> {
+    if *datatype == grpc::Datatype::Turbo4 as i32 {
+        return Err(common::validation::sparse_turbo4_unsupported_error());
     }
     Ok(())
 }
@@ -473,6 +529,7 @@ impl Validate for super::qdrant::IntegerIndexParams {
             range,
             is_principal: _,
             on_disk: _,
+            enable_hnsw: _,
         } = &self;
         validate_integer_index_params(lookup, range)
     }
@@ -492,8 +549,9 @@ mod tests {
     use validator::Validate;
 
     use crate::grpc::qdrant::{
-        CreateCollection, CreateFieldIndexCollection, GeoLineString, GeoPoint, GeoPolygon,
-        SearchPoints, UpdateCollection,
+        CreateCollection, CreateFieldIndexCollection, CreateVectorNameRequest,
+        DenseVectorCreationConfig, GeoLineString, GeoPoint, GeoPolygon, SearchPoints,
+        UpdateCollection, create_vector_name_request,
     };
 
     #[test]
@@ -699,5 +757,47 @@ mod tests {
             good_polygon.validate().is_ok(),
             "good polygon should not error on validation"
         );
+    }
+
+    #[test]
+    fn test_create_vector_name_request() {
+        let request_with_zero_size = CreateVectorNameRequest {
+            collection_name: "test".into(),
+            vector_name: "vec".into(),
+            vector_config: Some(create_vector_name_request::VectorConfig::DenseConfig(
+                DenseVectorCreationConfig {
+                    size: 0,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(request_with_zero_size.validate().is_err());
+
+        let request_with_oversize = CreateVectorNameRequest {
+            collection_name: "test".into(),
+            vector_name: "vec".into(),
+            vector_config: Some(create_vector_name_request::VectorConfig::DenseConfig(
+                DenseVectorCreationConfig {
+                    size: 65537,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(request_with_oversize.validate().is_err());
+
+        let good_request = CreateVectorNameRequest {
+            collection_name: "test".into(),
+            vector_name: "vec".into(),
+            vector_config: Some(create_vector_name_request::VectorConfig::DenseConfig(
+                DenseVectorCreationConfig {
+                    size: 768,
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        assert!(good_request.validate().is_ok());
     }
 }

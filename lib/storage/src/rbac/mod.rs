@@ -1,14 +1,29 @@
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 
-use segment::json_path::JsonPath;
-use segment::types::ValueVariants;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use validator::{Validate, ValidateArgs, ValidationError, ValidationErrors};
 
 use crate::content_manager::errors::StorageError;
 
+pub mod auditable_operation;
+pub mod auth;
 mod ops_checks;
+
+pub use auth::Auth;
+
+/// How the request was authenticated.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum AuthType {
+    Jwt,
+    ApiKey,
+    /// No authentication was configured or required.
+    None,
+    /// Request originated from the cluster itself (internal P2P communication).
+    /// These requests are not audit-logged.
+    Internal,
+}
 
 /// A structure that defines access rights.
 #[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
@@ -38,9 +53,22 @@ pub struct CollectionAccess {
 
     /// Payload constraints.
     /// An object where each key is a JSON path, and each value is JSON value.
+    ///
+    /// Deprecation: this parameter is kept for preventing old keys to become valid after parameter removal.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[deprecated(since = "1.15.0")]
-    pub payload: Option<PayloadConstraint>,
+    #[validate(custom(function = "validate_payload_empty"))]
+    pub payload: Option<Value>, // Value is a placeholder for a now removed type
+}
+
+fn validate_payload_empty(_payload: &Value) -> Result<(), ValidationError> {
+    Err(ValidationError {
+        code: Cow::from("deprecated"),
+        message: Some(Cow::from(
+            "The 'payload' constraint is deprecated and should not be used",
+        )),
+        params: HashMap::new(),
+    })
 }
 
 impl CollectionAccess {
@@ -48,8 +76,6 @@ impl CollectionAccess {
         CollectionAccessView {
             collection: &self.collection,
             access: self.access,
-            #[expect(deprecated)]
-            payload: &self.payload,
         }
     }
 }
@@ -80,9 +106,6 @@ pub enum CollectionAccessMode {
     #[serde(rename = "prw")]
     PointsReadWrite,
 }
-
-#[derive(Serialize, Deserialize, PartialEq, Clone, Debug)]
-pub struct PayloadConstraint(pub HashMap<JsonPath, ValueVariants>);
 
 impl Access {
     /// Create an `Access` object with full access.
@@ -158,22 +181,13 @@ impl CollectionAccessList {
 struct CollectionAccessView<'a> {
     pub collection: &'a str,
     pub access: CollectionAccessMode,
-    pub payload: &'a Option<PayloadConstraint>,
 }
 
 impl CollectionAccessView<'_> {
-    pub(self) fn check_whole_access(&self) -> Result<(), StorageError> {
-        if self.payload.is_some() {
-            return incompatible_with_payload_constraint(self.collection);
-        }
-        Ok(())
-    }
-
     fn meets_requirements(&self, requirements: AccessRequirements) -> Result<(), StorageError> {
         let AccessRequirements {
             write,
             manage,
-            whole,
             extras,
         } = requirements;
 
@@ -210,9 +224,6 @@ impl CollectionAccessView<'_> {
             return Err(StorageError::forbidden(
                 "Manage access for this operation is required",
             ));
-        }
-        if whole && self.payload.is_some() {
-            return incompatible_with_payload_constraint(self.collection);
         }
         Ok(())
     }
@@ -253,8 +264,6 @@ pub struct AccessRequirements {
     pub write: bool,
     /// Manage access is required, implies write access.
     pub manage: bool,
-    /// If true, the access should be not limited by a payload restrictions.
-    pub whole: bool,
     /// Require access to collection extras, like snapshots, payload indexes, cluster info.
     pub extras: bool,
 }
@@ -278,13 +287,6 @@ impl AccessRequirements {
         }
     }
 
-    pub fn whole(&self) -> Self {
-        Self {
-            whole: true,
-            ..*self
-        }
-    }
-
     pub fn extras(&self) -> Self {
         Self {
             extras: true,
@@ -298,7 +300,6 @@ impl GlobalAccessMode {
         let AccessRequirements {
             write,
             manage,
-            whole: _,
             extras: _,
         } = requirements;
         if write || manage {
@@ -311,15 +312,6 @@ impl GlobalAccessMode {
         }
         Ok(())
     }
-}
-
-/// Helper function to indicate that the operation is not allowed when `payload` constraint is
-/// present.
-fn incompatible_with_payload_constraint<T>(collection_name: &str) -> Result<T, StorageError> {
-    Err(StorageError::forbidden(format!(
-        "This operation is not allowed when \"payload\" restriction is present for collection \
-         {collection_name}"
-    )))
 }
 
 impl Access {
@@ -371,7 +363,7 @@ impl AccessCollectionBuilder {
         Self(Vec::new())
     }
 
-    pub(self) fn add(mut self, name: &str, write: bool, whole: bool) -> Self {
+    pub(self) fn add(mut self, name: &str, write: bool) -> Self {
         self.0.push(CollectionAccess {
             collection: name.to_string(),
             access: if write {
@@ -380,7 +372,7 @@ impl AccessCollectionBuilder {
                 CollectionAccessMode::Read
             },
             #[expect(deprecated)]
-            payload: (!whole).then(|| PayloadConstraint::new_test(name)),
+            payload: None,
         });
         self
     }
@@ -390,16 +382,5 @@ impl AccessCollectionBuilder {
 impl From<AccessCollectionBuilder> for Access {
     fn from(builder: AccessCollectionBuilder) -> Self {
         Access::Collection(CollectionAccessList(builder.0))
-    }
-}
-
-#[cfg(test)]
-impl PayloadConstraint {
-    /// Create a dummy value for testing.
-    pub fn new_test(name: &str) -> Self {
-        PayloadConstraint(HashMap::from([(
-            format!("f_{name}").parse().unwrap(),
-            ValueVariants::String(format!("v_{name}")),
-        )]))
     }
 }

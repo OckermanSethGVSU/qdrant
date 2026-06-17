@@ -1,10 +1,12 @@
 use common::types::PointOffsetType;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::common::types::DimWeight;
 
 pub const DEFAULT_MAX_NEXT_WEIGHT: DimWeight = f32::NEG_INFINITY;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, FromBytes, Immutable, KnownLayout)]
+#[repr(C)]
 pub struct GenericPostingElement<W> {
     /// Record ID
     pub record_id: PointOffsetType,
@@ -13,6 +15,7 @@ pub struct GenericPostingElement<W> {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+#[repr(C)]
 pub struct PostingElement {
     /// Record ID
     pub record_id: PointOffsetType,
@@ -20,7 +23,8 @@ pub struct PostingElement {
     pub weight: DimWeight,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, FromBytes, Immutable, IntoBytes, KnownLayout)]
+#[repr(C)]
 pub struct PostingElementEx {
     /// Record ID
     pub record_id: PointOffsetType,

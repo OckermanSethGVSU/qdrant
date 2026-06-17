@@ -1,11 +1,11 @@
 use common::types::ScoreType;
 use half::f16;
 
-use crate::data_types::vectors::{DenseVector, VectorElementTypeHalf};
+use crate::data_types::vectors::{DenseVector, TypedDenseVector, VectorElementTypeHalf};
 use crate::spaces::metric::Metric;
 #[cfg(target_arch = "x86_64")]
 use crate::spaces::metric_f16::avx::dot::avx_dot_similarity_half;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(windows)))]
 use crate::spaces::metric_f16::neon::dot::neon_dot_similarity_half;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::spaces::metric_f16::sse::dot::sse_dot_similarity_half;
@@ -38,7 +38,7 @@ impl Metric<VectorElementTypeHalf> for DotProductMetric {
             }
         }
 
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(windows)))]
         {
             if std::arch::is_aarch64_feature_detected!("neon")
                 && std::arch::is_aarch64_feature_detected!("fp16")
@@ -49,6 +49,13 @@ impl Metric<VectorElementTypeHalf> for DotProductMetric {
         }
 
         dot_similarity_half(v1, v2)
+    }
+
+    fn query_similarity(
+        query: &TypedDenseVector<VectorElementTypeHalf>,
+        vector: &[VectorElementTypeHalf],
+    ) -> ScoreType {
+        Self::similarity(query, vector)
     }
 
     fn preprocess(vector: DenseVector) -> DenseVector {

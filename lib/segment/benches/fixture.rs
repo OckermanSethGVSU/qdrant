@@ -2,12 +2,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use common::types::PointOffsetType;
+use fs_err as fs;
 use rand::SeedableRng as _;
 use rand::rngs::StdRng;
 use rayon::iter::{IntoParallelIterator as _, ParallelIterator as _};
 use segment::fixtures::index_fixtures::TestRawScorerProducer;
 use segment::index::hnsw_index::HnswM;
-use segment::index::hnsw_index::graph_layers::GraphLayers;
+use segment::index::hnsw_index::graph_layers::{GraphLayers, LoadOption};
 use segment::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
 use segment::index::hnsw_index::graph_links::GraphLinksFormatParam;
 use segment::index::hnsw_index::hnsw::SINGLE_THREADED_HNSW_BUILD_THRESHOLD;
@@ -53,7 +54,7 @@ where
         let updated_ago = updated_ago(&graph_layers_path).unwrap_or_else(|_| "???".to_string());
         eprintln!("Loading cached links (built {updated_ago} ago) from {graph_layers_path:?}.");
         eprintln!("Delete the directory above if code related to HNSW graph building is changed");
-        GraphLayers::load(&path, false, false).unwrap()
+        GraphLayers::load(&path, LoadOption::ram_from_mmap(), false).unwrap()
     } else {
         let mut graph_layers_builder =
             GraphLayersBuilder::new(num_vectors, HnswM::new2(m), ef_construct, 10, use_heuristic);
@@ -77,7 +78,7 @@ where
             )
             .for_each(add_point);
 
-        std::fs::create_dir_all(&path).unwrap();
+        fs::create_dir_all(&path).unwrap();
         graph_layers_builder
             .into_graph_layers(&path, GraphLinksFormatParam::Plain, false)
             .unwrap()
@@ -87,7 +88,7 @@ where
 }
 
 fn updated_ago(path: &Path) -> Result<String, Box<dyn std::error::Error>> {
-    let elapsed = std::fs::metadata(path)?.modified()?.elapsed()?;
+    let elapsed = fs::metadata(path)?.modified()?.elapsed()?;
     let secs_rounded = elapsed.as_secs().next_multiple_of(60);
     Ok(humantime::format_duration(Duration::from_secs(secs_rounded)).to_string())
 }

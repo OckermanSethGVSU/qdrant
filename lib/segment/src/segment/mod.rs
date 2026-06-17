@@ -1,15 +1,15 @@
 mod entry;
-mod facet;
-mod formula_rescore;
-mod order_by;
-mod sampling;
-mod scroll;
+pub mod memory;
 mod search;
 mod segment_ops;
+pub mod vector_data_read;
+mod vector_name_ops;
 mod version_tracker;
 
 pub mod snapshot;
 
+mod as_view;
+mod read_view;
 #[cfg(test)]
 mod tests;
 
@@ -17,17 +17,16 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::thread::JoinHandle;
 
 use atomic_refcell::AtomicRefCell;
-use io::storage_version::StorageVersion;
+use common::is_alive_lock::IsAliveLock;
+use common::storage_version::StorageVersion;
 use parking_lot::Mutex;
-#[cfg(feature = "rocksdb")]
-use rocksdb::DB;
+use uuid::Uuid;
 
 use self::version_tracker::VersionTracker;
-use crate::common::operation_error::{OperationResult, SegmentFailedState};
-use crate::id_tracker::IdTrackerSS;
+use crate::common::operation_error::SegmentFailedState;
+use crate::id_tracker::IdTrackerEnum;
 use crate::index::VectorIndexEnum;
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::payload_storage::payload_storage_enum::PayloadStorageEnum;
@@ -40,10 +39,8 @@ pub const SEGMENT_STATE_FILE: &str = "segment.json";
 const SNAPSHOT_PATH: &str = "snapshot";
 
 // Sub-directories of `SNAPSHOT_PATH`:
-#[cfg(feature = "rocksdb")]
-const DB_BACKUP_PATH: &str = "db_backup";
-#[cfg(feature = "rocksdb")]
-const PAYLOAD_DB_BACKUP_PATH: &str = "payload_index_db_backup";
+const DEPRECATED_ROCKSDB_BACKUP_PATH: &str = "db_backup";
+const DEPRECATED_PAYLOAD_ROCKSDB_BACKUP_PATH: &str = "payload_index_db_backup";
 const SNAPSHOT_FILES_PATH: &str = "files";
 
 pub struct SegmentVersion;
@@ -62,32 +59,41 @@ impl StorageVersion for SegmentVersion {
 /// - Keeps track of occurred errors
 #[derive(Debug)]
 pub struct Segment {
+    pub uuid: Uuid,
     /// Initial version this segment was created at
     pub initial_version: Option<SeqNumberType>,
     /// Latest update operation number, applied to this segment
     /// If None, there were no updates and segment is empty
     pub version: Option<SeqNumberType>,
     /// Latest persisted version
+    /// Locked structure on which we hold the lock during flush to prevent concurrent flushes
     pub persisted_version: Arc<Mutex<Option<SeqNumberType>>>,
-    /// Path of the storage root
-    pub current_path: PathBuf,
+    /// Lock to prevent concurrent flushes and used for waiting for ongoing flushes to finish.
+    pub is_alive_flush_lock: IsAliveLock,
+    /// Path to the segment directory
+    pub segment_path: PathBuf,
     pub version_tracker: VersionTracker,
     /// Component for mapping external ids to internal and also keeping track of point versions
-    pub id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    pub id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
     pub vector_data: HashMap<VectorNameBuf, VectorData>,
     pub payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
     pub payload_storage: Arc<AtomicRefCell<PayloadStorageEnum>>,
     /// Shows if it is possible to insert more points into this segment
     pub appendable_flag: bool,
+    /// Route mutating ops through clone-and-tombstone so the underlying
+    /// vector and payload storages are never written in place. Intended for
+    /// S3-backed storages that prefer pure appends.
+    ///
+    /// Runtime-only — not persisted in the segment state file. Only takes
+    /// effect when [`Segment::is_appendable`] is also true, see
+    /// [`Segment::is_append_only`].
+    pub append_only_mutations: bool,
     /// Shows what kind of indexes and storages are used in this segment
     pub segment_type: SegmentType,
     pub segment_config: SegmentConfig,
     /// Last unhandled error
     /// If not None, all update operations will be aborted until original operation is performed properly
     pub error_status: Option<SegmentFailedState>,
-    #[cfg(feature = "rocksdb")]
-    pub database: Option<Arc<parking_lot::RwLock<DB>>>,
-    pub flush_thread: Mutex<Option<JoinHandle<OperationResult<SeqNumberType>>>>,
 }
 
 pub struct VectorData {
@@ -104,9 +110,8 @@ impl fmt::Debug for VectorData {
 
 impl Drop for Segment {
     fn drop(&mut self) {
-        if let Err(flushing_err) = self.lock_flushing() {
-            log::error!("Failed to flush segment during drop: {flushing_err}");
-        }
+        // Wait for all background flush operations to finish
+        self.is_alive_flush_lock.blocking_mark_dead();
 
         // Try to remove everything from the disk cache, as it might pollute the cache
         if let Err(e) = self.payload_storage.borrow().clear_cache() {
@@ -139,16 +144,4 @@ impl Drop for Segment {
             }
         }
     }
-}
-
-#[cfg(feature = "rocksdb")]
-pub fn destroy_rocksdb(path: &std::path::Path) -> OperationResult<()> {
-    rocksdb::DB::destroy(&Default::default(), path).map_err(|err| {
-        crate::common::operation_error::OperationError::service_error(format!(
-            "failed to destroy RocksDB at {}: {err}",
-            path.display()
-        ))
-    })?;
-
-    Ok(())
 }

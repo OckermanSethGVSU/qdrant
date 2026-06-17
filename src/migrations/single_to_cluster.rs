@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use collection::collection_state::State;
 use collection::config::{CollectionConfigInternal, ShardingMethod};
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::shard::PeerId;
 use storage::content_manager::collection_meta_ops::{
     CollectionMetaOperations, CreateCollection, CreateCollectionOperation, CreateShardKey,
@@ -12,7 +12,7 @@ use storage::content_manager::consensus_manager::ConsensusStateRef;
 use storage::content_manager::shard_distribution::ShardDistributionProposal;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, AccessRequirements};
+use storage::rbac::{Access, AccessRequirements, Auth};
 
 /// Processes the existing collections, which were created outside the consensus:
 /// - during the migration from single to cluster
@@ -25,8 +25,9 @@ pub async fn handle_existing_collections(
     collections: Vec<String>,
 ) {
     let full_access = Access::full("Migration from single to cluster");
-    let multipass = full_access
-        .check_global_access(AccessRequirements::new().manage())
+    let full_auth = Auth::new_internal(full_access.clone());
+    let multipass = full_auth
+        .check_global_access(AccessRequirements::new().manage(), "migration")
         .expect("Full access should have manage rights");
 
     consensus_state.is_leader_established.await_ready();
@@ -62,7 +63,7 @@ pub async fn handle_existing_collections(
         let sharding_method = params.sharding_method;
 
         let mut collection_create_operation = CreateCollectionOperation::new(
-            collection_name.to_string(),
+            collection_name.clone(),
             CreateCollection {
                 vectors: params.vectors,
                 sparse_vectors: params.sparse_vectors,
@@ -77,8 +78,6 @@ pub async fn handle_existing_collections(
                 quantization_config,
                 strict_mode_config,
                 uuid,
-                #[expect(deprecated)]
-                init_from: None,
                 metadata,
             },
         )
@@ -117,14 +116,17 @@ pub async fn handle_existing_collections(
 
                     for shard_id in shard_ids {
                         let shard_info = shards.get(shard_id).unwrap();
-                        placement.push(shard_info.replicas.keys().copied().collect());
+                        let mut replicas: Vec<_> = shard_info.replicas.keys().copied().collect();
+                        replicas.sort_unstable();
+                        placement.push(replicas);
                     }
 
                     consensus_operations.push(CollectionMetaOperations::CreateShardKey(
                         CreateShardKey {
-                            collection_name: collection_name.to_string(),
+                            collection_name: collection_name.clone(),
                             shard_key: shard_key.clone(),
                             placement,
+                            initial_state: None, // Initial state can't be set during migration
                         },
                     ))
                 }
@@ -133,7 +135,7 @@ pub async fn handle_existing_collections(
 
         for operation in consensus_operations {
             let _res = dispatcher_arc
-                .submit_collection_meta_op(operation, full_access.clone(), None)
+                .submit_collection_meta_op(operation, full_auth.clone(), None)
                 .await;
         }
 
@@ -142,13 +144,13 @@ pub async fn handle_existing_collections(
                 let _res = dispatcher_arc
                     .submit_collection_meta_op(
                         CollectionMetaOperations::SetShardReplicaState(SetShardReplicaState {
-                            collection_name: collection_name.to_string(),
+                            collection_name: collection_name.clone(),
                             shard_id,
                             peer_id: this_peer_id,
                             state: ReplicaState::Active,
                             from_state: None,
                         }),
-                        full_access.clone(),
+                        full_auth.clone(),
                         None,
                     )
                     .await;

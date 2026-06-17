@@ -4,6 +4,7 @@ use std::sync::Arc;
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::save_on_disk::SaveOnDisk;
+use ordered_float::OrderedFloat;
 use segment::json_path::JsonPath;
 use segment::types::{
     Condition, FieldCondition, Filter, GeoPoint, GeoRadius, PayloadFieldSchema, PayloadSchemaType,
@@ -14,9 +15,10 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
 use crate::collection::payload_index_schema::{self, PayloadIndexSchema};
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::{CollectionUpdateOperations, CreateIndex, FieldIndexOperations};
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::{create_collection_config, upsert_operation};
 
 #[tokio::test(flavor = "multi_thread")]
@@ -27,7 +29,8 @@ async fn test_payload_missing_index_check() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let search_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -41,8 +44,8 @@ async fn test_payload_missing_index_check() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema.clone(),
-        current_runtime.clone(),
-        current_runtime.clone(),
+        update_runtime.clone(),
+        search_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
     )
@@ -52,7 +55,12 @@ async fn test_payload_missing_index_check() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
@@ -60,7 +68,7 @@ async fn test_payload_missing_index_check() {
         JsonPath::from_str("location").unwrap(),
         GeoRadius {
             center: GeoPoint::new(12.0, 34.0).ok().unwrap(),
-            radius: 50.0,
+            radius: OrderedFloat(50.0),
         },
     )));
 
@@ -166,7 +174,12 @@ async fn create_index(
         }),
     );
     shard
-        .update(create_index.into(), true, HwMeasurementAcc::new())
+        .update(
+            create_index.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 }

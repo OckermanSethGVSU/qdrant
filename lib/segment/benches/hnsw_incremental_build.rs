@@ -1,6 +1,7 @@
+#![expect(clippy::wildcard_enum_match_arm, reason = "benchmarks")]
+
 use std::collections::BTreeSet;
 use std::fmt::Debug;
-use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -10,8 +11,11 @@ use clap::Parser;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::{FeatureFlags, feature_flags, init_feature_flags};
+use common::fs::{atomic_save_json, read_json};
+use common::progress_tracker::ProgressTracker;
 use common::types::ScoredPointOffset;
-use io::file_operations::{atomic_save_json, read_json};
+use fs_err as fs;
+use fs_err::File;
 use itertools::Itertools as _;
 use ndarray::{ArrayView2, Axis};
 use ndarray_npy::ViewNpyExt;
@@ -26,12 +30,12 @@ use segment::common::operation_error::OperationResult;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, QueryVector, VectorElementType, VectorInternal, only_default_vector,
 };
-use segment::entry::SegmentEntry as _;
+use segment::entry::{SegmentEntry as _, StorageSegmentEntry as _};
 use segment::fixtures::index_fixtures::random_vector;
-use segment::id_tracker::IdTrackerSS;
+use segment::id_tracker::{IdTrackerEnum, IdTrackerRead};
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
-use segment::index::{VectorIndex as _, VectorIndexEnum};
+use segment::index::{VectorIndexEnum, VectorIndexRead as _};
 use segment::segment::Segment;
 use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
@@ -47,6 +51,9 @@ use zerocopy::IntoBytes;
 ///
 /// To speed up the benchmark across runs, some operations that not related
 /// to incremental HNSW are cached.
+///
+/// To benchmark only the regular (aka non-incremental) HNSW building,
+/// run it with `--iterations 0` and without `--cache`.
 ///
 /// # Plan
 ///
@@ -66,8 +73,11 @@ struct Args {
     #[clap(long)]
     bench: bool,
 
-    /// Path to a dataset in numpy format.
+    /// Path to a dataset in numpy format, to benchmark on real data.
     /// Incompatible with `--dimensions`.
+    ///
+    /// See https://github.com/qdrant/qdrant/pull/6615#issuecomment-3018646477
+    /// for scripts to prepare datasets.
     #[clap(long)]
     dataset: Option<PathBuf>,
 
@@ -147,6 +157,7 @@ fn main() {
     let cache_path = Path::new(env!("CARGO_TARGET_TMPDIR"))
         .join(env!("CARGO_PKG_NAME"))
         .join(env!("CARGO_CRATE_NAME"));
+    fs::create_dir_all(&cache_path).unwrap();
 
     // Load the dataset or generate random vectors.
     let (dataset_mmap, dataset);
@@ -291,7 +302,7 @@ fn main() {
         last_index = Arc::new(AtomicRefCell::new(VectorIndexEnum::Hnsw(index)));
 
         // Cleanup previous segment and index.
-        std::fs::remove_dir_all(last_segment_path).unwrap();
+        fs::remove_dir_all(last_segment_path).unwrap();
 
         // Slide the window.
         sliding_window =
@@ -345,7 +356,11 @@ fn dataset_hash<'a>(
         hasher.update(vector.as_bytes());
     }
 
-    format!("{:x}", hasher.finalize())
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 fn build_hnsw_index<R: Rng + ?Sized>(
@@ -363,7 +378,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
         max_indexing_threads: 0,
         on_disk: Some(false),
         payload_m: None,
-        copy_vectors: None,
+        inline_storage: None,
     };
 
     let open_args = HnswIndexOpenArgs {
@@ -385,7 +400,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
         return HNSWIndex::open(open_args).unwrap();
     }
 
-    let permit_cpu_count = num_rayon_threads(open_args.hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(open_args.hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     HNSWIndex::build(
@@ -398,6 +413,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
             stopped: &AtomicBool::new(false),
             hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: feature_flags(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap()
@@ -426,7 +442,7 @@ fn measure_accuracy(
                     .vector_index
                     .borrow()
                     .search(&[query], None, top, None, &Default::default())
-                    .pipe(|results| process_search_results(&*id_tracker, results))
+                    .pipe(|results| process_search_results(&id_tracker, results))
             })
             .collect::<Vec<_>>();
         log::debug!("Exact search time = {:?}", start.elapsed());
@@ -448,7 +464,7 @@ fn measure_accuracy(
                     }),
                     &Default::default(),
                 )
-                .pipe(|results| process_search_results(&*id_tracker, results));
+                .pipe(|results| process_search_results(&id_tracker, results));
 
             // Get number of same results.
             index_result
@@ -462,7 +478,7 @@ fn measure_accuracy(
 }
 
 fn process_search_results(
-    id_tracker: &IdTrackerSS,
+    id_tracker: &IdTrackerEnum,
     results: OperationResult<Vec<Vec<ScoredPointOffset>>>,
 ) -> Vec<ExtendedPointId> {
     // Expect exactly one result

@@ -9,8 +9,10 @@ use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::{
     CollectionUpdateOperations, CreateIndex, FieldIndexOperations, OperationWithClockTag,
 };
-use crate::shards::replica_set::{ReplicaState, ShardReplicaSet};
+use crate::shards::replica_set::ShardReplicaSet;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
 use crate::shards::shard::{PeerId, ShardId, ShardsPlacement};
+use crate::shards::shard_trait::WaitUntil;
 
 impl Collection {
     pub async fn create_replica_set(
@@ -33,7 +35,7 @@ impl Collection {
         ShardReplicaSet::build(
             shard_id,
             shard_key,
-            self.name(),
+            self.name().to_string(),
             self.this_peer_id,
             is_local,
             peers,
@@ -126,18 +128,19 @@ impl Collection {
                 replica_set
                     .update_local(
                         OperationWithClockTag::from(create_index_op),
-                        true,
+                        WaitUntil::Visible,
+                        None,
                         hw_counter.clone(),
                         false,
                     ) // TODO: Assign clock tag!? 🤔
                     .await?;
             }
 
-            self.shards_holder.write().await.add_shard(
-                shard_id,
-                replica_set,
-                Some(shard_key.clone()),
-            )?;
+            self.shards_holder
+                .write()
+                .await
+                .add_shard(shard_id, replica_set, Some(shard_key.clone()))
+                .await?;
         }
 
         Ok(())
@@ -187,5 +190,37 @@ impl Collection {
             .await
             .remove_shard_key(&shard_key)
             .await
+    }
+
+    pub async fn get_shard_ids(&self, shard_key: &ShardKey) -> CollectionResult<Vec<ShardId>> {
+        self.shards_holder
+            .read()
+            .await
+            .get_shard_key_to_ids_mapping()
+            .get(shard_key)
+            .map(|ids| ids.iter().cloned().collect())
+            .ok_or_else(|| {
+                CollectionError::bad_input(format!(
+                    "Shard key {shard_key} does not exist for collection {}",
+                    self.name()
+                ))
+            })
+    }
+
+    pub async fn get_replicas(
+        &self,
+        shard_key: &ShardKey,
+    ) -> CollectionResult<Vec<(ShardId, PeerId)>> {
+        let shard_ids = self.get_shard_ids(shard_key).await?;
+        let shard_holder = self.shards_holder.read().await;
+        let mut replicas = Vec::new();
+        for shard_id in shard_ids {
+            if let Some(replica_set) = shard_holder.get_shard(shard_id) {
+                for (peer_id, _) in replica_set.peers() {
+                    replicas.push((shard_id, peer_id));
+                }
+            }
+        }
+        Ok(replicas)
     }
 }

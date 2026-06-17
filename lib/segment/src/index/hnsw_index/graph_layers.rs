@@ -1,11 +1,40 @@
+//! # Search on level functions
+//!
+//! This module contains multiple variations of the SEARCH-LAYER function.
+//! All of them implement a beam (greedy) search for closest points within a
+//! single graph layer.
+//!
+//! - [`GraphLayersBase::search_on_level`]
+//!   Regular search, as described in the original HNSW paper.
+//!   Usually used on layer 0.
+//!
+//! - [`GraphLayersBase::search_on_level_acorn`]
+//!   Variation of `search_on_level` that implements the ACORN-1 algorithm.
+//!   Usually used on layer 0.
+//!
+//! - [`GraphLayersBase::search_entry_on_level`]
+//!   Simplified version of `search_on_level` that uses beam size of 1.
+//!   Usually used on all levels above level 0.
+//!
+//! - [`GraphLayersWithVectors::search_on_level_with_vectors`]
+//!   Like `search_on_level`, but for graphs with [inline storage].
+//!
+//! - [`GraphLayersWithVectors::search_entry_on_level_with_vectors`]
+//!   Like `search_entry_on_level`, but for graphs with [inline storage].
+//!
+//! [inline storage]: crate::types::HnswConfig::inline_storage
+
 use std::borrow::Cow;
 use std::cmp::max;
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 
 use common::fixed_length_priority_queue::FixedLengthPriorityQueue;
+use common::fs::{atomic_save, read_bin};
 use common::types::{PointOffsetType, ScoredPointOffset};
-use io::file_operations::{atomic_save, read_bin};
+use common::universal_io::{MmapFs, UniversalReadFs, read_bin_via};
+use fs_err as fs;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +78,12 @@ pub struct GraphLayers {
     pub(super) visited_pool: VisitedPool,
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum SearchAlgorithm {
+    Hnsw,
+    Acorn,
+}
+
 pub trait GraphLayersBase {
     fn get_visited_list_from_pool(&self) -> VisitedListHandle<'_>;
 
@@ -56,25 +91,42 @@ pub trait GraphLayersBase {
     where
         F: FnMut(PointOffsetType);
 
+    fn try_for_each_link<F>(
+        &self,
+        point_id: PointOffsetType,
+        level: usize,
+        f: F,
+    ) -> ControlFlow<(), ()>
+    where
+        F: FnMut(PointOffsetType) -> ControlFlow<(), ()>;
+
     /// Get M based on current level
     fn get_m(&self, level: usize) -> usize;
 
-    /// Greedy search for closest points within a single graph layer
-    fn _search_on_level(
+    /// Beam search for closest points within a single graph layer.
+    ///
+    /// See [module docs](self) for comparison with other search functions.
+    fn search_on_level(
         &self,
-        searcher: &mut SearchContext,
+        level_entry: ScoredPointOffset,
         level: usize,
-        visited_list: &mut VisitedListHandle,
+        ef: usize,
         points_scorer: &mut FilteredScorer,
         is_stopped: &AtomicBool,
-    ) -> CancellableResult<()> {
+    ) -> CancellableResult<FixedLengthPriorityQueue<ScoredPointOffset>> {
+        let mut visited_list = self.get_visited_list_from_pool();
+        visited_list.check_and_update_visited(level_entry.idx);
+
+        let mut search_context = SearchContext::new(ef);
+        search_context.process_candidate(level_entry);
+
         let limit = self.get_m(level);
         let mut points_ids: Vec<PointOffsetType> = Vec::with_capacity(2 * limit);
 
-        while let Some(candidate) = searcher.candidates.pop() {
+        while let Some(candidate) = search_context.candidates.pop() {
             check_process_stopped(is_stopped)?;
 
-            if candidate.score < searcher.lower_bound() {
+            if candidate.score < search_context.lower_bound() {
                 break;
             }
 
@@ -88,15 +140,19 @@ pub trait GraphLayersBase {
             points_scorer
                 .score_points(&mut points_ids, limit)
                 .for_each(|score_point| {
-                    searcher.process_candidate(score_point);
+                    search_context.process_candidate(score_point);
                     visited_list.check_and_update_visited(score_point.idx);
                 });
         }
 
-        Ok(())
+        Ok(search_context.nearest)
     }
 
-    fn search_on_level(
+    /// Variation of [`GraphLayersBase::search_on_level`] that implements the
+    /// ACORN-1 algorithm.
+    ///
+    /// See [module docs](self) for comparison with other search functions.
+    fn search_on_level_acorn(
         &self,
         level_entry: ScoredPointOffset,
         level: usize,
@@ -104,18 +160,86 @@ pub trait GraphLayersBase {
         points_scorer: &mut FilteredScorer,
         is_stopped: &AtomicBool,
     ) -> CancellableResult<FixedLengthPriorityQueue<ScoredPointOffset>> {
-        let mut visited_list = self.get_visited_list_from_pool();
-        visited_list.check_and_update_visited(level_entry.idx);
+        // Each node in `hop1_visited_list` either:
+        // a) Non-deleted node that going to be scored and added to
+        //    `search_context` for further expansion. (or already added)
+        // b) Deleted node that scheduled for exploration for 2-hop neighbors.
+        let mut hop1_visited_list = self.get_visited_list_from_pool();
+        hop1_visited_list.check_and_update_visited(level_entry.idx);
+
+        // Nodes in `hop2_visited_list` are already explored as 2-hop neighbors.
+        // Being in this list doesn't prevent the node to be handled again as
+        // 1-hop neighbor.
+        let mut hop2_visited_list = self.get_visited_list_from_pool();
+
         let mut search_context = SearchContext::new(ef);
         search_context.process_candidate(level_entry);
 
-        self._search_on_level(
-            &mut search_context,
-            level,
-            &mut visited_list,
-            points_scorer,
-            is_stopped,
-        )?;
+        // Limits are per every explored 1-hop or 2-hop neighbors, not total.
+        // This is necessary to avoid over-scoring when there are many
+        // additional graph links.
+        let hop1_limit = self.get_m(level);
+        let hop2_limit = self.get_m(level);
+        debug_assert_ne!(self.get_m(level), 0); // See `FilteredBytesScorer::score_points`
+
+        let mut to_score = Vec::with_capacity(hop1_limit * hop2_limit.min(16));
+        let mut to_explore = Vec::with_capacity(hop1_limit * hop2_limit.min(16));
+
+        while let Some(candidate) = search_context.candidates.pop() {
+            check_process_stopped(is_stopped)?;
+
+            if candidate.score < search_context.lower_bound() {
+                break;
+            }
+
+            to_explore.clear();
+            to_score.clear();
+
+            // Collect 1-hop neighbors (direct neighbors)
+            _ = self.try_for_each_link(candidate.idx, level, |hop1| {
+                if hop1_visited_list.check_and_update_visited(hop1) {
+                    return ControlFlow::Continue(());
+                }
+
+                if points_scorer.filters().check_vector(hop1) {
+                    to_score.push(hop1);
+                    if to_score.len() >= hop1_limit {
+                        return ControlFlow::Break(());
+                    }
+                } else {
+                    to_explore.push(hop1);
+                }
+                ControlFlow::Continue(())
+            });
+
+            // Collect 2-hop neighbors (neighbors of neighbors)
+            for &hop1 in &to_explore {
+                check_process_stopped(is_stopped)?;
+
+                let total_limit = to_score.len() + hop2_limit;
+                _ = self.try_for_each_link(hop1, level, |hop2| {
+                    if hop1_visited_list.check(hop2)
+                        || hop2_visited_list.check_and_update_visited(hop2)
+                    {
+                        return ControlFlow::Continue(());
+                    }
+
+                    if points_scorer.filters().check_vector(hop2) {
+                        hop1_visited_list.check_and_update_visited(hop2);
+                        to_score.push(hop2);
+                        if to_score.len() >= total_limit {
+                            return ControlFlow::Break(());
+                        }
+                    }
+                    ControlFlow::Continue(())
+                });
+            }
+
+            points_scorer
+                .score_points_unfiltered(&to_score)
+                .for_each(|score_point| search_context.process_candidate(score_point));
+        }
+
         Ok(search_context.nearest)
     }
 
@@ -150,6 +274,9 @@ pub trait GraphLayersBase {
         }
     }
 
+    /// Simplified version of `search_on_level` that uses beam size of 1.
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_entry_on_level(
         &self,
         entry_point: PointOffsetType,
@@ -192,39 +319,46 @@ pub trait GraphLayersBase {
 
 pub trait GraphLayersWithVectors: GraphLayersBase {
     /// Returns `true` if the current graph format contains vectors.
-    fn has_vectors(&self) -> bool;
+    fn has_inline_vectors(&self) -> bool;
 
     /// # Panics
     ///
     /// Panics when using a format that does not support vectors.
-    /// Check with [`Self::has_vectors()`] before calling this method.
+    /// Check with [`Self::has_inline_vectors()`] before calling this method.
     fn links_with_vectors(
         &self,
         point_id: PointOffsetType,
         level: usize,
     ) -> (&[u8], impl Iterator<Item = (PointOffsetType, &[u8])> + '_);
 
-    /// Similar to [`GraphLayersBase::_search_on_level`].
-    #[allow(clippy::too_many_arguments)]
-    fn _search_on_level_with_vectors(
+    /// Similar to [`GraphLayersBase::search_on_level`].
+    ///
+    /// See [module docs](self) for comparison with other search functions.
+    fn search_on_level_with_vectors(
         &self,
-        links_searcher: &mut SearchContext,
-        base_searcher: &mut SearchContext,
+        level_entry: ScoredPointOffset,
         level: usize,
-        visited_list: &mut VisitedListHandle,
+        ef: usize,
         links_scorer: &FilteredBytesScorer,
         base_scorer: &dyn QueryScorerBytes,
         is_stopped: &AtomicBool,
-    ) -> CancellableResult<()> {
+    ) -> CancellableResult<FixedLengthPriorityQueue<ScoredPointOffset>> {
+        let mut visited_list = self.get_visited_list_from_pool();
+        visited_list.check_and_update_visited(level_entry.idx);
+
+        let mut links_search_context = SearchContext::new(ef);
+        let mut base_search_context = SearchContext::new(ef);
+        links_search_context.process_candidate(level_entry);
+
         let limit = self.get_m(level);
         let mut points: Vec<(PointOffsetType, &[u8])> = Vec::with_capacity(2 * limit);
 
-        while let Some(candidate) = links_searcher.candidates.pop() {
+        while let Some(candidate) = links_search_context.candidates.pop() {
             check_process_stopped(is_stopped)?;
 
-            if candidate.score < links_searcher.lower_bound() {
+            if candidate.score < links_search_context.lower_bound() {
                 let (base_vector, _) = self.links_with_vectors(candidate.idx, level);
-                base_searcher.process_candidate(ScoredPointOffset {
+                base_search_context.process_candidate(ScoredPointOffset {
                     idx: candidate.idx,
                     score: base_scorer.score_bytes(base_vector),
                 });
@@ -238,7 +372,7 @@ pub trait GraphLayersWithVectors: GraphLayersBase {
                     points.push((link, link_vector));
                 }
             });
-            base_searcher.process_candidate(ScoredPointOffset {
+            base_search_context.process_candidate(ScoredPointOffset {
                 idx: candidate.idx,
                 score: base_scorer.score_bytes(base_vector),
             });
@@ -246,39 +380,11 @@ pub trait GraphLayersWithVectors: GraphLayersBase {
             links_scorer
                 .score_points(&mut points, limit)
                 .for_each(|score_point| {
-                    links_searcher.process_candidate(score_point);
+                    links_search_context.process_candidate(score_point);
                     visited_list.check_and_update_visited(score_point.idx);
                 });
         }
 
-        Ok(())
-    }
-
-    /// Similar to [`GraphLayersBase::search_on_level`].
-    fn search_on_level_with_vectors(
-        &self,
-        level_entry: ScoredPointOffset,
-        level: usize,
-        ef: usize,
-        links_scorer: &FilteredBytesScorer,
-        base_scorer: &dyn QueryScorerBytes,
-        is_stopped: &AtomicBool,
-    ) -> CancellableResult<FixedLengthPriorityQueue<ScoredPointOffset>> {
-        let mut visited_list = self.get_visited_list_from_pool();
-        visited_list.check_and_update_visited(level_entry.idx);
-        let mut links_search_context = SearchContext::new(ef);
-        let mut base_search_context = SearchContext::new(ef);
-        links_search_context.process_candidate(level_entry);
-
-        self._search_on_level_with_vectors(
-            &mut links_search_context,
-            &mut base_search_context,
-            level,
-            &mut visited_list,
-            links_scorer,
-            base_scorer,
-            is_stopped,
-        )?;
         Ok(base_search_context.nearest)
     }
 
@@ -310,6 +416,8 @@ pub trait GraphLayersWithVectors: GraphLayersBase {
     }
 
     /// Similar to [`GraphLayersBase::search_entry_on_level`].
+    ///
+    /// See [module docs](self) for comparison with other search functions.
     fn search_entry_on_level_with_vectors<'a>(
         &'a self,
         entry_point: ScoredPointOffset,
@@ -356,13 +464,25 @@ impl GraphLayersBase for GraphLayers {
         self.links.links(point_id, level).for_each(f);
     }
 
+    fn try_for_each_link<F>(
+        &self,
+        point_id: PointOffsetType,
+        level: usize,
+        f: F,
+    ) -> ControlFlow<(), ()>
+    where
+        F: FnMut(PointOffsetType) -> ControlFlow<(), ()>,
+    {
+        self.links.links(point_id, level).try_for_each(f)
+    }
+
     fn get_m(&self, level: usize) -> usize {
         self.hnsw_m.level_m(level)
     }
 }
 
 impl GraphLayersWithVectors for GraphLayers {
-    fn has_vectors(&self) -> bool {
+    fn has_inline_vectors(&self) -> bool {
         self.links.format().is_with_vectors()
     }
 
@@ -412,6 +532,7 @@ impl GraphLayers {
         &self,
         top: usize,
         ef: usize,
+        algorithm: SearchAlgorithm,
         mut points_scorer: FilteredScorer,
         custom_entry_points: Option<&[PointOffsetType]>,
         is_stopped: &AtomicBool,
@@ -428,13 +549,15 @@ impl GraphLayers {
             &mut points_scorer,
             is_stopped,
         )?;
-        let nearest = self.search_on_level(
-            zero_level_entry,
-            0,
-            max(top, ef),
-            &mut points_scorer,
-            is_stopped,
-        )?;
+        let ef = max(ef, top);
+        let nearest = match algorithm {
+            SearchAlgorithm::Hnsw => {
+                self.search_on_level(zero_level_entry, 0, ef, &mut points_scorer, is_stopped)
+            }
+            SearchAlgorithm::Acorn => {
+                self.search_on_level_acorn(zero_level_entry, 0, ef, &mut points_scorer, is_stopped)
+            }
+        }?;
         Ok(nearest.into_iter_sorted().take(top).collect_vec())
     }
 
@@ -499,31 +622,73 @@ impl GraphLayers {
     }
 }
 
+pub enum LoadOption<Fs: UniversalReadFs> {
+    /// Open as a mmap without populating it.
+    OnDiskMmap,
+    /// Load whole file into RAM using a generic backend.
+    RamFromUniversal { fs: Fs },
+}
+
+impl LoadOption<MmapFs> {
+    pub fn on_disk_mmap() -> Self {
+        Self::OnDiskMmap
+    }
+
+    pub fn ram_from_mmap() -> Self {
+        Self::RamFromUniversal { fs: MmapFs }
+    }
+}
+
 impl GraphLayers {
-    pub fn load(dir: &Path, on_disk: bool, compress: bool) -> OperationResult<Self> {
-        let graph_data: GraphLayerData = read_bin(&GraphLayers::get_path(dir))?;
+    pub fn load<Fs>(
+        dir: &Path,
+        load_option: LoadOption<Fs>,
+        compress: bool,
+    ) -> OperationResult<Self>
+    where
+        Fs: UniversalReadFs,
+    {
+        let graph_data_path = GraphLayers::get_path(dir);
+        let graph_data: GraphLayerData = match &load_option {
+            LoadOption::OnDiskMmap => read_bin(&graph_data_path)?,
+            LoadOption::RamFromUniversal { fs } => read_bin_via(fs, &graph_data_path)?,
+        };
 
         if compress {
+            // TODO: use `Fs` within this function? It writes data, and we don't have `UniversalWriteFs` yet.
+            //       It is not enabled as per `LINK_COMPRESSION_CONVERT_EXISTING` anyway.
             Self::convert_to_compressed(dir, HnswM::new(graph_data.m, graph_data.m0))?;
         }
 
         Ok(Self {
             hnsw_m: HnswM::new(graph_data.m, graph_data.m0),
-            links: Self::load_links(dir, on_disk)?,
+            links: Self::load_links(dir, load_option)?,
             entry_points: graph_data.entry_points.into_owned(),
             visited_pool: VisitedPool::new(),
         })
     }
 
-    fn load_links(dir: &Path, on_disk: bool) -> OperationResult<GraphLinks> {
+    fn load_links<Fs>(dir: &Path, load_option: LoadOption<Fs>) -> OperationResult<GraphLinks>
+    where
+        Fs: UniversalReadFs,
+    {
         for format in [
             GraphLinksFormat::CompressedWithVectors,
             GraphLinksFormat::Compressed,
             GraphLinksFormat::Plain,
         ] {
             let path = GraphLayers::get_links_path(dir, format);
-            if path.exists() {
-                return GraphLinks::load_from_file(&path, on_disk, format);
+            match &load_option {
+                LoadOption::OnDiskMmap => {
+                    if path.exists() {
+                        return GraphLinks::load_from_mmap(&path, format);
+                    }
+                }
+                LoadOption::RamFromUniversal { fs } => {
+                    if fs.exists(&path)? {
+                        return GraphLinks::load_from_universal_file(fs, &path, format);
+                    }
+                }
             }
         }
         Err(OperationError::service_error("No links file found"))
@@ -546,16 +711,17 @@ impl GraphLayers {
 
         let start = std::time::Instant::now();
 
-        let links = GraphLinks::load_from_file(&plain_path, true, GraphLinksFormat::Plain)?;
-        let original_size = plain_path.metadata()?.len();
+        let links =
+            GraphLinks::load_from_universal_file(&MmapFs, &plain_path, GraphLinksFormat::Plain)?;
+        let original_size = fs::metadata(&plain_path)?.len();
         atomic_save(&compressed_path, |writer| {
             let edges = links.to_edges();
             serialize_graph_links(edges, GraphLinksFormatParam::Compressed, hnsw_m, writer)
         })?;
-        let new_size = compressed_path.metadata()?.len();
+        let new_size = fs::metadata(&compressed_path)?.len();
 
         // Remove the original file
-        std::fs::remove_file(plain_path)?;
+        fs::remove_file(&plain_path)?;
 
         log::debug!(
             "Compressed HNSW graph links in {:.1?}: {:.1}MB -> {:.1}MB ({:.1}%)",
@@ -587,6 +753,17 @@ impl GraphLayers {
         self.links.populate()?;
         Ok(())
     }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        let Self {
+            hnsw_m: _,
+            links,
+            entry_points: _,
+            visited_pool: _,
+        } = self;
+        links.clear_cache()?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -605,7 +782,7 @@ mod tests {
     use crate::spaces::metric::Metric;
     use crate::spaces::simple::CosineMetric;
     use crate::types::Distance;
-    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorage};
+    use crate::vector_storage::{DEFAULT_STOPPED, VectorStorageRead};
 
     fn search_in_graph(
         query: &[VectorElementType],
@@ -617,7 +794,14 @@ mod tests {
 
         let ef = 16;
         graph
-            .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+            .search(
+                top,
+                ef,
+                SearchAlgorithm::Hnsw,
+                scorer,
+                None,
+                &DEFAULT_STOPPED,
+            )
             .unwrap()
     }
 
@@ -722,7 +906,7 @@ mod tests {
         let res1 = search_in_graph(&query, top, &vector_holder, &graph1);
         drop(graph1);
 
-        let graph2 = GraphLayers::load(dir.path(), false, compress).unwrap();
+        let graph2 = GraphLayers::load(dir.path(), LoadOption::ram_from_mmap(), compress).unwrap();
         if compress {
             assert_eq!(graph2.links.format(), GraphLinksFormat::Compressed);
         } else {

@@ -11,7 +11,7 @@ use segment::data_types::facets::{FacetParams, FacetResponse};
 
 use super::TableOfContent;
 use crate::content_manager::errors::StorageResult;
-use crate::rbac::{Access, AccessRequirements};
+use crate::rbac::{AccessRequirements, Auth};
 
 impl TableOfContent {
     pub async fn query_batch_internal(
@@ -41,8 +41,17 @@ impl TableOfContent {
     ) -> StorageResult<FacetResponse> {
         let collection = self.get_collection_unchecked(collection_name).await?;
 
+        let peer_limit = request.limit;
+
         let res = collection
-            .facet(request, shard_selection, None, timeout, hw_measurement_acc)
+            .facet_internal(
+                request,
+                peer_limit,
+                shard_selection,
+                None,
+                timeout,
+                hw_measurement_acc,
+            )
             .await?;
 
         Ok(res)
@@ -52,12 +61,15 @@ impl TableOfContent {
         &self,
         collection_name: &str,
         shard_id: ShardId,
-        access: Access,
+        auth: Auth,
         wait: bool,
         timeout: Option<Duration>,
     ) -> StorageResult<UpdateResult> {
-        let collection_pass = access
-            .check_collection_access(collection_name, AccessRequirements::new().write().whole())?;
+        let collection_pass = auth.check_collection_access(
+            collection_name,
+            AccessRequirements::new().write(),
+            "cleanup_local_shard",
+        )?;
 
         self.get_collection(&collection_pass)
             .await?

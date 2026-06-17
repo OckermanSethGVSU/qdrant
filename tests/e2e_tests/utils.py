@@ -2,6 +2,8 @@
 import gzip
 import os
 import shutil
+import socket
+import ssl
 import subprocess
 import tarfile
 import time
@@ -17,28 +19,69 @@ from docker.errors import NotFound
 from .models import QdrantContainer, QdrantContainerConfig, QdrantDockerCluster
 
 
-def wait_for_qdrant_ready(port: int = 6333, timeout: int = 30) -> bool:
-    """Wait for Qdrant service to be ready."""
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+def remove_dir(path: Path) -> None:
+    """Remove a directory and all its contents.
+
+    Args:
+        path: Path to the directory to remove
+    """
+    if path.exists():
+        shutil.rmtree(path, ignore_errors=True)
+        print(f"Removed directory: {path}")
+
+
+def wait_for_qdrant_ready(
+    port: int = 6333,
+    timeout: int = 30,
+    *,
+    host: str = "localhost",
+    scheme: str = "http",
+    verify: Union[bool, str] = True,
+    cert: Optional[Tuple[str, str]] = None,
+    grpc_port: Optional[int] = None,
+) -> bool:
+    """Poll /readyz; if grpc_port is set, also require a TCP/TLS handshake on it."""
+    url = f"{scheme}://{host}:{port}/readyz"
+
+    tls_ctx: Optional[ssl.SSLContext] = None
+    if grpc_port is not None and scheme == "https":
+        tls_ctx = ssl.create_default_context(cafile=verify if isinstance(verify, str) else None)
+        if cert is not None:
+            tls_ctx.load_cert_chain(certfile=cert[0], keyfile=cert[1])
+
+    deadline = time.time() + timeout
+    while time.time() < deadline:
         try:
-            response = requests.get(f"http://localhost:{port}/readyz")
-            if response.status_code == 200:
+            if (requests.get(url, timeout=5, verify=verify, cert=cert).status_code == 200
+                    and _grpc_port_ready(host, grpc_port, tls_ctx)):
                 return True
-        except requests.exceptions.ConnectionError:
+        except requests.exceptions.RequestException:
             pass
         time.sleep(0.2)
     return False
 
 
+def _grpc_port_ready(host: str, grpc_port: Optional[int], tls_ctx: Optional[ssl.SSLContext]) -> bool:
+    if grpc_port is None:
+        return True
+    try:
+        with socket.create_connection((host, grpc_port), timeout=5) as sock:
+            if tls_ctx is None:
+                return True
+            with tls_ctx.wrap_socket(sock, server_hostname=host):
+                return True
+    except (OSError, ssl.SSLError):
+        return False
+
+
 def get_docker_compose_command() -> List[str]:
     """Detect and return the available docker-compose command.
-    
+
     Tries docker compose v2 first, then falls back to docker-compose v1.
-    
+
     Returns:
         List[str]: Command prefix for docker-compose (e.g., ["docker", "compose"] or ["docker-compose"])
-        
+
     Raises:
         RuntimeError: If neither docker compose nor docker-compose is available
     """
@@ -46,22 +89,22 @@ def get_docker_compose_command() -> List[str]:
         ["docker", "compose"],  # v2
         ["docker-compose"]  # v1
     ]
-    
+
     for cmd_prefix in compose_commands:
         test_cmd = cmd_prefix + ["version"]
         result = subprocess.run(test_cmd, capture_output=True, text=True)
         if result.returncode == 0:
             return cmd_prefix
-    
+
     raise RuntimeError("Neither 'docker compose' nor 'docker-compose' command found")
 
 
 def get_default_qdrant_config(qdrant_image: str) -> Dict[str, Any]:
     """Get default configuration for Qdrant container.
-    
+
     Args:
         qdrant_image: The Qdrant Docker image to use
-        
+
     Returns:
         dict: Default container configuration with image, ports, detach, and remove settings
     """
@@ -77,33 +120,45 @@ def extract_container_ports(container: docker.models.containers.Container) -> Tu
     """Extract HTTP and gRPC ports from container.
     For host network mode, returns standard Qdrant ports (6333, 6334).
     For bridge/custom networks, extracts mapped ports from container attributes.
-    
+
     Args:
         container: Docker container object
-        
+
     Returns:
         tuple: (http_port, grpc_port) - extracted port numbers
+
+    Raises:
+        NotFound: If container has already been removed (e.g., crashed with auto-remove)
+        RuntimeError: If port mappings cannot be extracted
     """
     container.reload()
-    
+
     if container.attrs.get('HostConfig', {}).get('NetworkMode') == 'host':
         # For host network mode, use standard Qdrant ports
         return 6333, 6334
-    
+
     # For bridge/custom networks, extract mapped ports
-    http_port = container.attrs['NetworkSettings']['Ports']['6333/tcp'][0]['HostPort']
-    grpc_port = container.attrs['NetworkSettings']['Ports']['6334/tcp'][0]['HostPort']
-    return int(http_port), int(grpc_port)
+    ports = container.attrs.get('NetworkSettings', {}).get('Ports', {})
+    http_mapping = ports.get('6333/tcp')
+    grpc_mapping = ports.get('6334/tcp')
+
+    if not http_mapping:
+        raise RuntimeError(f"Container {container.name} has no HTTP port mapping. Container may have exited.")
+
+    http_port = int(http_mapping[0]['HostPort'])
+    grpc_port = int(grpc_mapping[0]['HostPort']) if grpc_mapping else 6334
+
+    return http_port, grpc_port
 
 
 def create_container_info(container: docker.models.containers.Container, http_port: int, grpc_port: int) -> QdrantContainer:
     """Create standardized container info object.
-    
+
     Args:
         container: Docker container object
         http_port: HTTP API port number
         grpc_port: gRPC API port number
-        
+
     Returns:
         QdrantContainer: Container info object with container, host, name, http_port, and grpc_port attributes
     """
@@ -112,7 +167,7 @@ def create_container_info(container: docker.models.containers.Container, http_po
         host = "localhost"
     else:
         host = "127.0.0.1"
-    
+
     return QdrantContainer(
         container=container,
         host=host,
@@ -144,7 +199,7 @@ def cleanup_container(container: docker.models.containers.Container) -> None:
 
 def create_qdrant_container(docker_client: docker.DockerClient, qdrant_image: str, config: Optional[Union[Dict[str, Any], QdrantContainerConfig]] = None) -> QdrantContainer:
     """Core function to create a Qdrant container with given configuration.
-    
+
     Args:
         docker_client: Docker client instance
         qdrant_image: Qdrant Docker image to use
@@ -152,42 +207,42 @@ def create_qdrant_container(docker_client: docker.DockerClient, qdrant_image: st
             - exit_on_error (bool): If True (default), raises RuntimeError when Qdrant fails to start.
                                    If False, returns container info even if Qdrant doesn't start.
             All other parameters are passed to docker_client.containers.run()
-            
+
     Returns:
         QdrantContainer: Container info object (see create_container_info)
-        
+
     Raises:
         RuntimeError: If Qdrant fails to start and exit_on_error=True
     """
     if config is None:
         config = {}
-    
+
     # Handle both dict and QdrantContainerConfig inputs
     if isinstance(config, QdrantContainerConfig):
         exit_on_error = config.exit_on_error
         merged_config = config.to_docker_config(qdrant_image)
     else:
         config = dict(config)
-        
+
         # Extract custom parameters
         exit_on_error = config.pop("exit_on_error", True)
-        
+
         default_config = get_default_qdrant_config(qdrant_image)
         merged_config = {**default_config, **config}
-        
+
         # If using host network mode, remove port bindings
         if merged_config.get('network_mode') == 'host':
             merged_config.pop('ports', None)
-    
+
     container = docker_client.containers.run(**merged_config)
-    
+
     try:
         http_port, grpc_port = extract_container_ports(container)
-        
+
         if not wait_for_qdrant_ready(port=http_port, timeout=30):
             if exit_on_error:
                 raise RuntimeError("Qdrant failed to start within 30 seconds")
-        
+
         return create_container_info(container, http_port, grpc_port)
     except Exception:
         cleanup_container(container)
@@ -230,13 +285,13 @@ def extract_archive(archive_file: Path, extract_to: Path, cleanup_archive: bool 
         elif file_name.endswith(('.tar.xz', '.tar.gz', '.tar.bz2', '.tgz', '.tbz2')):
             # Handle compressed tar files
             with tarfile.open(archive_file, 'r:*') as tar:
-                tar.extractall(path=extract_to)
+                tar.extractall(path=extract_to, filter='data')
                 print(f"Extracted {archive_file} to {extract_to}")
 
         elif file_name.endswith('.tar'):
             # Handle uncompressed tar files
             with tarfile.open(archive_file, 'r:') as tar:
-                tar.extractall(path=extract_to)
+                tar.extractall(path=extract_to, filter='data')
                 print(f"Extracted {archive_file} to {extract_to}")
 
         elif file_name.endswith('.zip'):
@@ -247,7 +302,6 @@ def extract_archive(archive_file: Path, extract_to: Path, cleanup_archive: bool 
 
         else:
             raise ValueError(f"Unsupported archive format: {archive_file}")
-
 
     except (OSError, ValueError, tarfile.TarError, zipfile.BadZipFile) as e:
         print(f"Failed to extract archive {archive_file}: {e}")
@@ -326,12 +380,15 @@ def run_docker_compose(docker_client, qdrant_image, test_data_dir, config):
         docker_client: Docker client instance
         qdrant_image: Qdrant image to use
         test_data_dir: Path to test data directory
-        config: Configuration dict with compose_file, wait_for_ready, service_name
+        config: Configuration dict with compose_file, wait_for_ready, service_name,
+            and optional `readiness` block forwarded to wait_for_qdrant_ready
+            (keys: scheme, verify, cert, include_grpc).
 
     Returns:
         QdrantDockerCluster: Cluster object containing containers and cleanup function
     """
     wait_for_ready = config.get("wait_for_ready", True)
+    readiness = config.get("readiness") or {}
     compose_file = config.get("compose_file")
     if not compose_file:
         raise ValueError("compose_file parameter is required")
@@ -374,6 +431,12 @@ def run_docker_compose(docker_client, qdrant_image, test_data_dir, config):
     # Wait for ports to be assigned
     time.sleep(2)
 
+    def _readiness_kwargs(info: QdrantContainer) -> Dict[str, Any]:
+        kwargs = {k: v for k, v in readiness.items() if k != "include_grpc"}
+        if readiness.get("include_grpc") and info.grpc_port is not None:
+            kwargs["grpc_port"] = info.grpc_port
+        return {"port": info.http_port, "timeout": 60, **kwargs}
+
     if service_count == 1:
         # Single service compose file - always return single object
         project_containers = docker_client.containers.list(filters={"name": project_name})
@@ -385,7 +448,7 @@ def run_docker_compose(docker_client, qdrant_image, test_data_dir, config):
 
         # Wait for this specific container to be ready
         if wait_for_ready:
-            if not wait_for_qdrant_ready(port=container_info.http_port, timeout=60):
+            if not wait_for_qdrant_ready(**_readiness_kwargs(container_info)):
                 raise RuntimeError("Qdrant failed to start within 60 seconds")
 
     else:
@@ -402,7 +465,7 @@ def run_docker_compose(docker_client, qdrant_image, test_data_dir, config):
 
             # Wait for this specific container to be ready
             if wait_for_ready:
-                if not wait_for_qdrant_ready(port=container_info.http_port, timeout=60):
+                if not wait_for_qdrant_ready(**_readiness_kwargs(container_info)):
                     raise RuntimeError("Qdrant failed to start within 60 seconds")
 
         else:
@@ -426,7 +489,7 @@ def run_docker_compose(docker_client, qdrant_image, test_data_dir, config):
             # Wait for all containers to be ready
             if wait_for_ready:
                 for info in container_infos:
-                    if not wait_for_qdrant_ready(port=info.http_port, timeout=60):
+                    if not wait_for_qdrant_ready(**_readiness_kwargs(info)):
                         print(f"Warning: Container {info.name} failed to start within 60 seconds")
 
             container_info = container_infos  # Return the array

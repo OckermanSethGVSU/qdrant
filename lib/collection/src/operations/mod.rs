@@ -2,7 +2,6 @@ pub mod cluster_ops;
 pub mod config_diff;
 pub mod consistency_params;
 pub mod conversions;
-pub mod conversions_rest;
 pub mod generalizer;
 pub mod loggable;
 pub mod operation_effect;
@@ -12,6 +11,8 @@ pub mod shard_selector_internal;
 pub mod shared_storage_config;
 pub mod snapshot_ops;
 pub mod snapshot_storage_ops;
+#[cfg(feature = "staging")]
+pub mod staging;
 pub mod types;
 pub mod universal_query;
 pub mod validation;
@@ -20,11 +21,10 @@ pub mod vector_params_builder;
 pub mod verification;
 
 pub mod query_enum {
-    pub use shard::search::QueryEnum;
+    pub use shard::query::query_enum::QueryEnum;
 }
 
-use std::collections::HashMap;
-
+use ahash::AHashMap;
 use segment::types::ExtendedPointId;
 pub use shard::operations::*;
 
@@ -51,6 +51,13 @@ impl SplitByShard for CollectionUpdateOperations {
                 .split_by_shard(ring)
                 .map(CollectionUpdateOperations::PayloadOperation),
             operation @ CollectionUpdateOperations::FieldIndexOperation(_) => {
+                OperationToShard::to_all(operation)
+            }
+            operation @ CollectionUpdateOperations::VectorNameOperation(_) => {
+                OperationToShard::to_all(operation)
+            }
+            #[cfg(feature = "staging")]
+            operation @ CollectionUpdateOperations::StagingOperation(_) => {
                 OperationToShard::to_all(operation)
             }
         }
@@ -100,7 +107,7 @@ where
     I: IntoIterator<Item = O>,
     F: Fn(&O) -> ExtendedPointId,
 {
-    let mut op_vec_by_shard: HashMap<ShardId, Vec<O>> = HashMap::new();
+    let mut op_vec_by_shard: AHashMap<ShardId, Vec<O>> = AHashMap::new();
     for operation in iter {
         for shard_id in point_to_shards(&id_extractor(&operation), ring) {
             op_vec_by_shard

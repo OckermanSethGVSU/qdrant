@@ -6,17 +6,18 @@ use common::save_on_disk::SaveOnDisk;
 use segment::common::reciprocal_rank_fusion::DEFAULT_RRF_K;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, NamedQuery, VectorInternal};
 use segment::types::{PointIdType, WithPayloadInterface, WithVector};
+use shard::query::query_enum::QueryEnum;
 use tempfile::Builder;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 
-use crate::operations::query_enum::QueryEnum;
+use crate::common::adaptive_handle::AdaptiveSearchHandle;
 use crate::operations::types::CollectionError;
 use crate::operations::universal_query::shard_query::{
     FusionInternal, ScoringQuery, ShardPrefetch, ShardQueryRequest,
 };
 use crate::shards::local_shard::LocalShard;
-use crate::shards::shard_trait::ShardOperation;
+use crate::shards::shard_trait::{ShardOperation, WaitUntil};
 use crate::tests::fixtures::*;
 
 #[tokio::test(flavor = "multi_thread")]
@@ -27,7 +28,8 @@ async fn test_shard_query_rrf_rescoring() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -41,7 +43,7 @@ async fn test_shard_query_rrf_rescoring() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -52,14 +54,22 @@ async fn test_shard_query_rrf_rescoring() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
     // RRF query without prefetches
     let query = ShardQueryRequest {
         prefetches: vec![],
-        query: Some(ScoringQuery::Fusion(FusionInternal::RrfK(DEFAULT_RRF_K))),
+        query: Some(ScoringQuery::Fusion(FusionInternal::Rrf {
+            k: DEFAULT_RRF_K,
+            weights: None,
+        })),
         filter: None,
         score_threshold: None,
         limit: 0,
@@ -73,12 +83,13 @@ async fn test_shard_query_rrf_rescoring() {
     let sources_scores = shard
         .query_batch(Arc::new(vec![query]), &current_runtime, None, hw_acc)
         .await;
-    let expected_error =
-        CollectionError::bad_request("cannot apply Fusion without prefetches".to_string());
+    let expected_error = CollectionError::bad_input(
+        "Validation failed: cannot apply Fusion without prefetches".to_string(),
+    );
     assert!(matches!(sources_scores, Err(err) if err == expected_error));
 
     // RRF query with single prefetch
-    let nearest_query = QueryEnum::Nearest(NamedQuery::new_from_vector(
+    let nearest_query = QueryEnum::Nearest(NamedQuery::new(
         VectorInternal::Dense(vec![1.0, 2.0, 3.0, 4.0]),
         DEFAULT_VECTOR_NAME,
     ));
@@ -94,7 +105,10 @@ async fn test_shard_query_rrf_rescoring() {
     let outer_limit = 2;
     let query = ShardQueryRequest {
         prefetches: vec![nearest_query_prefetch.clone()],
-        query: Some(ScoringQuery::Fusion(FusionInternal::RrfK(DEFAULT_RRF_K))),
+        query: Some(ScoringQuery::Fusion(FusionInternal::Rrf {
+            k: DEFAULT_RRF_K,
+            weights: None,
+        })),
         filter: None,
         score_threshold: None,
         limit: outer_limit,
@@ -141,7 +155,10 @@ async fn test_shard_query_rrf_rescoring() {
             nearest_query_prefetch.clone(),
             nearest_query_prefetch.clone(),
         ],
-        query: Some(ScoringQuery::Fusion(FusionInternal::RrfK(DEFAULT_RRF_K))),
+        query: Some(ScoringQuery::Fusion(FusionInternal::Rrf {
+            k: DEFAULT_RRF_K,
+            weights: None,
+        })),
         filter: None,
         score_threshold: None,
         limit: outer_limit,
@@ -185,7 +202,10 @@ async fn test_shard_query_rrf_rescoring() {
                 ..nearest_query_prefetch.clone()
             },
         ],
-        query: Some(ScoringQuery::Fusion(FusionInternal::RrfK(DEFAULT_RRF_K))),
+        query: Some(ScoringQuery::Fusion(FusionInternal::Rrf {
+            k: DEFAULT_RRF_K,
+            weights: None,
+        })),
         filter: None,
         score_threshold: None,
         limit: outer_limit,
@@ -219,7 +239,8 @@ async fn test_shard_query_vector_rescoring() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -233,7 +254,7 @@ async fn test_shard_query_vector_rescoring() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -244,11 +265,16 @@ async fn test_shard_query_vector_rescoring() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
-    let nearest_query = QueryEnum::Nearest(NamedQuery::new_from_vector(
+    let nearest_query = QueryEnum::Nearest(NamedQuery::new(
         VectorInternal::Dense(vec![1.0, 2.0, 3.0, 4.0]),
         DEFAULT_VECTOR_NAME,
     ));
@@ -357,7 +383,8 @@ async fn test_shard_query_payload_vector() {
 
     let collection_name = "test".to_string();
 
-    let current_runtime: Handle = Handle::current();
+    let update_runtime = Handle::current();
+    let current_runtime: AdaptiveSearchHandle = AdaptiveSearchHandle::current_for_tests();
 
     let payload_index_schema_dir = Builder::new().prefix("qdrant-test").tempdir().unwrap();
     let payload_index_schema_file = payload_index_schema_dir.path().join("payload-schema.json");
@@ -371,7 +398,7 @@ async fn test_shard_query_payload_vector() {
         Arc::new(RwLock::new(config.clone())),
         Arc::new(Default::default()),
         payload_index_schema,
-        current_runtime.clone(),
+        update_runtime.clone(),
         current_runtime.clone(),
         ResourceBudget::default(),
         config.optimizer_config.clone(),
@@ -382,11 +409,16 @@ async fn test_shard_query_payload_vector() {
     let upsert_ops = upsert_operation();
 
     shard
-        .update(upsert_ops.into(), true, HwMeasurementAcc::new())
+        .update(
+            upsert_ops.into(),
+            WaitUntil::Visible,
+            None,
+            HwMeasurementAcc::new(),
+        )
         .await
         .unwrap();
 
-    let nearest_query = QueryEnum::Nearest(NamedQuery::new_from_vector(
+    let nearest_query = QueryEnum::Nearest(NamedQuery::new(
         VectorInternal::Dense(vec![1.0, 2.0, 3.0, 4.0]),
         DEFAULT_VECTOR_NAME,
     ));

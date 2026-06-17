@@ -4,31 +4,34 @@ use std::sync::atomic::AtomicBool;
 
 use common::budget::ResourcePermit;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use common::types::TelemetryDetail;
+use ordered_float::OrderedFloat;
 use rand::prelude::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rstest::rstest;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, only_default_multi_vector};
 use segment::entry::entry_point::SegmentEntry;
 use segment::fixtures::payload_fixtures::{random_int_payload, random_multi_vector};
 use segment::fixtures::query_fixtures::{QueryVariant, random_multi_vec_query};
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::{PayloadIndex, VectorIndex};
+use segment::index::{PayloadIndex, VectorIndexRead};
 use segment::segment_constructor::build_segment;
 use segment::types::{
     Condition, Distance, FieldCondition, Filter, HnswConfig, Indexes, MultiVectorConfig,
     PayloadSchemaType, Range, SearchParams, SegmentConfig, SeqNumberType, VectorDataConfig,
     VectorStorageType,
 };
-use segment::vector_storage::VectorStorage;
+use segment::vector_storage::VectorStorageRead;
 use tempfile::Builder;
 
 /// Check all cases with single vector per multi and several vectors per multi
+#[cfg_attr(target_os = "windows", ignore = "slow on Windows, not OS-specific")]
 #[rstest]
 #[case::nearest_eq(QueryVariant::Nearest, 1, 32, 5)]
 #[case::nearest_multi(QueryVariant::Nearest, 3, 64, 20)]
-#[case::discovery_eq(QueryVariant::Discovery, 1, 128, 5)]
-#[case::discovery_multi(QueryVariant::Discovery, 3, 128, 20)]
+#[case::discover_eq(QueryVariant::Discover, 1, 128, 5)]
+#[case::discover_multi(QueryVariant::Discover, 3, 128, 20)]
 #[case::recobestscore_eq(QueryVariant::RecoBestScore, 1, 64, 5)]
 #[case::recobestscore_multi(QueryVariant::RecoBestScore, 2, 64, 10)]
 #[case::recosumscores_eq(QueryVariant::RecoSumScores, 1, 64, 5)]
@@ -81,7 +84,7 @@ fn test_multi_filterable_hnsw(
 
     let hw_counter = HardwareCounterCell::new();
 
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_segment(dir.path(), &config, None, true).unwrap();
     for n in 0..num_points {
         let idx = n.into();
         // Random number of vectors per multivec point
@@ -124,7 +127,7 @@ fn test_multi_filterable_hnsw(
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
-        copy_vectors: None,
+        inline_storage: None,
     };
 
     let permit_cpu_count = 1; // single-threaded for deterministic build
@@ -149,6 +152,7 @@ fn test_multi_filterable_hnsw(
             stopped: &stopped,
             hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();
@@ -171,8 +175,8 @@ fn test_multi_filterable_hnsw(
             Range {
                 lt: None,
                 gt: None,
-                gte: Some(f64::from(left_range)),
-                lte: Some(f64::from(right_range)),
+                gte: Some(OrderedFloat(f64::from(left_range))),
+                lte: Some(OrderedFloat(f64::from(right_range))),
             },
         )));
 

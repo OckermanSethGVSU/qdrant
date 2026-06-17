@@ -1,5 +1,4 @@
-#[cfg(feature = "testing")]
-use std::fs::File;
+use std::borrow::Cow;
 #[cfg(feature = "testing")]
 use std::io::{Read, Write};
 #[cfg(feature = "testing")]
@@ -9,14 +8,29 @@ use std::path::Path;
 use std::path::PathBuf;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+#[cfg(feature = "testing")]
+use common::fs::OneshotFile;
+use common::mmap::MmapFlusher;
 use common::types::PointOffsetType;
 #[cfg(feature = "testing")]
-use memory::fadvise::OneshotFile;
-use memory::mmap_type::MmapFlusher;
+use fs_err as fs;
+#[cfg(feature = "testing")]
+use fs_err::File;
 
 pub trait EncodedStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> &[u8];
+    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]>;
 
+    fn iter_batch(
+        &self,
+        offsets: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
+        offsets
+            .iter()
+            .map(move |&offset| self.get_vector_data(offset))
+            .enumerate()
+    }
+
+    fn is_in_ram_or_mmap() -> bool;
     fn is_on_disk(&self) -> bool;
 
     fn upsert_vector(
@@ -33,14 +47,52 @@ pub trait EncodedStorage {
     fn files(&self) -> Vec<PathBuf>;
 
     fn immutable_files(&self) -> Vec<PathBuf>;
+
+    /// Additional heap memory used by this storage beyond what's tracked in files.
+    /// RAM-based storages should report their in-memory data size here.
+    fn heap_size_bytes(&self) -> usize;
 }
 
 pub trait EncodedStorageBuilder {
     type Storage: EncodedStorage;
+    type Error: std::fmt::Display;
 
-    fn build(self) -> std::io::Result<Self::Storage>;
+    fn build(self) -> Result<Self::Storage, Self::Error>;
 
-    fn push_vector_data(&mut self, other: &[u8]) -> std::io::Result<()>;
+    fn push_vector_data(&mut self, other: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Validate that every encoded vector in `storage` has exactly `expected_size` bytes — the
+/// per-vector size the quantizer derives from its metadata.
+///
+/// The scoring hot paths assume each stored vector has this exact size: the storage stride and
+/// the quantizer metadata are both derived from the same vector parameters, so on consistent data
+/// they always match. Verifying it once here at load time keeps that invariant guaranteed in
+/// release builds, without paying for a bounds check on every score.
+///
+/// The storage uses a fixed stride for every vector, so inspecting the first encoded vector is
+/// enough to validate all of them. An empty storage has no vector data to score, so there is
+/// nothing to check.
+pub(crate) fn validate_storage_vector_size(
+    storage: &impl EncodedStorage,
+    expected_size: usize,
+) -> std::io::Result<()> {
+    if storage.vectors_count() == 0 {
+        return Ok(());
+    }
+
+    let actual_size = storage.get_vector_data(0).len();
+    if actual_size != expected_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Quantized vector storage is inconsistent with its metadata: encoded vector size \
+                 is {actual_size} bytes, but metadata expects {expected_size} bytes",
+            ),
+        ));
+    }
+
+    Ok(())
 }
 
 #[cfg(feature = "testing")]
@@ -83,7 +135,7 @@ impl TestEncodedStorage {
 
 #[cfg(feature = "testing")]
 impl EncodedStorage for TestEncodedStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> &[u8] {
+    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
         let start = self
             .quantized_vector_size
             .get()
@@ -92,7 +144,8 @@ impl EncodedStorage for TestEncodedStorage {
             .quantized_vector_size
             .get()
             .saturating_mul(index as usize + 1);
-        self.data.get(start..end).unwrap_or(&[])
+
+        Cow::Borrowed(self.data.get(start..end).unwrap_or(&[]))
     }
 
     fn upsert_vector(
@@ -121,6 +174,10 @@ impl EncodedStorage for TestEncodedStorage {
         Ok(())
     }
 
+    fn is_in_ram_or_mmap() -> bool {
+        true
+    }
+
     fn is_on_disk(&self) -> bool {
         false
     }
@@ -143,6 +200,16 @@ impl EncodedStorage for TestEncodedStorage {
 
     fn immutable_files(&self) -> Vec<PathBuf> {
         self.files()
+    }
+
+    fn heap_size_bytes(&self) -> usize {
+        let Self {
+            data,
+            quantized_vector_size: _,
+            path: _,
+        } = self;
+
+        data.capacity()
     }
 }
 
@@ -169,6 +236,7 @@ impl TestEncodedStorageBuilder {
 #[cfg(feature = "testing")]
 impl EncodedStorageBuilder for TestEncodedStorageBuilder {
     type Storage = TestEncodedStorage;
+    type Error = std::io::Error;
 
     fn build(self) -> std::io::Result<Self::Storage> {
         if let Some(path) = &self.path {
@@ -179,7 +247,7 @@ impl EncodedStorageBuilder for TestEncodedStorageBuilder {
                         "Path must have a parent directory",
                     )
                 })
-                .and_then(std::fs::create_dir_all)?;
+                .and_then(fs::create_dir_all)?;
             let mut file = File::create(path)?;
             file.write_all(&self.data)?;
             file.sync_all()?;
@@ -195,5 +263,42 @@ impl EncodedStorageBuilder for TestEncodedStorageBuilder {
         debug_assert_eq!(other.len(), self.quantized_vector_size.get());
         self.data.extend_from_slice(other);
         Ok(())
+    }
+}
+
+#[cfg(all(test, feature = "testing"))]
+mod tests {
+    use super::*;
+
+    fn storage_with_stride(stride: usize, count: usize) -> TestEncodedStorage {
+        let mut builder = TestEncodedStorageBuilder::new(None, stride);
+        let vector = vec![0u8; stride];
+        for _ in 0..count {
+            builder.push_vector_data(&vector).unwrap();
+        }
+        builder.build().unwrap()
+    }
+
+    #[test]
+    fn accepts_matching_size() {
+        let storage = storage_with_stride(260, 4);
+        validate_storage_vector_size(&storage, 260).unwrap();
+    }
+
+    #[test]
+    fn rejects_mismatched_size() {
+        let storage = storage_with_stride(260, 4);
+        // Both a smaller and a larger expected size must be rejected (exact match required).
+        for expected_size in [130, 520] {
+            let err = validate_storage_vector_size(&storage, expected_size).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        }
+    }
+
+    #[test]
+    fn skips_empty_storage() {
+        let storage = storage_with_stride(260, 0);
+        // With no stored vectors there is nothing to check, so any size is accepted.
+        validate_storage_vector_size(&storage, 999).unwrap();
     }
 }

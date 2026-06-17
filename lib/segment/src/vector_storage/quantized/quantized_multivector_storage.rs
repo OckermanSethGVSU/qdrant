@@ -1,23 +1,39 @@
-use std::ops::DerefMut;
+use std::borrow::Cow;
+use std::ops::DerefMut as _;
 use std::path::{Path, PathBuf};
+use std::{iter, slice};
 
+use ahash::HashMapExt as _;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::mmap::{Advice, AdviceSetting, MmapFlusher, MmapSlice};
 use common::typelevel::False;
 use common::types::{PointOffsetType, ScoreType};
+use common::universal_io::{MmapFile, MmapFs, OpenOptions, Populate, ReadRange, TypedStorage};
+use fs_err as fs;
 use memmap2::MmapMut;
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_type::{MmapFlusher, MmapSlice};
 use quantization::EncodedVectors;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use crate::common::operation_error::OperationResult;
 use crate::data_types::vectors::{TypedMultiDenseVectorRef, VectorElementType};
 use crate::types::{MultiVectorComparator, MultiVectorConfig};
-use crate::vector_storage::Random;
-use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
-use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
+use crate::vector_storage::VectorOffsetType;
+use crate::vector_storage::chunked_vectors::ChunkedVectors;
 
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(
+    Copy,
+    Clone,
+    Debug,
+    Default,
+    PartialEq,
+    Deserialize,
+    Serialize,
+    bytemuck::Pod,
+    bytemuck::Zeroable,
+)]
+#[repr(C)]
 pub struct MultivectorOffset {
     pub start: PointOffsetType,
     pub count: PointOffsetType,
@@ -25,11 +41,21 @@ pub struct MultivectorOffset {
 
 pub trait MultivectorOffsets {
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset;
+
+    fn iter_offsets(
+        &self,
+        ids: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, MultivectorOffset)>;
 }
 
 #[allow(clippy::len_without_is_empty)]
 pub trait MultivectorOffsetsStorage: Sized {
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset;
+
+    fn iter_offsets(
+        &self,
+        ids: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, MultivectorOffset)>;
 
     fn len(&self) -> usize;
 
@@ -45,6 +71,8 @@ pub trait MultivectorOffsetsStorage: Sized {
     fn files(&self) -> Vec<PathBuf>;
 
     fn immutable_files(&self) -> Vec<PathBuf>;
+
+    fn heap_size_bytes(&self) -> usize;
 }
 
 pub struct MultivectorOffsetsStorageRam {
@@ -66,10 +94,7 @@ impl MultivectorOffsetsStorageRam {
     }
 
     pub fn load(path: &Path) -> OperationResult<Self> {
-        let offsets_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
+        let offsets_file = fs::OpenOptions::new().read(true).write(true).open(path)?;
         let offsets_mmap = unsafe { MmapMut::map_mut(&offsets_file) }?;
         let mut offsets_mmap_type =
             unsafe { MmapSlice::<MultivectorOffset>::try_from(offsets_mmap)? };
@@ -83,6 +108,13 @@ impl MultivectorOffsetsStorageRam {
 impl MultivectorOffsetsStorage for MultivectorOffsetsStorageRam {
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset {
         self.offsets[idx as usize]
+    }
+
+    fn iter_offsets(
+        &self,
+        ids: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, MultivectorOffset)> {
+        ids.iter().map(|&id| self.get_offset(id)).enumerate()
     }
 
     fn len(&self) -> usize {
@@ -115,11 +147,16 @@ impl MultivectorOffsetsStorage for MultivectorOffsetsStorageRam {
     fn immutable_files(&self) -> Vec<PathBuf> {
         vec![self.path.clone()]
     }
+
+    fn heap_size_bytes(&self) -> usize {
+        let Self { offsets, path: _ } = self;
+        offsets.capacity() * std::mem::size_of::<MultivectorOffset>()
+    }
 }
 
 #[derive(Debug)]
 pub struct MultivectorOffsetsStorageMmap {
-    offsets: MmapSlice<MultivectorOffset>,
+    offsets: TypedStorage<MmapFile, MultivectorOffset>,
     path: PathBuf,
 }
 
@@ -134,30 +171,76 @@ impl MultivectorOffsetsStorageMmap {
     }
 
     pub fn load(path: &Path) -> OperationResult<Self> {
-        let offsets_file = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)?;
-        let offsets_mmap = unsafe { MmapMut::map_mut(&offsets_file) }?;
-        let offsets = unsafe { MmapSlice::<MultivectorOffset>::try_from(offsets_mmap)? };
+        let offsets = TypedStorage::<MmapFile, MultivectorOffset>::open(
+            &MmapFs,
+            path,
+            OpenOptions {
+                writeable: false,
+                need_sequential: false,
+                populate: Populate::No,
+                advice: AdviceSetting::Global,
+            },
+            (),
+        )?;
+
         Ok(Self {
             offsets,
             path: path.to_path_buf(),
         })
     }
 
-    pub fn populate(&self) -> std::io::Result<()> {
-        self.offsets.populate()
+    pub fn populate(&self) -> OperationResult<()> {
+        Ok(self.offsets.populate()?)
+    }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        Ok(self.offsets.clear_ram_cache()?)
     }
 }
 
 impl MultivectorOffsetsStorage for MultivectorOffsetsStorageMmap {
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset {
-        self.offsets[idx as usize]
+        let offset = self
+            .offsets
+            .read::<Random>(ReadRange::one(
+                u64::from(idx) * size_of::<MultivectorOffset>() as u64,
+            ))
+            .expect("multi-vector offset read");
+
+        let [offset] = offset.as_ref() else {
+            unreachable!("multi-vector offsets are stored as a single-element slice");
+        };
+
+        *offset
+    }
+
+    fn iter_offsets(
+        &self,
+        ids: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, MultivectorOffset)> {
+        let ranges = ids.iter().copied().enumerate().map(|(idx, id)| {
+            let offset = u64::from(id) * size_of::<MultivectorOffset>() as u64;
+            let range = ReadRange::one(offset);
+            (idx, range)
+        });
+
+        self.offsets
+            .read_iter::<Random, _>(ranges)
+            .expect("multi-vector offsets iterator initialized")
+            .map(|result| {
+                let (idx, offset) = result.expect("multi-vector offset read");
+                let [offset] = offset.as_ref() else {
+                    unreachable!("multi-vector offsets are stored as a single-element slice");
+                };
+
+                (idx, *offset)
+            })
     }
 
     fn len(&self) -> usize {
-        self.offsets.len()
+        self.offsets
+            .len()
+            .expect("multi-vector offsets length read") as _
     }
 
     fn upsert_offset(
@@ -184,10 +267,19 @@ impl MultivectorOffsetsStorage for MultivectorOffsetsStorageMmap {
     fn immutable_files(&self) -> Vec<PathBuf> {
         vec![self.path.clone()]
     }
+
+    fn heap_size_bytes(&self) -> usize {
+        let Self {
+            offsets: _,
+            path: _,
+        } = self;
+
+        0
+    }
 }
 
 pub struct MultivectorOffsetsStorageChunkedMmap {
-    data: ChunkedMmapVectors<MultivectorOffset>,
+    data: ChunkedVectors<MultivectorOffset, MmapFile>,
 }
 
 impl MultivectorOffsetsStorageChunkedMmap {
@@ -211,7 +303,8 @@ impl MultivectorOffsetsStorageChunkedMmap {
         } else {
             AdviceSetting::Global
         };
-        let data = ChunkedMmapVectors::<MultivectorOffset>::open(
+        let data = ChunkedVectors::open(
+            MmapFs,
             path,
             1,
             advice,
@@ -223,22 +316,40 @@ impl MultivectorOffsetsStorageChunkedMmap {
     pub fn populate(&self) -> OperationResult<()> {
         self.data.populate()
     }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        let Self { data } = self;
+        data.clear_cache()
+    }
 }
 
 impl MultivectorOffsetsStorage for MultivectorOffsetsStorageChunkedMmap {
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset {
-        ChunkedVectorStorage::get::<Random>(&self.data, idx as VectorOffsetType)
-            .and_then(|offsets| offsets.first())
-            .cloned()
+        self.data
+            .get::<Random>(idx as VectorOffsetType)
+            .and_then(|offsets| offsets.first().copied())
             .unwrap_or_default()
     }
 
+    fn iter_offsets(
+        &self,
+        ids: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, MultivectorOffset)> {
+        self.data.iter(ids).map(|(idx, offset)| {
+            let [offset] = offset.as_ref() else {
+                unreachable!("multi-vector offsets are stored as a single-element slice");
+            };
+
+            (idx, *offset)
+        })
+    }
+
     fn len(&self) -> usize {
-        ChunkedVectorStorage::len(&self.data)
+        self.data.len()
     }
 
     fn flusher(&self) -> MmapFlusher {
-        let flusher = ChunkedMmapVectors::flusher(&self.data);
+        let flusher = ChunkedVectors::flusher(&self.data);
         Box::new(move || {
             flusher().map_err(|e| {
                 std::io::Error::other(format!("Failed to flush multivector offsets storage: {e}"))
@@ -253,21 +364,22 @@ impl MultivectorOffsetsStorage for MultivectorOffsetsStorageChunkedMmap {
         offset: MultivectorOffset,
         hw_counter: &HardwareCounterCell,
     ) -> std::io::Result<()> {
-        ChunkedVectorStorage::insert(
-            &mut self.data,
-            id as VectorOffsetType,
-            &[offset],
-            hw_counter,
-        )
-        .map_err(std::io::Error::other)
+        self.data
+            .insert(id as VectorOffsetType, &[offset], hw_counter)
+            .map_err(std::io::Error::other)
     }
 
     fn files(&self) -> Vec<PathBuf> {
-        ChunkedVectorStorage::files(&self.data)
+        self.data.files()
     }
 
     fn immutable_files(&self) -> Vec<PathBuf> {
-        ChunkedVectorStorage::immutable_files(&self.data)
+        self.data.immutable_files()
+    }
+
+    fn heap_size_bytes(&self) -> usize {
+        let Self { data: _ } = self;
+        0
     }
 }
 
@@ -281,6 +393,8 @@ where
     dim: usize,
     multi_vector_config: MultiVectorConfig,
 }
+
+pub type DynScore<'a, Query> = dyn Fn(&Vec<Query>) -> ScoreType + 'a;
 
 impl<QuantizedStorage, TMultivectorOffsetsStorage>
     QuantizedMultivectorStorage<QuantizedStorage, TMultivectorOffsetsStorage>
@@ -310,30 +424,188 @@ where
         }
     }
 
-    /// Custom `score_max_similarity` implementation for quantized vectors
-    fn score_point_max_similarity(
+    #[inline]
+    pub fn score_points_batch<F>(
         &self,
-        query: &Vec<QuantizedStorage::EncodedQuery>,
-        vector_index: PointOffsetType,
+        point_ids: &[PointOffsetType],
+        scorer: F,
+        scores: &mut [ScoreType],
+        hw_counter: &HardwareCounterCell,
+    ) where
+        F: Fn(&DynScore<QuantizedStorage::EncodedQuery>) -> ScoreType,
+    {
+        debug_assert_eq!(point_ids.len(), scores.len());
+
+        if QuantizedStorage::is_in_ram_or_mmap() {
+            // This function is optimized of in-ram access
+            // it doesn't do extra mem copies and assume reference access
+            self.score_points_batch_in_mem_like(point_ids, scorer, scores, hw_counter);
+        } else {
+            // Optimized for remote access from external storage,
+            // does memory copy, but minimizes assessed to external storage
+            self.score_points_batch_uring_like(point_ids, scorer, scores, hw_counter);
+        }
+    }
+
+    #[inline]
+    fn score_points_batch_in_mem_like<F>(
+        &self,
+        point_ids: &[PointOffsetType],
+        scorer: F,
+        scores: &mut [ScoreType],
+        hw_counter: &HardwareCounterCell,
+    ) where
+        F: Fn(&DynScore<QuantizedStorage::EncodedQuery>) -> ScoreType,
+    {
+        match self.multi_vector_config.comparator {
+            MultiVectorComparator::MaxSim => (),
+        }
+
+        for (index, &point_id) in point_ids.iter().enumerate() {
+            scores[index] = scorer(&|query| {
+                self.score_point_max_similarity(query, point_id, hw_counter) // inhibit rustfmt
+            });
+        }
+    }
+
+    #[inline]
+    fn score_points_batch_uring_like<F>(
+        &self,
+        point_ids: &[PointOffsetType],
+        scorer: F,
+        scores: &mut [ScoreType],
+        hw_counter: &HardwareCounterCell,
+    ) where
+        F: Fn(&DynScore<QuantizedStorage::EncodedQuery>) -> ScoreType,
+    {
+        match self.multi_vector_config.comparator {
+            MultiVectorComparator::MaxSim => (),
+        }
+
+        self.for_each_in_multi_batch(
+            point_ids,
+            |index, multi_vector| {
+                scores[index] = scorer(&|query| {
+                    self.score_vector_max_similarity(query, multi_vector, hw_counter)
+                });
+            },
+            hw_counter,
+        );
+    }
+
+    fn for_each_in_multi_batch(
+        &self,
+        point_ids: &[PointOffsetType],
+        mut callback: impl FnMut(usize, &[Cow<'_, [u8]>]),
+        hw_counter: &HardwareCounterCell,
+    ) {
+        debug_assert!(point_ids.len() <= u32::MAX as usize);
+
+        #[derive(Copy, Clone)]
+        struct State {
+            index: u32,
+            count: u32,
+        }
+
+        let mut state = Vec::with_capacity(point_ids.len());
+        let mut chunks = Vec::with_capacity(point_ids.len());
+
+        for (index, offset) in self.offsets.iter_offsets(point_ids) {
+            for _ in 0..offset.count {
+                state.push(State {
+                    index: index as u32,
+                    count: offset.count,
+                });
+            }
+
+            chunks.extend(offset.start..offset.start + offset.count);
+        }
+
+        hw_counter
+            .vector_io_read()
+            .incr_delta(chunks.len() * self.quantized_vector_size());
+
+        let mut multi_vectors = ahash::HashMap::new();
+
+        for (chunk_index, vector) in self.quantized_storage.iter_batch(&chunks) {
+            let State { index, count } = state[chunk_index];
+
+            if count == 1 {
+                callback(index as _, slice::from_ref(&vector));
+                continue;
+            }
+
+            let multi_vector = multi_vectors
+                .entry(index)
+                .or_insert_with(SmallVec::<[_; 4]>::new);
+
+            multi_vector.push(vector);
+
+            if multi_vector.len() == count as usize {
+                let multi_vector = multi_vectors.remove(&index).expect("multi-vector exists");
+                callback(index as _, &multi_vector);
+            }
+        }
+
+        debug_assert!(multi_vectors.is_empty());
+    }
+
+    /// Custom `score_max_similarity` implementation for quantized vectors.
+    /// Efficient for io_uring storage implementation.
+    fn score_vector_max_similarity(
+        &self,
+        query: &[QuantizedStorage::EncodedQuery],
+        multi_vector: &[Cow<'_, [u8]>],
         hw_counter: &HardwareCounterCell,
     ) -> ScoreType {
-        let offset = self.offsets.get_offset(vector_index);
         let mut sum = 0.0;
+
         for inner_query in query {
             let mut max_sim = ScoreType::NEG_INFINITY;
+
             // manual `max_by` for performance
-            for i in 0..offset.count {
-                let sim =
-                    self.quantized_storage
-                        .score_point(inner_query, offset.start + i, hw_counter);
-                if sim > max_sim {
+            for vector in multi_vector {
+                let sim = self
+                    .quantized_storage
+                    .score(inner_query, vector, hw_counter);
+
+                if max_sim < sim {
                     max_sim = sim;
                 }
             }
+
             // sum of max similarity
             sum += max_sim;
         }
+
         sum
+    }
+
+    /// Custom `score_max_similarity` implementation for quantized vectors.
+    /// Efficient for in-RAM and mmap storage implementations.
+    fn score_point_max_similarity(
+        &self,
+        query: &[QuantizedStorage::EncodedQuery],
+        point_id: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> ScoreType {
+        let offset = self.offsets.get_offset(point_id);
+        let offsets: SmallVec<[_; 8]> = (offset.start..offset.start + offset.count).collect();
+
+        let mut max_sim: SmallVec<[_; 8]> = SmallVec::new();
+        max_sim.resize(query.len(), ScoreType::NEG_INFINITY);
+
+        for (_, vector) in self.quantized_storage.iter_batch(&offsets) {
+            for (query_idx, query) in query.iter().enumerate() {
+                let sim = self.quantized_storage.score(query, &vector, hw_counter);
+
+                if max_sim[query_idx] < sim {
+                    max_sim[query_idx] = sim;
+                }
+            }
+        }
+
+        max_sim.into_iter().sum()
     }
 
     /// Custom `score_max_similarity` implementation for quantized vectors
@@ -387,6 +659,10 @@ where
     // TODO(colbert): refactor `EncodedVectors` to support multi vector storage after quantization migration
     type EncodedQuery = Vec<QuantizedStorage::EncodedQuery>;
 
+    fn is_in_ram_or_mmap() -> bool {
+        QuantizedStorage::is_in_ram_or_mmap()
+    }
+
     fn is_on_disk(&self) -> bool {
         self.quantized_storage.is_on_disk()
     }
@@ -400,6 +676,17 @@ where
             .multi_vectors()
             .map(|inner_vector| self.quantized_storage.encode_query(inner_vector))
             .collect()
+    }
+
+    fn iter_batch(&self, _: &[PointOffsetType]) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
+        unimplemented!("quantized multi-vector storage does not support `iter_batch`");
+
+        #[allow(unreachable_code)]
+        iter::empty()
+    }
+
+    fn score(&self, _: &Self::EncodedQuery, _: &[u8], _: &HardwareCounterCell) -> f32 {
+        unimplemented!("quantized multi-vector storage does not support `score`");
     }
 
     fn score_point(
@@ -512,6 +799,17 @@ where
         files
     }
 
+    fn heap_size_bytes(&self) -> usize {
+        let Self {
+            quantized_storage,
+            offsets,
+            dim: _,
+            multi_vector_config: _,
+        } = self;
+
+        quantized_storage.heap_size_bytes() + offsets.heap_size_bytes()
+    }
+
     type SupportsBytes = False;
     fn score_bytes(
         &self,
@@ -533,6 +831,13 @@ where
     fn get_offset(&self, idx: PointOffsetType) -> MultivectorOffset {
         self.offsets.get_offset(idx)
     }
+
+    fn iter_offsets(
+        &self,
+        ids: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, MultivectorOffset)> {
+        self.offsets.iter_offsets(ids)
+    }
 }
 
 fn create_offsets_file_from_iter(
@@ -547,10 +852,10 @@ fn create_offsets_file_from_iter(
                 "Path must have a parent directory",
             )
         })
-        .and_then(std::fs::create_dir_all)?;
+        .and_then(fs::create_dir_all)?;
 
     let offsets_file_size = count * std::mem::size_of::<MultivectorOffset>();
-    let offsets_file = std::fs::OpenOptions::new()
+    let offsets_file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)

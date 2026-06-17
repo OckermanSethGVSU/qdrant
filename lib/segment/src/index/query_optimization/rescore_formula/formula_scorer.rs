@@ -2,19 +2,16 @@ use std::collections::HashMap;
 use std::ops::Neg;
 
 use ahash::AHashMap;
-use common::counter::hardware_counter::HardwareCounterCell;
 use common::types::{PointOffsetType, ScoreType};
 use geo::{Distance, Haversine};
 use serde_json::Value;
 
 use super::parsed_formula::{
-    DatetimeExpression, DecayKind, ParsedExpression, ParsedFormula, PreciseScore, VariableId,
+    DatetimeExpression, DecayKind, ParsedExpression, PreciseScore, VariableId,
 };
 use super::value_retriever::VariableRetrieverFn;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::index::query_optimization::optimized_filter::{OptimizedCondition, check_condition};
-use crate::index::query_optimization::payload_provider::PayloadProvider;
-use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::json_path::JsonPath;
 use crate::types::{DateTimePayloadType, GeoPoint};
 
@@ -57,39 +54,20 @@ impl FriendlyName for DateTimePayloadType {
     }
 }
 
-impl StructPayloadIndex {
-    pub fn formula_scorer<'s, 'q>(
-        &'s self,
-        parsed_formula: &'q ParsedFormula,
-        prefetches_scores: &'q [AHashMap<PointOffsetType, ScoreType>],
-        hw_counter: &'q HardwareCounterCell,
-    ) -> FormulaScorer<'q>
-    where
-        's: 'q,
-    {
-        let ParsedFormula {
-            payload_vars,
-            conditions,
-            defaults,
-            formula,
-        } = parsed_formula;
-
-        let payload_retrievers = self.retrievers_map(payload_vars.clone(), hw_counter);
-
-        let payload_provider = PayloadProvider::new(self.payload.clone());
-        let total = self.available_point_count();
-        let condition_checkers = self
-            .convert_conditions(conditions, payload_provider, total, hw_counter)
-            .into_iter()
-            .map(|(checker, _estimation)| checker)
-            .collect();
-
+impl<'a> FormulaScorer<'a> {
+    pub(crate) fn new(
+        formula: ParsedExpression,
+        prefetches_scores: &'a [AHashMap<PointOffsetType, ScoreType>],
+        payload_retrievers: HashMap<JsonPath, VariableRetrieverFn<'a>>,
+        condition_checkers: Vec<OptimizedCondition<'a>>,
+        defaults: HashMap<VariableId, Value>,
+    ) -> Self {
         FormulaScorer {
-            formula: formula.clone(),
+            formula,
             prefetches_scores,
             payload_retrievers,
             condition_checkers,
-            defaults: defaults.clone(),
+            defaults,
         }
     }
 }
@@ -462,12 +440,12 @@ mod tests {
     #[case(ParsedExpression::new_neg(ParsedExpression::Constant(PreciseScoreOrdered::from(10.0))), -10.0)]
     // Error cases
     #[case(ParsedExpression::new_geo_distance(
-        GeoPoint { lat: 25.717877679163667, lon: -100.43383200156751 }, JsonPath::new(GEO_FIELD_NAME)
+        GeoPoint::new_unchecked(-100.43383200156751, 25.717877679163667), JsonPath::new(GEO_FIELD_NAME)
     ), 21926.494151786308)]
     #[should_panic(
         expected = r#"VariableTypeError { field_name: JsonPath { first_key: "number", rest: [] }, expected_type: "geo point", "#
     )]
-    #[case(ParsedExpression::new_geo_distance(GeoPoint { lat: 25.717877679163667, lon: -100.43383200156751 }, JsonPath::new(FIELD_NAME)), 0.0)]
+    #[case(ParsedExpression::new_geo_distance(GeoPoint::new_unchecked(-100.43383200156751, 25.717877679163667), JsonPath::new(FIELD_NAME)), 0.0)]
     #[should_panic(expected = r#"NonFiniteNumber { expression: "-1^0.4 = NaN" }"#)]
     #[case(ParsedExpression::new_pow(ParsedExpression::Constant(PreciseScoreOrdered::from(-1.0)), ParsedExpression::Constant(PreciseScoreOrdered::from(0.4))), 0.0)]
     #[should_panic(expected = r#"NonFiniteNumber { expression: "√-3 = NaN" }"#)]
@@ -530,7 +508,7 @@ mod tests {
         })
     )]
     // geo distance with default value
-    #[case(ParsedExpression::new_geo_distance(GeoPoint { lat: 25.717877679163667, lon: -100.43383200156751 }, JsonPath::new(NO_VALUE_GEO_POINT)), Ok(90951.29600298218))]
+    #[case(ParsedExpression::new_geo_distance(GeoPoint::new_unchecked(-100.43383200156751, 25.717877679163667), JsonPath::new(NO_VALUE_GEO_POINT)), Ok(90951.29600298218))]
     // datetime expression constant
     #[case(
         ParsedExpression::Datetime(DatetimeExpression::Constant("2025-03-18".parse().unwrap())),

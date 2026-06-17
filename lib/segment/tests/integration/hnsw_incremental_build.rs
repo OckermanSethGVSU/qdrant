@@ -6,18 +6,19 @@ use atomic_refcell::AtomicRefCell;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
+use common::progress_tracker::ProgressTracker;
 use itertools::Itertools as _;
 use rand::rngs::StdRng;
 use rand::seq::SliceRandom as _;
-use rand::{Rng, SeedableRng as _};
+use rand::{Rng, RngExt, SeedableRng as _};
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, QueryVector, VectorElementType, only_default_vector,
 };
 use segment::entry::SegmentEntry as _;
 use segment::fixtures::index_fixtures::random_vector;
 use segment::index::VectorIndexEnum;
+use segment::index::hnsw_index::get_num_indexing_threads;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
-use segment::index::hnsw_index::num_rayon_threads;
 use segment::segment::Segment;
 use segment::segment_constructor::VectorIndexBuildArgs;
 use segment::segment_constructor::simple_segment_constructor::build_simple_segment;
@@ -131,10 +132,10 @@ fn build_hnsw_index<R: Rng + ?Sized>(
         max_indexing_threads: 0,
         on_disk: Some(false),
         payload_m: None,
-        copy_vectors: None,
+        inline_storage: None,
     };
 
-    let permit_cpu_count = num_rayon_threads(hnsw_config.max_indexing_threads);
+    let permit_cpu_count = get_num_indexing_threads(hnsw_config.max_indexing_threads);
     let permit = Arc::new(ResourcePermit::dummy(permit_cpu_count as u32));
 
     HNSWIndex::build(
@@ -158,6 +159,7 @@ fn build_hnsw_index<R: Rng + ?Sized>(
             feature_flags: FeatureFlags::default().tap_mut(|flags| {
                 flags.incremental_hnsw_building = true;
             }),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap()

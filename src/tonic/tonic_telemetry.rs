@@ -6,8 +6,18 @@ use tower::Service;
 use tower_layer::Layer;
 
 use crate::common::telemetry_ops::requests_telemetry::{
-    TonicTelemetryCollector, TonicWorkerTelemetryCollector,
+    CollectionName, TonicTelemetryCollector, TonicWorkerTelemetryCollector,
 };
+
+/// Based on https://grpc.io/docs/guides/status-codes/
+/// Default gRPC status code for all responses (0 = OK)
+const DEFAULT_SUCCESS_GRPC_STATUS_CODE: i32 = 0;
+
+/// Based on https://grpc.io/docs/guides/status-codes/
+/// Default gRPC status code for errors (2 = UNKNOWN)
+const DEFAULT_FAILURE_GRPC_STATUS_CODE: i32 = 2;
+
+const GRPC_STATUS_HEADER: &str = "grpc-status";
 
 #[derive(Clone)]
 pub struct TonicTelemetryService<T> {
@@ -20,10 +30,11 @@ pub struct TonicTelemetryLayer {
     telemetry_collector: Arc<parking_lot::Mutex<TonicTelemetryCollector>>,
 }
 
-impl<S> Service<tonic::codegen::http::Request<tonic::transport::Body>> for TonicTelemetryService<S>
+impl<S, ReqBody, RespBody> Service<http::Request<ReqBody>> for TonicTelemetryService<S>
 where
-    S: Service<tonic::codegen::http::Request<tonic::transport::Body>>,
+    S: Service<http::Request<ReqBody>, Response = http::Response<RespBody>>,
     S::Future: Send + 'static,
+    ReqBody: Send + 'static,
 {
     type Response = S::Response;
     type Error = S::Error;
@@ -33,17 +44,39 @@ where
         self.service.poll_ready(cx)
     }
 
-    fn call(
-        &mut self,
-        request: tonic::codegen::http::Request<tonic::transport::Body>,
-    ) -> Self::Future {
+    fn call(&mut self, request: http::Request<ReqBody>) -> Self::Future {
         let method_name = request.uri().path().to_string();
         let future = self.service.call(request);
         let telemetry_data = self.telemetry_data.clone();
         Box::pin(async move {
             let instant = std::time::Instant::now();
             let response = future.await?;
-            telemetry_data.lock().add_response(method_name, instant);
+
+            // For gRPC, HTTP status is usually 200, check grpc-status header instead
+            // grpc-status: 0 = OK, non-zero = error
+            let status_code = response
+                .headers()
+                .get(GRPC_STATUS_HEADER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse::<i32>().ok())
+                .unwrap_or_else(|| {
+                    if response.status().is_success() {
+                        DEFAULT_SUCCESS_GRPC_STATUS_CODE
+                    } else {
+                        DEFAULT_FAILURE_GRPC_STATUS_CODE
+                    }
+                });
+
+            // Collection name is attached to response extensions by
+            // telemetry wrappers (see telemetry_wrapper.rs).
+            let collection_name = response
+                .extensions()
+                .get::<CollectionName>()
+                .map(|cn| cn.0.clone());
+
+            telemetry_data
+                .lock()
+                .add_response(method_name, instant, status_code, collection_name);
             Ok(response)
         })
     }

@@ -58,21 +58,21 @@ impl UnindexedField {
         collection_name: String,
     ) -> Result<Self, OperationError> {
         if field_schemas.is_empty() {
-            return Err(OperationError::ValidationError {
-                description: "Cannot create issue which won't have a solution".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "Cannot create issue which won't have a solution",
+            ));
         }
 
+        let encoded_collection_name = urlencoding::encode(&collection_name);
+
         let endpoint = match Uri::builder()
-            .path_and_query(format!("/collections/{collection_name}/index").as_str())
+            .path_and_query(format!("/collections/{encoded_collection_name}/index").as_str())
             .build()
         {
             Ok(uri) => uri,
             Err(e) => {
                 log::trace!("Failed to build uri: {e}");
-                return Err(OperationError::ValidationError {
-                    description: "Bad collection name".to_string(),
-                });
+                return Err(OperationError::validation_error("Bad collection name"));
             }
         };
 
@@ -124,7 +124,7 @@ impl Issue for UnindexedField {
     }
 
     fn solution(&self) -> Solution {
-        let mut solutions = self.field_schemas.iter().cloned().map(|field_schema| {
+        let mut solutions = self.field_schemas.iter().map(|field_schema| {
             let request_body = serde_json::json!({
                 "field_name": self.field_name,
                 "field_schema": field_schema,
@@ -189,6 +189,16 @@ fn infer_index_from_match_value(value: &MatchValue) -> Vec<FieldIndexType> {
 }
 
 fn infer_index_from_any_variants(value: &AnyVariants) -> Vec<FieldIndexType> {
+    // An empty `any`/`except` list is a no-op: `any: []` matches nothing and
+    // `except: []` excludes nothing, regardless of the field's data type. Since
+    // the value type cannot be inferred from an empty list (it degenerates to
+    // the keyword variant during deserialization), requiring a keyword/uuid
+    // index here would wrongly reject fields indexed as other types. No index
+    // is needed to evaluate a no-op condition.
+    if value.is_empty() {
+        return Vec::new();
+    }
+
     match value {
         AnyVariants::Strings(strings) => {
             let mut inferred = Vec::new();
@@ -385,6 +395,12 @@ impl<'a> Extractor<'a> {
             Condition::CustomIdChecker(_) => return,
             Condition::HasVector(_) => return,
         };
+
+        // An empty required-index set means the condition is a no-op (e.g.
+        // `match: {"any": []}` / `{"except": []}`) and needs no index.
+        if required_index.is_empty() {
+            return;
+        }
 
         let full_key = JsonPath::extend_or_new(nested_prefix, key);
 

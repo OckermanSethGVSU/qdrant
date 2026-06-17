@@ -16,6 +16,7 @@ use schemars::JsonSchema;
 use segment::json_path::JsonPath;
 use segment::types::{Filter, PayloadFieldSchema, PayloadKeyType, StrictModeConfig};
 use serde::{Deserialize, Serialize};
+use serde_with::DurationSeconds;
 use shard::operations::payload_ops::*;
 use shard::operations::*;
 use storage::content_manager::collection_meta_ops::*;
@@ -23,33 +24,43 @@ use storage::content_manager::collection_verification::check_strict_mode;
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::Access;
+use storage::rbac::{Access, AccessRequirements, Auth};
 use validator::Validate;
 
-use crate::common::inference::InferenceToken;
+use crate::common::inference::params::InferenceParams;
 use crate::common::inference::service::InferenceType;
 use crate::common::inference::update_requests::*;
 use crate::common::strict_mode::*;
+use crate::common::validate_vectors::validate_vector_dimensions;
 
+#[serde_with::serde_as]
 #[derive(Copy, Clone, Debug, Deserialize, Serialize, Validate)]
 pub struct UpdateParams {
     #[serde(default)]
     pub wait: bool,
     #[serde(default)]
     pub ordering: WriteOrdering,
+    #[serde_as(as = "Option<DurationSeconds<String>>")]
+    pub timeout: Option<Duration>,
 }
 
 impl UpdateParams {
     pub fn from_grpc(
         wait: Option<bool>,
         ordering: Option<api::grpc::qdrant::WriteOrdering>,
+        timeout: Option<u64>,
     ) -> tonic::Result<Self> {
         let params = Self {
             wait: wait.unwrap_or(false),
             ordering: write_ordering_from_proto(ordering)?,
+            timeout: timeout.map(Duration::from_secs),
         };
 
         Ok(params)
+    }
+
+    pub(crate) fn timeout_as_secs(&self) -> Option<usize> {
+        self.timeout.map(|timeout| timeout.as_secs() as usize)
     }
 }
 
@@ -57,16 +68,23 @@ impl UpdateParams {
 pub struct InternalUpdateParams {
     pub shard_id: Option<ShardId>,
     pub clock_tag: Option<ClockTag>,
+    /// When present, fully overrides the `wait` boolean from the public API message.
+    /// When absent, falls back to the `wait` boolean (backward compatible with older nodes).
+    pub wait_override: Option<collection::shards::shard_trait::WaitUntil>,
 }
 
 impl InternalUpdateParams {
     pub fn from_grpc(
         shard_id: Option<ShardId>,
         clock_tag: Option<api::grpc::qdrant::ClockTag>,
+        wait_override: Option<i32>,
     ) -> Self {
         Self {
             shard_id,
             clock_tag: clock_tag.map(ClockTag::from),
+            wait_override: wait_override
+                .and_then(|v| api::grpc::qdrant::WaitUntil::try_from(v).ok())
+                .map(collection::shards::shard_trait::WaitUntil::from),
         }
     }
 }
@@ -107,6 +125,19 @@ impl Validate for UpdateOperation {
 }
 
 impl StrictModeVerification for UpdateOperation {
+    fn consumes_memory(&self) -> bool {
+        match self {
+            UpdateOperation::Upsert(op) => op.upsert.consumes_memory(),
+            UpdateOperation::Delete(op) => op.delete.consumes_memory(),
+            UpdateOperation::SetPayload(op) => op.set_payload.consumes_memory(),
+            UpdateOperation::OverwritePayload(op) => op.overwrite_payload.consumes_memory(),
+            UpdateOperation::DeletePayload(op) => op.delete_payload.consumes_memory(),
+            UpdateOperation::ClearPayload(op) => op.clear_payload.consumes_memory(),
+            UpdateOperation::UpdateVectors(op) => op.update_vectors.consumes_memory(),
+            UpdateOperation::DeleteVectors(op) => op.delete_vectors.consumes_memory(),
+        }
+    }
+
     fn query_limit(&self) -> Option<usize> {
         None
     }
@@ -178,6 +209,10 @@ impl StrictModeVerification for UpdateOperation {
 }
 
 impl StrictModeVerification for CreateFieldIndex {
+    fn consumes_memory(&self) -> bool {
+        true
+    }
+
     async fn check_custom(
         &self,
         collection: &Collection,
@@ -281,47 +316,93 @@ pub async fn do_upsert_points(
     operation: PointInsertOperations,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    inference_params: InferenceParams,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<(UpdateResult, Option<models::InferenceUsage>), StorageError> {
+    use point_ops::UpdateMode;
+    use segment::types::Filter;
+
+    // The REST handler already runs this via `actix_web_validator::Json`, but the
+    // gRPC handler does not — without this, empty vectors entering through gRPC
+    // would only be rejected on the synchronous (wait=true) apply path.
+    operation
+        .validate()
+        .map_err(|err| StorageError::bad_input(err.to_string()))?;
+
     let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
+        .check_strict_mode(
+            &operation,
+            &collection_name,
+            params.timeout_as_secs(),
+            &auth,
+        )
         .await?;
 
-    let (operation, shard_key, usage, update_filter) = match operation {
+    let (operation, shard_key, usage, update_filter, update_mode) = match operation {
         PointInsertOperations::PointsBatch(batch) => {
             let PointsBatch {
                 batch,
                 shard_key,
                 update_filter,
+                update_mode,
             } = batch;
-            let (batch, usage) = convert_batch(batch, inference_token).await?;
+            let (batch, usage) = convert_batch(batch, inference_params).await?;
             let operation = PointInsertOperationsInternal::PointsBatch(batch);
-            (operation, shard_key, usage, update_filter)
+            let update_mode = update_mode.map(rest_update_mode_to_internal);
+            (operation, shard_key, usage, update_filter, update_mode)
         }
         PointInsertOperations::PointsList(list) => {
             let PointsList {
                 points,
                 shard_key,
                 update_filter,
+                update_mode,
             } = list;
             let (list, usage) =
-                convert_point_struct(points, InferenceType::Update, inference_token).await?;
+                convert_point_struct(points, InferenceType::Update, inference_params).await?;
             let operation = PointInsertOperationsInternal::PointsList(list);
-            (operation, shard_key, usage, update_filter)
+            let update_mode = update_mode.map(rest_update_mode_to_internal);
+            (operation, shard_key, usage, update_filter, update_mode)
         }
     };
 
-    let operation = if let Some(condition) = update_filter {
-        CollectionUpdateOperations::PointOperation(PointOperations::UpsertPointsConditional(
-            ConditionalInsertOperationInternal {
+    // Validate vector dimensions early, before writing to WAL.
+    // This ensures that dimension mismatches are reported even for async (wait=false) operations,
+    // rather than being silently discarded during background processing.
+    {
+        let collection_pass = auth
+            .unlogged_access()
+            .check_collection_access(&collection_name, AccessRequirements::new())?;
+        let collection = toc.get_collection(&collection_pass).await?;
+        let vectors_config = collection.vectors_config().await;
+        validate_vector_dimensions(&operation, &vectors_config)?;
+    }
+
+    // Decide which operation to use based on update_filter and update_mode
+    let operation = match (update_filter, update_mode) {
+        // If update_filter is provided, always use conditional upsert
+        (Some(condition), mode) => CollectionUpdateOperations::PointOperation(
+            PointOperations::UpsertPointsConditional(ConditionalInsertOperationInternal {
                 points_op: operation,
                 condition,
-            },
-        ))
-    } else {
-        CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(operation))
+                update_mode: mode,
+            }),
+        ),
+        // If update_mode is InsertOnly or UpdateOnly, use conditional upsert with empty filter
+        (None, Some(UpdateMode::InsertOnly)) | (None, Some(UpdateMode::UpdateOnly)) => {
+            CollectionUpdateOperations::PointOperation(PointOperations::UpsertPointsConditional(
+                ConditionalInsertOperationInternal {
+                    points_op: operation,
+                    condition: Filter::default(), // Empty filter matches all existing points
+                    update_mode,
+                },
+            ))
+        }
+        // Default: regular upsert
+        (None, None) | (None, Some(UpdateMode::Upsert)) => {
+            CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(operation))
+        }
     };
 
     let result = update(
@@ -331,12 +412,21 @@ pub async fn do_upsert_points(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await?;
 
     Ok((result, usage))
+}
+
+/// Convert REST UpdateMode to internal UpdateMode
+fn rest_update_mode_to_internal(mode: api::rest::schema::UpdateMode) -> point_ops::UpdateMode {
+    match mode {
+        api::rest::schema::UpdateMode::Upsert => point_ops::UpdateMode::Upsert,
+        api::rest::schema::UpdateMode::InsertOnly => point_ops::UpdateMode::InsertOnly,
+        api::rest::schema::UpdateMode::UpdateOnly => point_ops::UpdateMode::UpdateOnly,
+    }
 }
 
 pub async fn do_delete_points(
@@ -345,11 +435,11 @@ pub async fn do_delete_points(
     points: PointsSelector,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     let toc = toc_provider
-        .check_strict_mode(&points, &collection_name, None, &access)
+        .check_strict_mode(&points, &collection_name, params.timeout_as_secs(), &auth)
         .await?;
 
     let (operation, shard_key) = match points {
@@ -370,7 +460,7 @@ pub async fn do_delete_points(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await
@@ -383,12 +473,17 @@ pub async fn do_update_vectors(
     operation: UpdateVectors,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    inference_params: InferenceParams,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<(UpdateResult, Option<models::InferenceUsage>), StorageError> {
     let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
+        .check_strict_mode(
+            &operation,
+            &collection_name,
+            params.timeout_as_secs(),
+            &auth,
+        )
         .await?;
 
     let UpdateVectors {
@@ -398,7 +493,7 @@ pub async fn do_update_vectors(
     } = operation;
 
     let (points, usage) =
-        convert_point_vectors(points, InferenceType::Update, inference_token).await?;
+        convert_point_vectors(points, InferenceType::Update, inference_params).await?;
 
     let operation = CollectionUpdateOperations::VectorOperation(VectorOperations::UpdateVectors(
         UpdateVectorsOp {
@@ -414,7 +509,7 @@ pub async fn do_update_vectors(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await?;
@@ -428,13 +523,18 @@ pub async fn do_delete_vectors(
     operation: DeleteVectors,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     // TODO: Is this cancel safe!?
 
     let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
+        .check_strict_mode(
+            &operation,
+            &collection_name,
+            params.timeout_as_secs(),
+            &auth,
+        )
         .await?;
 
     let DeleteVectors {
@@ -462,7 +562,7 @@ pub async fn do_delete_vectors(
                 internal_params,
                 params,
                 shard_key.clone(),
-                access.clone(),
+                auth.clone(),
                 hw_measurement_acc.clone(),
             )
             .await?,
@@ -481,7 +581,7 @@ pub async fn do_delete_vectors(
                 internal_params,
                 params,
                 shard_key,
-                access,
+                auth,
                 hw_measurement_acc,
             )
             .await?,
@@ -497,11 +597,16 @@ pub async fn do_set_payload(
     operation: SetPayload,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
+        .check_strict_mode(
+            &operation,
+            &collection_name,
+            params.timeout_as_secs(),
+            &auth,
+        )
         .await?;
 
     let SetPayload {
@@ -527,7 +632,7 @@ pub async fn do_set_payload(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await
@@ -539,11 +644,16 @@ pub async fn do_overwrite_payload(
     operation: SetPayload,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
+        .check_strict_mode(
+            &operation,
+            &collection_name,
+            params.timeout_as_secs(),
+            &auth,
+        )
         .await?;
 
     let SetPayload {
@@ -570,7 +680,7 @@ pub async fn do_overwrite_payload(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await
@@ -582,11 +692,16 @@ pub async fn do_delete_payload(
     operation: DeletePayload,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     let toc = toc_provider
-        .check_strict_mode(&operation, &collection_name, None, &access)
+        .check_strict_mode(
+            &operation,
+            &collection_name,
+            params.timeout_as_secs(),
+            &auth,
+        )
         .await?;
 
     let DeletePayload {
@@ -610,7 +725,7 @@ pub async fn do_delete_payload(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await
@@ -622,11 +737,11 @@ pub async fn do_clear_payload(
     points: PointsSelector,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     let toc = toc_provider
-        .check_strict_mode(&points, &collection_name, None, &access)
+        .check_strict_mode(&points, &collection_name, params.timeout_as_secs(), &auth)
         .await?;
 
     let (point_operation, shard_key) = match points {
@@ -647,7 +762,7 @@ pub async fn do_clear_payload(
         internal_params,
         params,
         shard_key,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await
@@ -660,8 +775,8 @@ pub async fn do_batch_update_points(
     operations: Vec<UpdateOperation>,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
-    inference_token: InferenceToken,
+    auth: Auth,
+    inference_params: InferenceParams,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<(Vec<UpdateResult>, Option<InferenceUsage>), StorageError> {
     // Check strict mode for all batch operations, *before applying* them
@@ -669,7 +784,7 @@ pub async fn do_batch_update_points(
 
     for operation in &operations {
         toc = toc_provider
-            .check_strict_mode(operation, &collection_name, None, &access)
+            .check_strict_mode(operation, &collection_name, params.timeout_as_secs(), &auth)
             .await?
             .into();
     }
@@ -694,8 +809,8 @@ pub async fn do_batch_update_points(
                     operation.upsert,
                     internal_params,
                     params,
-                    access.clone(),
-                    inference_token.clone(),
+                    auth.clone(),
+                    inference_params.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?;
@@ -710,7 +825,7 @@ pub async fn do_batch_update_points(
                     operation.delete,
                     internal_params,
                     params,
-                    access.clone(),
+                    auth.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?
@@ -722,7 +837,7 @@ pub async fn do_batch_update_points(
                     operation.set_payload,
                     internal_params,
                     params,
-                    access.clone(),
+                    auth.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?
@@ -734,7 +849,7 @@ pub async fn do_batch_update_points(
                     operation.overwrite_payload,
                     internal_params,
                     params,
-                    access.clone(),
+                    auth.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?
@@ -746,7 +861,7 @@ pub async fn do_batch_update_points(
                     operation.delete_payload,
                     internal_params,
                     params,
-                    access.clone(),
+                    auth.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?
@@ -758,7 +873,7 @@ pub async fn do_batch_update_points(
                     operation.clear_payload,
                     internal_params,
                     params,
-                    access.clone(),
+                    auth.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?
@@ -770,8 +885,8 @@ pub async fn do_batch_update_points(
                     operation.update_vectors,
                     internal_params,
                     params,
-                    access.clone(),
-                    inference_token.clone(),
+                    auth.clone(),
+                    inference_params.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?;
@@ -786,7 +901,7 @@ pub async fn do_batch_update_points(
                     operation.delete_vectors,
                     internal_params,
                     params,
-                    access.clone(),
+                    auth.clone(),
                     hw_measurement_acc.clone(),
                 )
                 .await?
@@ -805,21 +920,19 @@ pub async fn do_create_index(
     operation: CreateFieldIndex,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     // TODO: Is this cancel safe!?
 
-    // Default consensus timeout will be used
-    let wait_timeout: Option<Duration> = None; // ToDo: make it configurable
-
     // Check strict mode before submitting consensus operation
     let pass = check_strict_mode(
         &operation,
-        wait_timeout.map(|d| d.as_secs() as usize),
+        // Use per-request timeout from params if provided
+        params.timeout_as_secs(),
         &collection_name,
         &dispatcher,
-        &access,
+        &auth,
     )
     .await?;
 
@@ -830,21 +943,17 @@ pub async fn do_create_index(
     };
 
     let consensus_op = CollectionMetaOperations::CreatePayloadIndex(CreatePayloadIndex {
-        collection_name: collection_name.to_string(),
+        collection_name: collection_name.clone(),
         field_name: operation.field_name.clone(),
         field_schema: field_schema.clone(),
     });
 
-    let toc = dispatcher.toc(&access, &pass).clone();
+    let toc = dispatcher.toc(&auth, &pass).clone();
 
     // TODO: Is `submit_collection_meta_op` cancel-safe!? Should be, I think?.. 🤔
     dispatcher
-        .submit_collection_meta_op(consensus_op, access, wait_timeout)
+        .submit_collection_meta_op(consensus_op, auth, params.timeout)
         .await?;
-
-    // This function is required as long as we want to maintain interface compatibility
-    // for `wait` parameter and return type.
-    // The idea is to migrate from the point-like interface to consensus-like interface in the next few versions
 
     do_create_index_internal(
         toc,
@@ -881,7 +990,7 @@ pub async fn do_create_index_internal(
         internal_params,
         params,
         None,
-        Access::full("Internal API"),
+        Auth::new_internal(Access::full("Internal API")),
         hw_measurement_acc,
     )
     .await
@@ -893,27 +1002,29 @@ pub async fn do_delete_index(
     index_name: JsonPath,
     internal_params: InternalUpdateParams,
     params: UpdateParams,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     // TODO: Is this cancel safe!?
 
     let consensus_op = CollectionMetaOperations::DropPayloadIndex(DropPayloadIndex {
-        collection_name: collection_name.to_string(),
+        collection_name: collection_name.clone(),
         field_name: index_name.clone(),
     });
-
-    // Default consensus timeout will be used
-    let wait_timeout = None; // ToDo: make it configurable
 
     // Nothing to verify here.
     let pass = new_unchecked_verification_pass();
 
-    let toc = dispatcher.toc(&access, &pass).clone();
+    let toc = dispatcher.toc(&auth, &pass).clone();
 
     // TODO: Is `submit_collection_meta_op` cancel-safe!? Should be, I think?.. 🤔
     dispatcher
-        .submit_collection_meta_op(consensus_op, access, wait_timeout)
+        .submit_collection_meta_op(
+            consensus_op,
+            auth,
+            // Use per-request timeout from params if provided
+            params.timeout,
+        )
         .await?;
 
     do_delete_index_internal(
@@ -946,7 +1057,161 @@ pub async fn do_delete_index_internal(
         internal_params,
         params,
         None,
-        Access::full("Internal API"),
+        Auth::new_internal(Access::full("Internal API")),
+        hw_measurement_acc,
+    )
+    .await
+}
+
+#[expect(clippy::too_many_arguments)]
+pub async fn do_create_vector_name(
+    dispatcher: Arc<Dispatcher>,
+    collection_name: String,
+    vector_name: String,
+    config: VectorNameConfig,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    auth: Auth,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    // Validate the vector name once at the single chokepoint that both REST and
+    // gRPC entrypoints land in (REST also runs the same check via `VectorNamePath`).
+    common::validation::validate_vector_name(&vector_name).map_err(|err| {
+        StorageError::bad_input(format!("Invalid vector name `{vector_name}`: {err}"))
+    })?;
+
+    // Reject before consensus submission if strict mode is violated — in
+    // particular, refuse creating a new named vector while process memory is
+    // already over the configured threshold, since this operation allocates
+    // storage for the new vector across every existing point.
+    let operation = shard::operations::CreateVectorName {
+        vector_name: vector_name.clone(),
+        config: config.clone(),
+    };
+    let pass = check_strict_mode(
+        &operation,
+        params.timeout_as_secs(),
+        &collection_name,
+        &dispatcher,
+        &auth,
+    )
+    .await?;
+
+    let consensus_op = CreateNamedVector {
+        collection_name: collection_name.clone(),
+        vector_name: vector_name.clone(),
+        config: config.clone(),
+    };
+
+    let toc = dispatcher.toc(&auth, &pass).clone();
+
+    dispatcher
+        .submit_collection_meta_op(
+            CollectionMetaOperations::CreateNamedVector(consensus_op),
+            auth,
+            params.timeout,
+        )
+        .await?;
+
+    do_create_vector_name_internal(
+        toc,
+        collection_name,
+        vector_name,
+        config,
+        internal_params,
+        params,
+        hw_measurement_acc,
+    )
+    .await
+}
+
+pub async fn do_create_vector_name_internal(
+    toc: Arc<TableOfContent>,
+    collection_name: String,
+    vector_name: String,
+    config: segment::data_types::vector_name_config::VectorNameConfig,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    let operation = CollectionUpdateOperations::VectorNameOperation(
+        VectorNameOperations::CreateVectorName(CreateVectorName {
+            vector_name,
+            config,
+        }),
+    );
+
+    update(
+        &toc,
+        &collection_name,
+        operation,
+        internal_params,
+        params,
+        None,
+        Auth::new_internal(Access::full("Internal API")),
+        hw_measurement_acc,
+    )
+    .await
+}
+
+pub async fn do_delete_vector_name(
+    dispatcher: Arc<Dispatcher>,
+    collection_name: String,
+    vector_name: String,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    auth: Auth,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    use collection::operations::verification::new_unchecked_verification_pass;
+
+    let consensus_op = DeleteNamedVector {
+        collection_name: collection_name.clone(),
+        vector_name: vector_name.clone(),
+    };
+
+    let pass = new_unchecked_verification_pass();
+    let toc = dispatcher.toc(&auth, &pass).clone();
+
+    dispatcher
+        .submit_collection_meta_op(
+            CollectionMetaOperations::DeleteNamedVector(consensus_op),
+            auth,
+            params.timeout,
+        )
+        .await?;
+
+    do_delete_vector_name_internal(
+        toc,
+        collection_name,
+        vector_name,
+        internal_params,
+        params,
+        hw_measurement_acc,
+    )
+    .await
+}
+
+pub async fn do_delete_vector_name_internal(
+    toc: Arc<TableOfContent>,
+    collection_name: String,
+    vector_name: String,
+    internal_params: InternalUpdateParams,
+    params: UpdateParams,
+    hw_measurement_acc: HwMeasurementAcc,
+) -> Result<UpdateResult, StorageError> {
+    let operation = CollectionUpdateOperations::VectorNameOperation(
+        VectorNameOperations::DeleteVectorName(DeleteVectorName { vector_name }),
+    );
+
+    update(
+        &toc,
+        &collection_name,
+        operation,
+        internal_params,
+        params,
+        None,
+        Auth::new_internal(Access::full("Internal API")),
         hw_measurement_acc,
     )
     .await
@@ -960,15 +1225,28 @@ pub async fn update(
     internal_params: InternalUpdateParams,
     params: UpdateParams,
     shard_key: Option<ShardKeySelector>,
-    access: Access,
+    auth: Auth,
     hw_measurement_acc: HwMeasurementAcc,
 ) -> Result<UpdateResult, StorageError> {
     let InternalUpdateParams {
         shard_id,
         clock_tag,
+        wait_override,
     } = internal_params;
 
-    let UpdateParams { wait, ordering } = params;
+    let UpdateParams {
+        wait,
+        ordering,
+        timeout,
+    } = params;
+
+    // Default missing timeout to the inter-node update timeout so REST/gRPC
+    // user requests can't wait indefinitely on a vanished client.
+    let timeout = timeout.or_else(|| Some(toc.get_channel_service().request_timeout()));
+
+    // Use wait_override if present, otherwise fall back to the wait boolean
+    let wait =
+        wait_override.unwrap_or_else(|| collection::shards::shard_trait::WaitUntil::from(wait));
 
     let shard_selector = match operation {
         CollectionUpdateOperations::PointOperation(point_ops::PointOperations::SyncPoints(_)) => {
@@ -986,7 +1264,8 @@ pub async fn update(
             }
         }
 
-        CollectionUpdateOperations::FieldIndexOperation(_) => {
+        CollectionUpdateOperations::FieldIndexOperation(_)
+        | CollectionUpdateOperations::VectorNameOperation(_) => {
             debug_assert_eq!(
                 shard_key, None,
                 "Field index operations can't specify shard key"
@@ -997,17 +1276,28 @@ pub async fn update(
                 None => ShardSelectorInternal::All,
             }
         }
-
-        _ => get_shard_selector_for_update(shard_id, shard_key),
+        CollectionUpdateOperations::VectorOperation(_)
+        | CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(_))
+        | CollectionUpdateOperations::PointOperation(PointOperations::UpsertPointsConditional(_))
+        | CollectionUpdateOperations::PointOperation(PointOperations::DeletePoints { .. })
+        | CollectionUpdateOperations::PointOperation(PointOperations::DeletePointsByFilter(_))
+        | CollectionUpdateOperations::PayloadOperation(_) => {
+            get_shard_selector_for_update(shard_id, shard_key)
+        }
+        #[cfg(feature = "staging")]
+        CollectionUpdateOperations::StagingOperation(_) => {
+            get_shard_selector_for_update(shard_id, shard_key)
+        }
     };
 
     toc.update(
         collection_name,
         OperationWithClockTag::new(operation, clock_tag),
         wait,
+        timeout,
         ordering,
         shard_selector,
-        access,
+        auth,
         hw_measurement_acc,
     )
     .await

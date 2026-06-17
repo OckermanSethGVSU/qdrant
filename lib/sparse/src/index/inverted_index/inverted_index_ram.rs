@@ -1,13 +1,20 @@
 use std::borrow::Cow;
+#[cfg(feature = "testing")]
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::storage_version::StorageVersion;
 use common::types::PointOffsetType;
-use io::storage_version::StorageVersion;
+use common::universal_io::Result;
+#[cfg(feature = "testing")]
+use fs_err as fs;
+#[cfg(feature = "testing")]
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::common::sparse_vector::RemappedSparseVector;
 use crate::common::types::{DimId, DimOffset};
-use crate::index::inverted_index::InvertedIndex;
+use crate::index::inverted_index::{InvertedIndex, out_of_bounds};
 use crate::index::posting_list::{PostingList, PostingListIterator};
 use crate::index::posting_list_common::PostingElementEx;
 
@@ -41,28 +48,29 @@ impl InvertedIndex for InvertedIndexRam {
         false
     }
 
-    fn open(_path: &Path) -> std::io::Result<Self> {
+    fn open(_path: &Path) -> Result<Self> {
         panic!("InvertedIndexRam is not supposed to be loaded");
     }
 
-    fn save(&self, _path: &Path) -> std::io::Result<()> {
+    fn save(&self, _path: &Path) -> Result<()> {
         panic!("InvertedIndexRam is not supposed to be saved");
     }
 
     fn get<'a>(
         &'a self,
         id: DimOffset,
+        _arena: &'a crate::SearchScratchArena,
         _hw_counter: &'a HardwareCounterCell,
-    ) -> Option<PostingListIterator<'a>> {
-        self.get(&id).map(|posting_list| posting_list.iter())
+    ) -> Result<PostingListIterator<'a>> {
+        Ok(self.get(id)?.iter())
     }
 
     fn len(&self) -> usize {
         self.postings.len()
     }
 
-    fn posting_list_len(&self, id: &DimId, _hw_counter: &HardwareCounterCell) -> Option<usize> {
-        self.get(id).map(|posting_list| posting_list.elements.len())
+    fn posting_list_len(&self, id: DimOffset, _hw_counter: &HardwareCounterCell) -> Result<usize> {
+        Ok(self.get(id)?.elements.len())
     }
 
     fn files(_path: &Path) -> Vec<PathBuf> {
@@ -97,10 +105,7 @@ impl InvertedIndex for InvertedIndexRam {
         self.upsert(id, vector, old_vector);
     }
 
-    fn from_ram_index<P: AsRef<Path>>(
-        ram_index: Cow<InvertedIndexRam>,
-        _path: P,
-    ) -> std::io::Result<Self> {
+    fn from_ram_index<P: AsRef<Path>>(ram_index: Cow<InvertedIndexRam>, _path: P) -> Result<Self> {
         Ok(ram_index.into_owned())
     }
 
@@ -130,9 +135,10 @@ impl InvertedIndexRam {
         }
     }
 
-    /// Get posting list for dimension id
-    pub fn get(&self, id: &DimId) -> Option<&PostingList> {
-        self.postings.get((*id) as usize)
+    pub fn get(&self, id: DimOffset) -> Result<&PostingList> {
+        self.postings
+            .get(id as usize)
+            .ok_or_else(|| out_of_bounds(id, self.len()))
     }
 
     /// Upsert a vector into the inverted index.
@@ -160,7 +166,7 @@ impl InvertedIndexRam {
 
         let new_vector_size = vector.len() * size_of::<PostingElementEx>();
 
-        for (dim_id, weight) in vector.indices.into_iter().zip(vector.values.into_iter()) {
+        for (dim_id, weight) in vector.indices.into_iter().zip(vector.values) {
             let dim_id = dim_id as usize;
             match self.postings.get_mut(dim_id) {
                 Some(posting) => {
@@ -195,6 +201,72 @@ impl InvertedIndexRam {
     }
 }
 
+#[cfg(feature = "testing")]
+/// Load/save methods to speed up benchmark setup.
+impl InvertedIndexRam {
+    const TEST_MAGIC: &'static [u8] = b"InvertedIndexRam for benchmarks.";
+
+    pub fn test_save(&self, path: &Path) -> std::io::Result<()> {
+        let InvertedIndexRam {
+            postings,
+            vector_count,
+            total_sparse_size,
+        } = self;
+
+        let mut f = BufWriter::new(fs::File::create(path)?);
+        f.write_all(Self::TEST_MAGIC)?;
+        f.write_all(postings.len().as_bytes())?;
+        for posting in postings {
+            f.write_all(posting.elements.len().as_bytes())?;
+            let bytes = posting.elements.as_bytes();
+            f.write_all(bytes)?;
+            // padding
+            f.write_all(&0usize.to_ne_bytes()[..bytes.len() % size_of::<usize>()])?;
+        }
+        f.write_all(vector_count.as_bytes())?;
+        f.write_all(total_sparse_size.as_bytes())?;
+
+        Ok(())
+    }
+
+    pub fn test_load(path: &Path) -> std::io::Result<Self> {
+        let f = fs::File::open(path)?;
+        let mmap = unsafe { memmap2::Mmap::map(&f)? };
+        let bytes = &mmap[..];
+
+        let (magic, bytes) =
+            <[u8]>::ref_from_prefix_with_elems(bytes, Self::TEST_MAGIC.len()).unwrap();
+        if magic != Self::TEST_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Invalid magic",
+            ));
+        }
+
+        let (postings_len, bytes) = usize::ref_from_prefix(bytes).unwrap();
+        let mut postings = Vec::with_capacity(*postings_len);
+        let mut bytes_cursor = bytes;
+        for _ in 0..*postings_len {
+            let (elements_len, bytes) = usize::ref_from_prefix(bytes_cursor).unwrap();
+            let (elements, bytes) =
+                <[PostingElementEx]>::ref_from_prefix_with_elems(bytes, *elements_len).unwrap();
+            let elements = elements.to_vec();
+            postings.push(PostingList { elements });
+            bytes_cursor = &bytes[bytes.as_ptr().align_offset(size_of::<usize>())..];
+        }
+        let bytes = bytes_cursor;
+
+        let (&vector_count, bytes) = usize::ref_from_prefix(bytes).unwrap();
+        let (&total_sparse_size, _bytes) = usize::ref_from_prefix(bytes).unwrap();
+
+        Ok(InvertedIndexRam {
+            postings,
+            vector_count,
+            total_sparse_size,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,7 +288,7 @@ mod tests {
             None,
         );
         for i in 1..4 {
-            let posting_list = inverted_index_ram.get(&i).unwrap();
+            let posting_list = inverted_index_ram.get(i).unwrap();
             let posting_list = posting_list.elements.as_slice();
             assert_eq!(posting_list.len(), 4);
             assert_eq!(posting_list.first().unwrap().weight, 10.0);
@@ -250,7 +322,7 @@ mod tests {
 
         // updated existing dimension
         for i in 1..3 {
-            let posting_list = inverted_index_ram.get(&i).unwrap();
+            let posting_list = inverted_index_ram.get(i).unwrap();
             let posting_list = posting_list.elements.as_slice();
             assert_eq!(posting_list.len(), 4);
             assert_eq!(posting_list.first().unwrap().weight, 10.0);
@@ -260,7 +332,7 @@ mod tests {
         }
 
         // fetch 30th posting
-        let postings = inverted_index_ram.get(&30).unwrap();
+        let postings = inverted_index_ram.get(30).unwrap();
         let postings = postings.elements.as_slice();
         assert_eq!(postings.len(), 1);
         let posting = postings.first().unwrap();

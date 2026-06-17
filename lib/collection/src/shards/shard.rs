@@ -1,21 +1,28 @@
 use core::marker::{Send, Sync};
 use std::future::{self, Future};
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
 use common::types::TelemetryDetail;
-use segment::data_types::manifest::SnapshotManifest;
+use futures::future::Either;
+use parking_lot::Mutex as ParkingMutex;
 use segment::index::field_index::CardinalityEstimation;
-use segment::types::{Filter, SizeStats, SnapshotFormat};
+use segment::types::{Filter, SeqNumberType, SizeStats, SnapshotFormat, StrictModeConfig};
+use shard::snapshots::snapshot_manifest::SnapshotManifest;
+use tokio::sync::oneshot;
 
 use super::local_shard::clock_map::RecoveryPoint;
 use super::update_tracker::UpdateTracker;
+use crate::collection_manager::optimizers::TrackerLog;
+use crate::operations::OperationWithClockTag;
 use crate::operations::operation_effect::{EstimateOperationEffectArea, OperationEffectArea};
 use crate::operations::types::{CollectionError, CollectionResult, OptimizersStatus};
 use crate::shards::dummy_shard::DummyShard;
 use crate::shards::forward_proxy_shard::ForwardProxyShard;
-use crate::shards::local_shard::LocalShard;
+use crate::shards::local_shard::{LocalShard, LocalShardOptimizations};
 use crate::shards::proxy_shard::ProxyShard;
 use crate::shards::queue_proxy_shard::QueueProxyShard;
 use crate::shards::shard_trait::ShardOperation;
@@ -34,7 +41,7 @@ pub type ShardReplicasPlacement = Vec<PeerId>;
 /// Example: [
 ///     [1, 2],
 ///     [2, 3],
-///     [3, 4]
+///     [3, 4],
 /// ] - 3 shards, each has 2 replicas
 pub type ShardsPlacement = Vec<ShardReplicasPlacement>;
 
@@ -70,111 +77,144 @@ impl Shard {
         }
     }
 
-    pub async fn get_telemetry_data(&self, detail: TelemetryDetail) -> LocalShardTelemetry {
+    /// Return the underlying [`LocalShard`] if this shard wraps one.
+    ///
+    /// Proxy variants forward writes to a wrapped local shard, so callers
+    /// that need the local-shard's state (e.g. rate limiters) can reach it
+    /// uniformly through this accessor. `Dummy` returns `None`.
+    pub fn local_shard(&self) -> Option<&LocalShard> {
+        match self {
+            Shard::Local(local_shard) => Some(local_shard),
+            Shard::Proxy(proxy_shard) => Some(&proxy_shard.wrapped_shard),
+            Shard::ForwardProxy(proxy_shard) => Some(&proxy_shard.wrapped_shard),
+            Shard::QueueProxy(proxy_shard) => proxy_shard.wrapped_shard(),
+            Shard::Dummy(_) => None,
+        }
+    }
+
+    pub async fn get_telemetry_data(
+        &self,
+        detail: TelemetryDetail,
+        timeout: Duration,
+    ) -> CollectionResult<LocalShardTelemetry> {
         let mut telemetry = match self {
             Shard::Local(local_shard) => {
-                let mut shard_telemetry = local_shard.get_telemetry_data(detail).await;
+                let mut shard_telemetry = local_shard.get_telemetry_data(detail, timeout).await?;
 
                 // can't take sync locks in async fn so local_shard_status() has to be
                 // called outside get_telemetry_data()
                 shard_telemetry.status = Some(local_shard.local_shard_status().await.0);
                 shard_telemetry
             }
-            Shard::Proxy(proxy_shard) => proxy_shard.get_telemetry_data(detail).await,
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_telemetry_data(detail).await,
-            Shard::QueueProxy(proxy_shard) => proxy_shard.get_telemetry_data(detail).await,
+            Shard::Proxy(proxy_shard) => proxy_shard.get_telemetry_data(detail, timeout).await?,
+            Shard::ForwardProxy(proxy_shard) => {
+                proxy_shard.get_telemetry_data(detail, timeout).await?
+            }
+            Shard::QueueProxy(proxy_shard) => {
+                proxy_shard.get_telemetry_data(detail, timeout).await?
+            }
             Shard::Dummy(dummy_shard) => dummy_shard.get_telemetry_data(),
         };
         telemetry.variant_name = Some(self.variant_name().to_string());
-        telemetry
+        Ok(telemetry)
     }
 
-    pub async fn get_optimization_status(&self) -> OptimizersStatus {
+    pub async fn get_optimization_status(
+        &self,
+        timeout: Duration,
+    ) -> CollectionResult<OptimizersStatus> {
         match self {
-            Shard::Local(local_shard) => local_shard.get_optimization_status().await,
-            Shard::Proxy(proxy_shard) => proxy_shard.get_optimization_status().await,
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_optimization_status().await,
+            Shard::Local(local_shard) => local_shard.get_optimization_status(timeout).await,
+            Shard::Proxy(proxy_shard) => proxy_shard.get_optimization_status(timeout).await,
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_optimization_status(timeout).await,
             Shard::QueueProxy(queue_proxy_shard) => {
-                queue_proxy_shard.get_optimization_status().await
+                queue_proxy_shard.get_optimization_status(timeout).await
             }
-            Shard::Dummy(dummy_shard) => dummy_shard.get_optimization_status(),
+            Shard::Dummy(dummy_shard) => Ok(dummy_shard.get_optimization_status()),
         }
     }
 
-    pub async fn get_size_stats(&self) -> SizeStats {
+    pub async fn get_size_stats(&self, timeout: Duration) -> CollectionResult<SizeStats> {
         match self {
-            Shard::Local(local_shard) => local_shard.get_size_stats().await,
-            Shard::Proxy(proxy_shard) => proxy_shard.get_size_stats().await,
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_size_stats().await,
-            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.get_size_stats().await,
-            Shard::Dummy(dummy_shard) => dummy_shard.get_size_stats(),
+            Shard::Local(local_shard) => local_shard.get_size_stats(timeout).await,
+            Shard::Proxy(proxy_shard) => proxy_shard.get_size_stats(timeout).await,
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.get_size_stats(timeout).await,
+            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.get_size_stats(timeout).await,
+            Shard::Dummy(dummy_shard) => Ok(dummy_shard.get_size_stats()),
         }
     }
 
-    pub async fn create_snapshot(
+    pub async fn get_snapshot_creator(
         &self,
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
         manifest: Option<SnapshotManifest>,
         save_wal: bool,
-    ) -> CollectionResult<()> {
-        match self {
-            Shard::Local(local_shard) => {
+    ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + use<>> {
+        let future = match self {
+            Shard::Local(local_shard) => Either::Left(Either::Left(
                 local_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
-            Shard::Proxy(proxy_shard) => {
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
+            Shard::Proxy(proxy_shard) => Either::Left(Either::Right(
                 proxy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
-            Shard::ForwardProxy(proxy_shard) => {
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
+            Shard::ForwardProxy(proxy_shard) => Either::Right(Either::Left(
                 proxy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
-            Shard::QueueProxy(proxy_shard) => {
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
+            Shard::QueueProxy(proxy_shard) => Either::Right(Either::Right(
                 proxy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
-            }
+                    .get_snapshot_creator(temp_path, tar, format, manifest, save_wal)
+                    .await?,
+            )),
             Shard::Dummy(dummy_shard) => {
-                dummy_shard
-                    .create_snapshot(temp_path, tar, format, manifest, save_wal)
-                    .await
+                return Err(dummy_shard.dummy_error("get_snapshot_creator"));
             }
-        }
+        };
+
+        Ok(future)
     }
 
-    pub fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
+    pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
         match self {
-            Shard::Local(local_shard) => local_shard.snapshot_manifest(),
-            Shard::Proxy(proxy_shard) => proxy_shard.snapshot_manifest(),
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.snapshot_manifest(),
-            Shard::QueueProxy(proxy_shard) => proxy_shard.snapshot_manifest(),
+            Shard::Local(local_shard) => local_shard.snapshot_manifest().await,
+            Shard::Proxy(proxy_shard) => proxy_shard.snapshot_manifest().await,
+            Shard::ForwardProxy(proxy_shard) => proxy_shard.snapshot_manifest().await,
+            Shard::QueueProxy(proxy_shard) => proxy_shard.snapshot_manifest().await,
             Shard::Dummy(dummy_shard) => dummy_shard.snapshot_manifest(),
         }
     }
 
+    /// ## Cancel safety
+    ///
+    /// This function is **not** cancel safe.
     pub async fn on_optimizer_config_update(&self) -> CollectionResult<()> {
         match self {
             Shard::Local(local_shard) => local_shard.on_optimizer_config_update().await,
             Shard::Proxy(proxy_shard) => proxy_shard.on_optimizer_config_update().await,
             Shard::ForwardProxy(proxy_shard) => proxy_shard.on_optimizer_config_update().await,
             Shard::QueueProxy(proxy_shard) => proxy_shard.on_optimizer_config_update().await,
-            Shard::Dummy(dummy_shard) => dummy_shard.on_optimizer_config_update().await,
+            Shard::Dummy(dummy_shard) => dummy_shard.on_optimizer_config_update(),
         }
     }
 
-    pub async fn on_strict_mode_config_update(&mut self) {
+    pub fn on_strict_mode_config_update(&mut self, new_strict_mode: &StrictModeConfig) {
         match self {
-            Shard::Local(local_shard) => local_shard.on_strict_mode_config_update().await,
-            Shard::Proxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
-            Shard::ForwardProxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
-            Shard::QueueProxy(proxy_shard) => proxy_shard.on_strict_mode_config_update().await,
-            Shard::Dummy(dummy_shard) => dummy_shard.on_strict_mode_config_update().await,
+            Shard::Local(local_shard) => local_shard.on_strict_mode_config_update(new_strict_mode),
+            Shard::Proxy(proxy_shard) => proxy_shard.on_strict_mode_config_update(new_strict_mode),
+            Shard::ForwardProxy(proxy_shard) => {
+                proxy_shard.on_strict_mode_config_update(new_strict_mode)
+            }
+            Shard::QueueProxy(proxy_shard) => {
+                proxy_shard.on_strict_mode_config_update(new_strict_mode)
+            }
+            Shard::Dummy(dummy_shard) => dummy_shard.on_strict_mode_config_update(new_strict_mode),
         }
     }
 
@@ -218,6 +258,46 @@ impl Shard {
         Some(update_tracker)
     }
 
+    pub fn optimizers_log(&self) -> Option<Arc<ParkingMutex<TrackerLog>>> {
+        let optimizers_log = match self {
+            Self::Local(local_shard) => local_shard.optimizers_log(),
+            Self::Proxy(proxy_shard) => proxy_shard.optimizers_log(),
+            Self::ForwardProxy(proxy_shard) => proxy_shard.optimizers_log(),
+            Self::QueueProxy(proxy_shard) => proxy_shard.optimizers_log(),
+            Self::Dummy(_) => return None,
+        };
+
+        Some(optimizers_log)
+    }
+
+    pub fn optimizations(&self) -> Option<LocalShardOptimizations> {
+        Some(match self {
+            Self::Local(local_shard) => local_shard.optimizations(),
+            Self::Proxy(proxy_shard) => proxy_shard.wrapped_shard.optimizations(),
+            Self::ForwardProxy(proxy_shard) => proxy_shard.wrapped_shard.optimizations(),
+            Self::QueueProxy(proxy_shard) => proxy_shard.wrapped_shard()?.optimizations(),
+            Self::Dummy(_) => return None,
+        })
+    }
+
+    pub async fn truncate_unapplied_wal(&self) -> CollectionResult<usize> {
+        match self {
+            Self::Local(local_shard) => local_shard.truncate_unapplied_wal().await,
+            Self::Proxy(proxy_shard) => proxy_shard.wrapped_shard.truncate_unapplied_wal().await,
+            Self::ForwardProxy(proxy_shard) => {
+                proxy_shard.wrapped_shard.truncate_unapplied_wal().await
+            }
+            Self::QueueProxy(proxy_shard) => {
+                if let Some(local_shard) = proxy_shard.wrapped_shard() {
+                    local_shard.truncate_unapplied_wal().await
+                } else {
+                    Ok(0)
+                }
+            }
+            Self::Dummy(_) => Ok(0),
+        }
+    }
+
     pub async fn shard_recovery_point(&self) -> CollectionResult<RecoveryPoint> {
         match self {
             Self::Local(local_shard) => Ok(local_shard.recovery_point().await),
@@ -229,6 +309,44 @@ impl Shard {
                     self.variant_name(),
                 )))
             }
+        }
+    }
+
+    pub async fn take_newest_clocks_snapshot(&self) -> CollectionResult<()> {
+        match self {
+            Self::Local(local_shard) => local_shard.take_newest_clocks_snapshot().await,
+            Self::Proxy(ProxyShard { wrapped_shard, .. })
+            | Self::ForwardProxy(ForwardProxyShard { wrapped_shard, .. }) => {
+                wrapped_shard.take_newest_clocks_snapshot().await
+            }
+            Self::QueueProxy(proxy) => {
+                if let Some(local_shard) = proxy.wrapped_shard() {
+                    local_shard.take_newest_clocks_snapshot().await
+                } else {
+                    Ok(())
+                }
+            }
+            // Ignore dummy shard, it is not loaded
+            Self::Dummy(_) => Ok(()),
+        }
+    }
+
+    pub async fn clear_newest_clocks_snapshot(&self) -> CollectionResult<()> {
+        match self {
+            Self::Local(local_shard) => local_shard.clear_newest_clocks_snapshot().await,
+            Self::Proxy(ProxyShard { wrapped_shard, .. })
+            | Self::ForwardProxy(ForwardProxyShard { wrapped_shard, .. }) => {
+                wrapped_shard.clear_newest_clocks_snapshot().await
+            }
+            Self::QueueProxy(proxy) => {
+                if let Some(local_shard) = proxy.wrapped_shard() {
+                    local_shard.clear_newest_clocks_snapshot().await
+                } else {
+                    Ok(())
+                }
+            }
+            // Ignore dummy shard, it is not loaded
+            Self::Dummy(_) => Ok(()),
         }
     }
 
@@ -300,6 +418,47 @@ impl Shard {
         }
     }
 
+    pub async fn get_wal_entries(
+        &self,
+        count: u64,
+    ) -> CollectionResult<Vec<(SeqNumberType, OperationWithClockTag)>> {
+        let local = match self {
+            Shard::Local(local) => local,
+            Shard::Proxy(proxy) => &proxy.wrapped_shard,
+            Shard::ForwardProxy(proxy) => &proxy.wrapped_shard,
+
+            Shard::QueueProxy(proxy) => match proxy.wrapped_shard() {
+                Some(wrapped) => wrapped,
+                None => return Ok(Vec::new()),
+            },
+
+            Shard::Dummy(dummy) => return Err(dummy.dummy_error("get_wal_entries")),
+        };
+
+        local.get_wal_entries(count).await
+    }
+
+    pub async fn set_extended_wal_retention(&self) {
+        match self {
+            Shard::Local(local) => local.set_extended_wal_retention().await,
+            Shard::Proxy(proxy) => proxy.set_extended_wal_retention().await,
+            Shard::ForwardProxy(forward_proxy) => forward_proxy.set_extended_wal_retention().await,
+            Shard::QueueProxy(queue_proxy) => queue_proxy.set_extended_wal_retention().await,
+            Shard::Dummy(_) => {} // Do nothing for dummy shard
+        }
+    }
+
+    /// WAL is keeping normal amount of data after truncation.
+    pub async fn set_normal_wal_retention(&self) {
+        match self {
+            Shard::Local(local) => local.set_normal_wal_retention().await,
+            Shard::Proxy(proxy) => proxy.set_normal_wal_retention().await,
+            Shard::ForwardProxy(forward_proxy) => forward_proxy.set_normal_wal_retention().await,
+            Shard::QueueProxy(queue_proxy) => queue_proxy.set_normal_wal_retention().await,
+            Shard::Dummy(_) => {} // Do nothing for dummy shard
+        }
+    }
+
     pub async fn estimate_cardinality(
         &self,
         filter: Option<&Filter>,
@@ -342,6 +501,42 @@ impl Shard {
                 self.estimate_cardinality(Some(filter), hw_measurement_acc)
                     .await
             }
+        }
+    }
+
+    pub async fn stop_gracefully(self) {
+        match self {
+            Shard::Local(local_shard) => local_shard.stop_gracefully().await,
+            Shard::Proxy(proxy_shard) => proxy_shard.stop_gracefully().await,
+            Shard::ForwardProxy(forward_proxy_shard) => forward_proxy_shard.stop_gracefully().await,
+            Shard::QueueProxy(queue_proxy_shard) => queue_proxy_shard.stop_gracefully().await,
+            Shard::Dummy(_) => {}
+        }
+    }
+
+    /// Send plunger operation
+    ///
+    /// Returns oneshot channel receiver that will be notified once the plunger operation is
+    /// processed.
+    pub async fn plunge_async(&self) -> CollectionResult<oneshot::Receiver<()>> {
+        // Fake plunger for variants that have no queue
+        let fake_plunger = || {
+            let (tx, rx) = oneshot::channel();
+            let _ = tx.send(());
+            rx
+        };
+
+        match self {
+            Shard::Local(local_shard) => local_shard.plunge_async().await,
+            Shard::Proxy(proxy_shard) => proxy_shard.wrapped_shard.plunge_async().await,
+            Shard::ForwardProxy(forward_proxy_shard) => {
+                forward_proxy_shard.wrapped_shard.plunge_async().await
+            }
+            Shard::QueueProxy(queue_proxy_shard) => match queue_proxy_shard.wrapped_shard() {
+                Some(wrapped_shard) => wrapped_shard.plunge_async().await,
+                None => Ok(fake_plunger()),
+            },
+            Shard::Dummy(_) => Ok(fake_plunger()),
         }
     }
 }

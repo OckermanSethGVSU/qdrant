@@ -1,18 +1,18 @@
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::{Random, Sequential};
 use common::types::PointOffsetType;
+use fs_err as fs;
 use gridstore::config::StorageOptions;
 use gridstore::{Blob, Gridstore};
-use parking_lot::RwLock;
 use serde_json::Value;
 
 use crate::common::Flusher;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::json_path::JsonPath;
-use crate::payload_storage::PayloadStorage;
-use crate::types::{Payload, PayloadKeyTypeRef};
+use crate::payload_storage::{PayloadStorage, PayloadStorageRead};
+use crate::types::{OwnedPayloadRef, Payload, PayloadKeyTypeRef};
 
 const STORAGE_PATH: &str = "payload_storage";
 
@@ -28,7 +28,7 @@ impl Blob for Payload {
 
 #[derive(Debug)]
 pub struct MmapPayloadStorage {
-    storage: Arc<RwLock<Gridstore<Payload>>>,
+    storage: Gridstore<Payload>,
     populate: bool,
 }
 
@@ -39,7 +39,7 @@ impl MmapPayloadStorage {
             Self::open(path, populate)
         } else {
             // create folder if it does not exist
-            std::fs::create_dir_all(&path).map_err(|_| {
+            fs::create_dir_all(&path).map_err(|_| {
                 OperationError::service_error("Failed to create mmap payload storage directory")
             })?;
             Ok(Self::new(path, populate)?)
@@ -50,22 +50,19 @@ impl MmapPayloadStorage {
         let storage = Gridstore::open(path).map_err(|err| {
             OperationError::service_error(format!("Failed to open mmap payload storage: {err}"))
         })?;
-        let storage = Arc::new(RwLock::new(storage));
 
         if populate {
-            storage.read().populate()?;
+            storage.populate()?;
         }
 
         Ok(Self { storage, populate })
     }
 
     fn new(path: PathBuf, populate: bool) -> OperationResult<Self> {
-        let storage = Gridstore::new(path, StorageOptions::default())
-            .map_err(OperationError::service_error)?;
-        let storage = Arc::new(RwLock::new(storage));
+        let storage = Gridstore::new(path, StorageOptions::default())?;
 
         if populate {
-            storage.read().populate()?;
+            storage.populate()?;
         }
 
         Ok(Self { storage, populate })
@@ -74,14 +71,68 @@ impl MmapPayloadStorage {
     /// Populate all pages in the mmap.
     /// Block until all pages are populated.
     pub fn populate(&self) -> OperationResult<()> {
-        self.storage.read().populate()?;
+        self.storage.populate()?;
         Ok(())
     }
 
     /// Drop disk cache.
     pub fn clear_cache(&self) -> OperationResult<()> {
-        self.storage.read().clear_cache()?;
+        self.storage.clear_cache()?;
         Ok(())
+    }
+}
+
+impl PayloadStorageRead for MmapPayloadStorage {
+    fn get(
+        &self,
+        point_offset: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        match self.storage.get_value::<Random>(point_offset, hw_counter)? {
+            Some(payload) => Ok(payload),
+            None => Ok(Default::default()),
+        }
+    }
+
+    fn get_sequential(
+        &self,
+        point_offset: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<Payload> {
+        match self
+            .storage
+            .get_value::<Sequential>(point_offset, hw_counter)?
+        {
+            Some(payload) => Ok(payload),
+            None => Ok(Default::default()),
+        }
+    }
+
+    fn payload_ref(
+        &self,
+        point_offset: PointOffsetType,
+        hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<OwnedPayloadRef<'_>> {
+        let payload = self.get(point_offset, hw_counter)?;
+        Ok(OwnedPayloadRef::from(payload))
+    }
+
+    fn iter<F>(&self, mut callback: F, hw_counter: &HardwareCounterCell) -> OperationResult<()>
+    where
+        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
+    {
+        self.storage.iter(
+            |point_id, payload| callback(point_id, &payload),
+            hw_counter.ref_payload_io_read_counter(),
+        )
+    }
+
+    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
+        Ok(self.storage.get_storage_size_bytes()?)
+    }
+
+    fn is_on_disk(&self) -> bool {
+        !self.populate
     }
 }
 
@@ -93,9 +144,7 @@ impl PayloadStorage for MmapPayloadStorage {
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
         self.storage
-            .write()
-            .put_value(point_id, payload, hw_counter.ref_payload_io_write_counter())
-            .map_err(OperationError::service_error)?;
+            .put_value(point_id, payload, hw_counter.ref_payload_io_write_counter())?;
         Ok(())
     }
 
@@ -105,22 +154,21 @@ impl PayloadStorage for MmapPayloadStorage {
         payload: &Payload,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
-        let mut guard = self.storage.write();
-        match guard.get_value::<false>(point_id, hw_counter) {
+        match self.storage.get_value::<Random>(point_id, hw_counter)? {
             Some(mut point_payload) => {
                 point_payload.merge(payload);
-                guard
-                    .put_value(
-                        point_id,
-                        &point_payload,
-                        hw_counter.ref_payload_io_write_counter(),
-                    )
-                    .map_err(OperationError::service_error)?;
+                self.storage.put_value(
+                    point_id,
+                    &point_payload,
+                    hw_counter.ref_payload_io_write_counter(),
+                )?;
             }
             None => {
-                guard
-                    .put_value(point_id, payload, hw_counter.ref_payload_io_write_counter())
-                    .map_err(OperationError::service_error)?;
+                self.storage.put_value(
+                    point_id,
+                    payload,
+                    hw_counter.ref_payload_io_write_counter(),
+                )?;
             }
         }
         Ok(())
@@ -133,53 +181,26 @@ impl PayloadStorage for MmapPayloadStorage {
         key: &JsonPath,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<()> {
-        let mut guard = self.storage.write();
-        match guard.get_value::<false>(point_id, hw_counter) {
+        match self.storage.get_value::<Random>(point_id, hw_counter)? {
             Some(mut point_payload) => {
                 point_payload.merge_by_key(payload, key);
-                guard
-                    .put_value(
-                        point_id,
-                        &point_payload,
-                        hw_counter.ref_payload_io_write_counter(),
-                    )
-                    .map_err(OperationError::service_error)?;
+                self.storage.put_value(
+                    point_id,
+                    &point_payload,
+                    hw_counter.ref_payload_io_write_counter(),
+                )?;
             }
             None => {
                 let mut dest_payload = Payload::default();
                 dest_payload.merge_by_key(payload, key);
-                guard
-                    .put_value(
-                        point_id,
-                        &dest_payload,
-                        hw_counter.ref_payload_io_write_counter(),
-                    )
-                    .map_err(OperationError::service_error)?;
+                self.storage.put_value(
+                    point_id,
+                    &dest_payload,
+                    hw_counter.ref_payload_io_write_counter(),
+                )?;
             }
         }
         Ok(())
-    }
-
-    fn get(
-        &self,
-        point_id: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<Payload> {
-        match self.storage.read().get_value::<false>(point_id, hw_counter) {
-            Some(payload) => Ok(payload),
-            None => Ok(Default::default()),
-        }
-    }
-
-    fn get_sequential(
-        &self,
-        point_id: PointOffsetType,
-        hw_counter: &HardwareCounterCell,
-    ) -> OperationResult<Payload> {
-        match self.storage.read().get_value::<true>(point_id, hw_counter) {
-            Some(payload) => Ok(payload),
-            None => Ok(Default::default()),
-        }
     }
 
     fn delete(
@@ -188,18 +209,15 @@ impl PayloadStorage for MmapPayloadStorage {
         key: PayloadKeyTypeRef,
         hw_counter: &HardwareCounterCell,
     ) -> OperationResult<Vec<Value>> {
-        let mut guard = self.storage.write();
-        match guard.get_value::<false>(point_id, hw_counter) {
+        match self.storage.get_value::<Random>(point_id, hw_counter)? {
             Some(mut payload) => {
                 let res = payload.remove(key);
                 if !res.is_empty() {
-                    guard
-                        .put_value(
-                            point_id,
-                            &payload,
-                            hw_counter.ref_payload_io_write_counter(),
-                        )
-                        .map_err(OperationError::service_error)?;
+                    self.storage.put_value(
+                        point_id,
+                        &payload,
+                        hw_counter.ref_payload_io_write_counter(),
+                    )?;
                 }
                 Ok(res)
             }
@@ -212,59 +230,34 @@ impl PayloadStorage for MmapPayloadStorage {
         point_id: PointOffsetType,
         _: &HardwareCounterCell,
     ) -> OperationResult<Option<Payload>> {
-        let res = self.storage.write().delete_value(point_id);
+        let res = self.storage.delete_value(point_id)?;
         Ok(res)
     }
 
     #[cfg(test)]
     fn clear_all(&mut self, _: &HardwareCounterCell) -> OperationResult<()> {
-        self.storage.write().clear().map_err(|err| {
+        self.storage.clear().map_err(|err| {
             OperationError::service_error(format!("Failed to clear mmap payload storage: {err}"))
         })
     }
 
     fn flusher(&self) -> Flusher {
-        let storage = self.storage.clone();
+        let storage_flusher = self.storage.flusher();
         Box::new(move || {
-            storage.read().flush().map_err(|err| {
+            storage_flusher().map_err(|err| {
                 OperationError::service_error(format!(
-                    "Failed to flush mmap payload storage: {err}"
+                    "Failed to flush mmap payload gridstore: {err}"
                 ))
             })
         })
     }
 
-    fn iter<F>(&self, mut callback: F, hw_counter: &HardwareCounterCell) -> OperationResult<()>
-    where
-        F: FnMut(PointOffsetType, &Payload) -> OperationResult<bool>,
-    {
-        self.storage.read().iter(
-            |point_id, payload| {
-                callback(point_id, &payload).map_err(|e|
-                    // TODO return proper error
-                    std::io::Error::other(
-                        e.to_string(),
-                    ))
-            },
-            hw_counter.ref_payload_io_read_counter(),
-        )?;
-        Ok(())
-    }
-
     fn files(&self) -> Vec<PathBuf> {
-        self.storage.read().files()
+        self.storage.files()
     }
 
     fn immutable_files(&self) -> Vec<PathBuf> {
-        self.storage.read().immutable_files()
-    }
-
-    fn get_storage_size_bytes(&self) -> OperationResult<usize> {
-        Ok(self.storage.read().get_storage_size_bytes())
-    }
-
-    fn is_on_disk(&self) -> bool {
-        !self.populate
+        self.storage.immutable_files()
     }
 }
 

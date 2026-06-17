@@ -1,6 +1,5 @@
 use std::cmp;
 use std::collections::HashMap;
-use std::fs::{File, create_dir_all};
 use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -9,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use atomicwrites::{AllowOverwrite, AtomicFile};
 use collection::operations::types::PeerMetadata;
 use collection::shards::shard::PeerId;
+use fs_err as fs;
+use fs_err::File;
 use http::Uri;
 use parking_lot::RwLock;
 use raft::RaftState;
@@ -98,6 +99,13 @@ impl Persistent {
         *peer_metadata_by_id.write() = metadata_by_id;
         *cluster_metadata = new_cluster_metadata;
 
+        // Last Raft commit and last snapshot index must be equal and persisted in one operation
+        // Our `ConsensusManager::new` function relies on this for reconciling WAL clears
+        debug_assert_eq!(
+            state.hard_state.commit, latest_snapshot_meta.index,
+            "applied Raft commit and last snapshot index must be equal",
+        );
+
         self.save()
     }
 
@@ -110,7 +118,7 @@ impl Persistent {
         reinit: bool,
         peer_id: Option<PeerId>,
     ) -> Result<Self, StorageError> {
-        create_dir_all(storage_path.as_ref())?;
+        fs::create_dir_all(storage_path.as_ref())?;
         let path_legacy = storage_path.as_ref().join(STATE_FILE_NAME_CBOR);
         let path_json = storage_path.as_ref().join(STATE_FILE_NAME);
         let mut state = if path_json.exists() {
@@ -208,14 +216,6 @@ impl Persistent {
         self.save()
     }
 
-    pub fn set_peer_address_by_id(
-        &mut self,
-        peer_address_by_id: PeerAddressById,
-    ) -> Result<(), StorageError> {
-        *self.peer_address_by_id.write() = peer_address_by_id;
-        self.save()
-    }
-
     pub fn insert_peer(&mut self, peer_id: PeerId, address: Uri) -> Result<(), StorageError> {
         let address_display = address.to_string();
         match self
@@ -254,7 +254,9 @@ impl Persistent {
     }
 
     pub fn get_cluster_metadata_keys(&self) -> Vec<String> {
-        self.cluster_metadata.keys().cloned().collect()
+        let mut keys: Vec<String> = self.cluster_metadata.keys().cloned().collect();
+        keys.sort_unstable();
+        keys
     }
 
     pub fn get_cluster_metadata_key(&self, key: &str) -> serde_json::Value {
@@ -343,7 +345,7 @@ impl Persistent {
                 conf_state: ConfState::from((voters, vec![])),
             },
             apply_progress_queue: Default::default(),
-            first_voter: if first_peer { Some(this_peer_id) } else { None },
+            first_voter: first_peer.then_some(this_peer_id),
             peer_address_by_id: Default::default(),
             peer_metadata_by_id: Default::default(),
             cluster_metadata: Default::default(),

@@ -1,8 +1,8 @@
 use std::path::Path;
-use std::sync::Arc;
 
-use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::mmap::AdviceSetting;
 use common::types::PointOffsetType;
 use common::validation::MAX_MULTIVECTOR_FLATTENED_LEN;
 use rstest::rstest;
@@ -11,21 +11,19 @@ use tempfile::Builder;
 use crate::data_types::vectors::{
     MultiDenseVectorInternal, QueryVector, TypedMultiDenseVectorRef, VectorElementType, VectorRef,
 };
-use crate::fixtures::payload_context_fixture::FixtureIdTracker;
-use crate::id_tracker::IdTrackerSS;
-use crate::index::hnsw_index::point_scorer::FilteredScorer;
+use crate::fixtures::payload_context_fixture::create_id_tracker_fixture;
+use crate::id_tracker::IdTrackerRead;
+use crate::index::hnsw_index::point_scorer::BatchFilteredSearcher;
 use crate::types::{Distance, MultiVectorConfig};
 use crate::vector_storage::common::CHUNK_SIZE;
 use crate::vector_storage::multi_dense::appendable_mmap_multi_dense_vector_storage::open_appendable_memmap_multi_vector_storage_full;
 use crate::vector_storage::multi_dense::volatile_multi_dense_vector_storage::new_volatile_multi_dense_vector_storage;
 use crate::vector_storage::{
-    DEFAULT_STOPPED, MultiVectorStorage, Random, VectorStorage, VectorStorageEnum,
+    DEFAULT_STOPPED, MultiVectorStorage, VectorStorage, VectorStorageEnum, VectorStorageRead,
 };
 
 #[derive(Clone, Copy)]
 enum MultiDenseStorageType {
-    #[cfg(feature = "rocksdb")]
-    RocksDbFloat,
     AppendableMmapFloat,
 }
 
@@ -52,10 +50,7 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
 
     let delete_mask = [false, false, true, true, false];
 
-    let id_tracker: Arc<AtomicRefCell<IdTrackerSS>> =
-        Arc::new(AtomicRefCell::new(FixtureIdTracker::new(points.len())));
-
-    let borrowed_id_tracker = id_tracker.borrow_mut();
+    let id_tracker = create_id_tracker_fixture(points.len());
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -75,10 +70,6 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
     {
         let orig_iter = points.iter().flat_map(|multivec| multivec.multi_vectors());
         match storage as &VectorStorageEnum {
-            #[cfg(feature = "rocksdb")]
-            VectorStorageEnum::DenseSimple(_)
-            | VectorStorageEnum::DenseSimpleByte(_)
-            | VectorStorageEnum::DenseSimpleHalf(_) => unreachable!(),
             #[cfg(test)]
             VectorStorageEnum::DenseVolatile(_)
             | VectorStorageEnum::DenseVolatileByte(_)
@@ -86,43 +77,33 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
             VectorStorageEnum::DenseMemmap(_)
             | VectorStorageEnum::DenseMemmapByte(_)
             | VectorStorageEnum::DenseMemmapHalf(_) => unreachable!(),
+            #[cfg(target_os = "linux")]
+            VectorStorageEnum::DenseUring(_)
+            | VectorStorageEnum::DenseUringByte(_)
+            | VectorStorageEnum::DenseUringHalf(_) => unreachable!(),
             VectorStorageEnum::DenseAppendableMemmap(_)
             | VectorStorageEnum::DenseAppendableMemmapByte(_)
             | VectorStorageEnum::DenseAppendableMemmapHalf(_) => unreachable!(),
-            #[cfg(feature = "rocksdb")]
-            VectorStorageEnum::SparseSimple(_) => unreachable!(),
             VectorStorageEnum::SparseMmap(_) => unreachable!(),
             #[cfg(test)]
             VectorStorageEnum::SparseVolatile(_) => unreachable!(),
-            #[cfg(feature = "rocksdb")]
-            VectorStorageEnum::MultiDenseSimple(v) => {
-                for (orig, vec) in orig_iter.zip(v.iterate_inner_vectors()) {
-                    assert_eq!(orig, vec);
-                }
-            }
-            #[cfg(feature = "rocksdb")]
-            VectorStorageEnum::MultiDenseSimpleByte(_)
-            | VectorStorageEnum::MultiDenseSimpleHalf(_) => unreachable!(),
             VectorStorageEnum::MultiDenseVolatile(v) => {
                 for (orig, vec) in orig_iter.zip(v.iterate_inner_vectors()) {
-                    assert_eq!(orig, vec);
+                    assert_eq!(orig, vec.as_ref());
                 }
             }
             VectorStorageEnum::MultiDenseVolatileByte(_)
             | VectorStorageEnum::MultiDenseVolatileHalf(_) => unreachable!(),
             VectorStorageEnum::MultiDenseAppendableMemmap(v) => {
                 for (orig, vec) in orig_iter.zip(v.iterate_inner_vectors()) {
-                    assert_eq!(orig, vec);
+                    assert_eq!(orig, vec.as_ref());
                 }
             }
             VectorStorageEnum::MultiDenseAppendableMemmapByte(_)
             | VectorStorageEnum::MultiDenseAppendableMemmapHalf(_) => unreachable!(),
-            VectorStorageEnum::DenseAppendableInRam(_)
-            | VectorStorageEnum::DenseAppendableInRamByte(_)
-            | VectorStorageEnum::DenseAppendableInRamHalf(_) => unreachable!(),
-            VectorStorageEnum::MultiDenseAppendableInRam(_)
-            | VectorStorageEnum::MultiDenseAppendableInRamByte(_)
-            | VectorStorageEnum::MultiDenseAppendableInRamHalf(_) => unreachable!(),
+            VectorStorageEnum::EmptyDense(_) | VectorStorageEnum::EmptySparse(_) => {
+                unreachable!()
+            }
         };
     }
 
@@ -141,16 +122,21 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
     );
     let vector: Vec<Vec<f32>> = vec![vec![2.0; vector_dim]];
     let query = QueryVector::Nearest(vector.try_into().unwrap());
-    let scorer =
-        FilteredScorer::new_for_test(query, storage, borrowed_id_tracker.deleted_point_bitslice());
-    let closest = scorer
-        .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+    let searcher = BatchFilteredSearcher::new_for_test(
+        std::slice::from_ref(&query),
+        storage,
+        id_tracker.deleted_point_bitslice(),
+        5,
+    );
+    let closest = searcher
+        .peek_top_iter([0, 1, 2, 3, 4].iter().cloned(), &DEFAULT_STOPPED)
+        .unwrap()
+        .pop()
         .unwrap();
     assert_eq!(closest.len(), 3, "must have 3 vectors, 2 are deleted");
     assert_eq!(closest[0].idx, 4);
     assert_eq!(closest[1].idx, 1);
     assert_eq!(closest[2].idx, 0);
-    drop(scorer);
 
     // Delete 1, redelete 2
     storage.delete_vector(1 as PointOffsetType).unwrap();
@@ -163,15 +149,20 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
 
     let vector: Vec<Vec<f32>> = vec![vec![1.0; vector_dim]];
     let query = QueryVector::Nearest(vector.try_into().unwrap());
-    let scorer =
-        FilteredScorer::new_for_test(query, storage, borrowed_id_tracker.deleted_point_bitslice());
-    let closest = scorer
-        .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+    let searcher = BatchFilteredSearcher::new_for_test(
+        std::slice::from_ref(&query),
+        storage,
+        id_tracker.deleted_point_bitslice(),
+        5,
+    );
+    let closest = searcher
+        .peek_top_iter([0, 1, 2, 3, 4].iter().cloned(), &DEFAULT_STOPPED)
+        .unwrap()
+        .pop()
         .unwrap();
     assert_eq!(closest.len(), 2, "must have 2 vectors, 3 are deleted");
     assert_eq!(closest[0].idx, 4);
     assert_eq!(closest[1].idx, 0);
-    drop(scorer);
 
     // Delete all
     storage.delete_vector(0 as PointOffsetType).unwrap();
@@ -184,9 +175,17 @@ fn do_test_delete_points(vector_dim: usize, vec_count: usize, storage: &mut Vect
 
     let vector: Vec<Vec<f32>> = vec![vec![1.0; vector_dim]];
     let query = QueryVector::Nearest(vector.try_into().unwrap());
-    let scorer =
-        FilteredScorer::new_for_test(query, storage, borrowed_id_tracker.deleted_point_bitslice());
-    let closest = scorer.peek_top_all(5, &DEFAULT_STOPPED).unwrap();
+    let searcher = BatchFilteredSearcher::new_for_test(
+        std::slice::from_ref(&query),
+        storage,
+        id_tracker.deleted_point_bitslice(),
+        5,
+    );
+    let closest = searcher
+        .peek_top_all(&DEFAULT_STOPPED)
+        .unwrap()
+        .pop()
+        .unwrap();
     assert!(closest.is_empty(), "must have no results, all deleted");
 }
 
@@ -199,9 +198,7 @@ fn do_test_update_from_delete_points(
 
     let delete_mask = [false, false, true, true, false];
 
-    let id_tracker: Arc<AtomicRefCell<IdTrackerSS>> =
-        Arc::new(AtomicRefCell::new(FixtureIdTracker::new(points.len())));
-    let borrowed_id_tracker = id_tracker.borrow_mut();
+    let id_tracker = create_id_tracker_fixture(points.len());
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -240,12 +237,17 @@ fn do_test_update_from_delete_points(
 
     let query = QueryVector::Nearest(vector.try_into().unwrap());
 
-    let scorer =
-        FilteredScorer::new_for_test(query, storage, borrowed_id_tracker.deleted_point_bitslice());
-    let closest = scorer
-        .peek_top_iter(&mut [0, 1, 2, 3, 4].iter().cloned(), 5, &DEFAULT_STOPPED)
+    let searcher = BatchFilteredSearcher::new_for_test(
+        std::slice::from_ref(&query),
+        storage,
+        id_tracker.deleted_point_bitslice(),
+        5,
+    );
+    let closest = searcher
+        .peek_top_iter([0, 1, 2, 3, 4].iter().cloned(), &DEFAULT_STOPPED)
+        .unwrap()
+        .pop()
         .unwrap();
-    drop(scorer);
     assert_eq!(closest.len(), 3, "must have 3 vectors, 2 are deleted");
     assert_eq!(closest[0].idx, 4);
     assert_eq!(closest[1].idx, 1);
@@ -268,28 +270,14 @@ fn create_vector_storage(
     path: &Path,
 ) -> VectorStorageEnum {
     match storage_type {
-        #[cfg(feature = "rocksdb")]
-        MultiDenseStorageType::RocksDbFloat => {
-            use crate::common::rocksdb_wrapper::{DB_VECTOR_CF, open_db};
-            use crate::vector_storage::multi_dense::simple_multi_dense_vector_storage::open_simple_multi_dense_vector_storage_full;
-
-            let db = open_db(path, &[DB_VECTOR_CF]).unwrap();
-            open_simple_multi_dense_vector_storage_full(
-                db,
-                DB_VECTOR_CF,
-                vec_dim,
-                Distance::Dot,
-                MultiVectorConfig::default(),
-                &Default::default(),
-            )
-            .unwrap()
-        }
         MultiDenseStorageType::AppendableMmapFloat => {
             open_appendable_memmap_multi_vector_storage_full(
                 path,
                 vec_dim,
                 Distance::Dot,
                 MultiVectorConfig::default(),
+                AdviceSetting::Global,
+                false,
             )
             .unwrap()
         }
@@ -297,7 +285,6 @@ fn create_vector_storage(
 }
 
 #[rstest]
-#[cfg_attr(feature = "rocksdb", case(MultiDenseStorageType::RocksDbFloat))]
 #[case(MultiDenseStorageType::AppendableMmapFloat)]
 fn test_delete_points_in_multi_dense_vector_storage(#[case] storage_type: MultiDenseStorageType) {
     let vec_dim = 1024;
@@ -327,7 +314,6 @@ fn test_delete_points_in_multi_dense_vector_storage(#[case] storage_type: MultiD
 }
 
 #[rstest]
-#[cfg_attr(feature = "rocksdb", case(MultiDenseStorageType::RocksDbFloat))]
 #[case(MultiDenseStorageType::AppendableMmapFloat)]
 fn test_update_from_delete_points_multi_dense_vector_storage(
     #[case] storage_type: MultiDenseStorageType,
@@ -359,7 +345,6 @@ fn test_update_from_delete_points_multi_dense_vector_storage(
 }
 
 #[rstest]
-#[cfg_attr(feature = "rocksdb", case(MultiDenseStorageType::RocksDbFloat))]
 #[case(MultiDenseStorageType::AppendableMmapFloat)]
 fn test_large_multi_dense_vector_storage(#[case] storage_type: MultiDenseStorageType) {
     assert!(MAX_MULTIVECTOR_FLATTENED_LEN * std::mem::size_of::<VectorElementType>() < CHUNK_SIZE);

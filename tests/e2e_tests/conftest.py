@@ -1,5 +1,6 @@
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Generator
 
@@ -22,10 +23,25 @@ def pytest_runtest_makereport(item, call):
     setattr(item, "rep_" + rep.when, rep)
 
 
+def _dump_container_logs_on_failure(request, docker_containers):
+    """On test failure, write full docker logs to tests/e2e_tests/logs/<test>/<container>.log."""
+    rep = getattr(request.node, "rep_call", None)
+    if rep is None or not rep.failed:
+        return
+    log_dir = Path(__file__).parent / "logs" / f"{request.node.name}_{int(time.time())}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    for c in docker_containers:
+        try:
+            c.reload()
+            (log_dir / f"{c.name}.log").write_bytes(c.logs())
+        except Exception as e:
+            print(f"Failed to capture logs for {c.name}: {e}")
+
+
 @pytest.fixture(scope="session")
 def docker_client() -> docker.DockerClient:
     """Create a Docker client instance.
-    
+
     Returns:
         docker.DockerClient: Docker client connected to local Docker daemon
     """
@@ -35,7 +51,7 @@ def docker_client() -> docker.DockerClient:
 @pytest.fixture(scope="session")
 def test_data_dir() -> Path:
     """Path to the test data directory.
-    
+
     Returns:
         Path: Absolute path to tests/e2e_tests/test_data directory
     """
@@ -59,11 +75,11 @@ def qdrant_image(docker_client: docker.DockerClient, request) -> str:
         ], indirect=True)
         def test_something(qdrant_image):
             # Uses custom tag and forces rebuild
-            
+
     Parameters (via indirect parametrization):
         - tag (str): Custom image tag (default: "qdrant/qdrant:e2e-tests")
         - rebuild_image (bool): Force rebuild even if image exists (default: False)
-        
+
     Returns:
         str: The Docker image tag that was built or already exists
     """
@@ -98,6 +114,7 @@ def qdrant_image(docker_client: docker.DockerClient, request) -> str:
         build_cmd = [
             "docker", "buildx", "build",
             "--build-arg=PROFILE=ci",
+            "--build-arg=FEATURES=data-consistency-check,staging",
             "--load",
             str(project_root),
             f"--tag={image_tag}"
@@ -121,11 +138,11 @@ def qdrant_container_factory(docker_client, qdrant_image, request):
     For a simple use case with default configuration, use qdrant fixture instead.
 
     Can be used as a factory or with indirect parametrization:
-    
+
     Factory usage (returns a callable):
         def test_something(qdrant_container_factory):
             container_info = qdrant_container_factory(mem_limit="128m", environment={...})
-            
+
     Indirect parametrization (returns container info directly):
         @pytest.mark.parametrize("qdrant_container_factory", [
             {"mem_limit": "256m", "environment": {"KEY": "value"}}
@@ -134,14 +151,14 @@ def qdrant_container_factory(docker_client, qdrant_image, request):
             # qdrant_container_factory is already the container info object
             host = qdrant_container_factory.host
             port = qdrant_container_factory.http_port
-    
+
     Returns a QdrantContainer object with:
         - container: The Docker container object
         - host: The host address ("127.0.0.1" or "localhost" for host network)
         - name: The container name
         - http_port: The HTTP API port (6333)
         - grpc_port: The gRPC API port (6334)
-        
+
     Parameters (all passed to docker_client.containers.run, common ones include):
         - name (str): Container name
         - mem_limit (str): Memory limit (e.g., "128m", "256m")
@@ -156,7 +173,7 @@ def qdrant_container_factory(docker_client, qdrant_image, request):
                                If False, returns container info even if Qdrant doesn't start successfully.
     """
     containers = []
-    
+
     def _create_container(*args, **kwargs):
         # Handle both QdrantContainerConfig objects and keyword arguments
         if len(args) == 1 and isinstance(args[0], QdrantContainerConfig):
@@ -167,37 +184,17 @@ def qdrant_container_factory(docker_client, qdrant_image, request):
         container_info = create_qdrant_container(docker_client, qdrant_image, config)
         containers.append(container_info.container)
         return container_info
-    
-    def _log_containers_on_failure():
-        """Output container logs if the test failed"""
-        if request.node.rep_call.failed if hasattr(request.node, 'rep_call') else False:
-            print("\n" + "="*50)
-            print("TEST FAILED - DUMPING CONTAINER LOGS")
-            print("="*50)
-            for docker_container in containers:
-                try:
-                    docker_container.reload()
-                    logs = docker_container.logs(tail=50).decode('utf-8', errors='ignore')
-                    print(f"\nLogs for container {docker_container.name}:")
-                    print("-" * 30)
-                    print(logs)
-                    print("-" * 30)
-                except Exception as e:
-                    print(f"Failed to get logs for container {docker_container.name}: {e}")
-            print("="*50)
-    
+
     def _cleanup_containers():
         """Clean up containers after potentially logging them"""
-        # First log containers if test failed (before cleanup)
-        _log_containers_on_failure()
-        
-        # Then cleanup all containers
+        _dump_container_logs_on_failure(request, containers)
+
         for container in containers:
             cleanup_container(container)
-    
+
     # Register the finalizer to handle logging and cleanup
     request.addfinalizer(_cleanup_containers)
-    
+
     # Check if this is being used with indirect parametrization
     if hasattr(request, "param"):
         if isinstance(request.param, dict):
@@ -208,7 +205,7 @@ def qdrant_container_factory(docker_client, qdrant_image, request):
             config = request.param
         else:
             raise ValueError(f"Unsupported parameter type for qdrant_container_factory: {type(request.param)}")
-        
+
         container_info = create_qdrant_container(docker_client, qdrant_image, config)
         containers.append(container_info.container)
         yield container_info
@@ -218,7 +215,7 @@ def qdrant_container_factory(docker_client, qdrant_image, request):
 
 
 @pytest.fixture(scope="function")
-def temp_storage_dir(request) -> Generator[Path, None, None]:
+def temp_storage_dir(request, docker_client) -> Generator[Path, None, None]:
     """
     Create a temporary storage directory and ensure its removal after test.
 
@@ -245,8 +242,22 @@ def temp_storage_dir(request) -> Generator[Path, None, None]:
             try:
                 shutil.rmtree(test_dir)
                 print(f"Cleaned up temp storage directory: {test_dir}")
-            except Exception as e:
+            except (PermissionError, OSError) as e:
                 print(f"Warning: Failed to remove temp storage directory {test_dir}: {e}")
+                print(f"Using Docker to clean up root-owned files...")
+
+                try:
+                    docker_client.containers.run(
+                        "alpine:latest",
+                        command=["rm", "-rf", f"/cleanup/{folder_name}"],
+                        volumes={str(Path(__file__).parent): {"bind": "/cleanup", "mode": "rw"}},
+                        remove=True,
+                        user="root"
+                    )
+                    print(f"Successfully cleaned up temp storage directory with Docker: {test_dir}")
+                except Exception as docker_error:
+                    print(f"Failed to cleanup with Docker: {docker_error}")
+                    print(f"WARNING: Test directory may not be fully cleaned up: {test_dir}")
 
 
 @pytest.fixture(scope="function")
@@ -334,4 +345,5 @@ def qdrant_compose(docker_client, qdrant_image, test_data_dir, request):
     try:
         yield cluster
     finally:
+        _dump_container_logs_on_failure(request, [c.container for c in cluster.containers])
         cluster.cleanup()

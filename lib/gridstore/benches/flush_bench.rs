@@ -3,13 +3,13 @@ use std::time::{Duration, Instant};
 use common::counter::hardware_counter::HardwareCounterCell;
 use criterion::{Criterion, criterion_group, criterion_main};
 use gridstore::fixtures::{empty_storage, random_payload};
-use rand::Rng;
+use rand::RngExt;
 
 pub fn flush_bench(c: &mut Criterion) {
     let prepopulation_size = 10_000;
 
     // Test sequential updates' flushing performance
-    for unflushed_updates in [100, 1_000, prepopulation_size].iter() {
+    for unflushed_updates in &[100, 1_000, prepopulation_size] {
         let bench_name = format!("flush after {unflushed_updates} sequential writes");
 
         c.bench_function(&bench_name, |b| {
@@ -37,7 +37,7 @@ pub fn flush_bench(c: &mut Criterion) {
                     // Benchmark the flush operation after accumulating updates
                     let instant = Instant::now();
 
-                    storage.flush().unwrap();
+                    storage.flusher()().unwrap();
 
                     total_elapsed += instant.elapsed();
                 }
@@ -47,7 +47,7 @@ pub fn flush_bench(c: &mut Criterion) {
     }
 
     // Test random updates' flushing performance
-    for unflushed_updates in [100, 1_000, prepopulation_size].iter() {
+    for unflushed_updates in &[100, 1_000, prepopulation_size] {
         let bench_name = format!("flush after {unflushed_updates} random writes");
 
         c.bench_function(&bench_name, |b| {
@@ -76,7 +76,7 @@ pub fn flush_bench(c: &mut Criterion) {
                     // Benchmark the flush operation after accumulating updates
                     let instant = Instant::now();
 
-                    storage.flush().unwrap();
+                    storage.flusher()().unwrap();
 
                     total_elapsed += instant.elapsed();
                 }

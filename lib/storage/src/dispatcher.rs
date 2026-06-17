@@ -6,7 +6,7 @@ use api::rest::models::HardwareUsage;
 use collection::common::fetch_vectors::CollectionName;
 use collection::config::ShardingMethod;
 use collection::operations::verification::VerificationPass;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use common::counter::hardware_accumulator::HwSharedDrain;
 use common::defaults::CONSENSUS_META_OP_WAIT;
 use futures::StreamExt as _;
@@ -15,7 +15,7 @@ use segment::types::ShardKey;
 
 use crate::content_manager::collection_meta_ops::AliasOperations;
 use crate::content_manager::shard_distribution::ShardDistributionProposal;
-use crate::rbac::{Access, CollectionMultipass};
+use crate::rbac::{Auth, CollectionMultipass};
 use crate::{
     ClusterStatus, CollectionMetaOperations, ConsensusOperations, ConsensusStateRef, StorageError,
     TableOfContent,
@@ -46,13 +46,9 @@ impl Dispatcher {
     }
 
     /// Get the table of content.
-    /// The `_access` and `_verification_pass` parameter are not used, but it's required to verify caller's possession
+    /// The `_auth` and `_verification_pass` parameter are not used, but it's required to verify caller's possession
     /// of both objects.
-    pub fn toc(
-        &self,
-        _access: &Access,
-        _verification_pass: &VerificationPass,
-    ) -> &Arc<TableOfContent> {
+    pub fn toc(&self, _auth: &Auth, _verification_pass: &VerificationPass) -> &Arc<TableOfContent> {
         &self.toc
     }
 
@@ -65,14 +61,21 @@ impl Dispatcher {
     }
 
     /// If `wait_timeout` is not supplied - then default duration will be used.
+    ///
     /// This function needs to be called from a runtime with timers enabled.
+    ///
+    /// ## Cancel safety
+    ///
+    /// This function is cancel safe.
+    ///
+    /// On deployments without consensus - a submitted operation is always run to completion.
     pub async fn submit_collection_meta_op(
         &self,
         operation: CollectionMetaOperations,
-        access: Access,
+        auth: Auth,
         wait_timeout: Option<Duration>,
     ) -> Result<bool, StorageError> {
-        access.check_collection_meta_operation(&operation)?;
+        auth.check_collection_meta_operation(&operation)?;
 
         // if distributed deployment is enabled
         if let Some(state) = self.consensus_state.as_ref() {
@@ -83,7 +86,6 @@ impl Dispatcher {
 
             let op = match operation {
                 CollectionMetaOperations::CreateCollection(mut op) => {
-                    self.toc.check_write_lock()?;
                     if !op.is_distribution_set() {
                         match op.create_collection.sharding_method.unwrap_or_default() {
                             ShardingMethod::Auto => {
@@ -136,11 +138,23 @@ impl Dispatcher {
                     CollectionMetaOperations::CreateCollection(op)
                 }
                 CollectionMetaOperations::CreateShardKey(op) => {
-                    self.toc.check_write_lock()?;
                     CollectionMetaOperations::CreateShardKey(op)
                 }
 
-                op => op,
+                CollectionMetaOperations::UpdateCollection(_)
+                | CollectionMetaOperations::DeleteCollection(_)
+                | CollectionMetaOperations::ChangeAliases(_)
+                | CollectionMetaOperations::Resharding(_, _)
+                | CollectionMetaOperations::TransferShard(_, _)
+                | CollectionMetaOperations::SetShardReplicaState(_)
+                | CollectionMetaOperations::DropShardKey(_)
+                | CollectionMetaOperations::CreatePayloadIndex(_)
+                | CollectionMetaOperations::DropPayloadIndex(_)
+                | CollectionMetaOperations::CreateNamedVector(_)
+                | CollectionMetaOperations::DeleteNamedVector(_)
+                | CollectionMetaOperations::Nop { .. } => operation,
+                #[cfg(feature = "staging")]
+                CollectionMetaOperations::TestSlowDown(_) => operation,
             };
 
             let operation_awaiter =
@@ -154,9 +168,14 @@ impl Dispatcher {
                 };
 
             let do_sync_nodes = match &op {
-                // Sync nodes after collection or shard key creation
+                // Sync nodes after collection or shard key creation, or after
+                // adding/removing a named vector — in all of these cases callers
+                // expect the updated collection config to be visible on every
+                // peer on return.
                 CollectionMetaOperations::CreateCollection(_)
-                | CollectionMetaOperations::CreateShardKey(_) => true,
+                | CollectionMetaOperations::CreateShardKey(_)
+                | CollectionMetaOperations::CreateNamedVector(_)
+                | CollectionMetaOperations::DeleteNamedVector(_) => true,
 
                 // Sync nodes when creating or renaming collection aliases
                 CollectionMetaOperations::ChangeAliases(changes) => {
@@ -178,6 +197,9 @@ impl Dispatcher {
                 | CollectionMetaOperations::CreatePayloadIndex(_)
                 | CollectionMetaOperations::DropPayloadIndex(_)
                 | CollectionMetaOperations::Nop { .. } => false,
+
+                #[cfg(feature = "staging")]
+                CollectionMetaOperations::TestSlowDown(_) => false,
             };
 
             // During creation of a shard key, we must ensure that all replicas are ready to accept
@@ -192,11 +214,13 @@ impl Dispatcher {
             //    ( At this stage we are sure, that all consensus operations are created, but might not be applied everywhere )
             // 3. Wait for all remote peers to have at least the same state as the current peer.
             //    ( So we are sure, that all remote peers have also switched to `Active` state )
+            #[expect(clippy::wildcard_enum_match_arm, reason = "too many enum variants")]
             let create_shard_key = match &op {
                 CollectionMetaOperations::CreateShardKey(op) => {
                     let collection_name: CollectionName = op.collection_name.clone();
                     let shard_key = op.shard_key.clone();
-                    Some((collection_name, shard_key))
+                    let initial_state = op.initial_state;
+                    Some((collection_name, shard_key, initial_state))
                 }
                 _ => None,
             };
@@ -221,7 +245,11 @@ impl Dispatcher {
             }
 
             // Wait for shards activation
-            if let Some((collection_name, shard_key)) = create_shard_key {
+            if let Some((collection_name, shard_key, initial_state)) = create_shard_key
+                && initial_state.is_none()
+            {
+                // Only do if initial state is not set because we only wanted to wait for Active since introducing
+                // the Initial state which needs a transition to Active.
                 let remaining_timeout =
                     wait_timeout.map(|timeout| timeout.saturating_sub(start.elapsed()));
                 self.wait_for_shard_key_activation(collection_name, shard_key, remaining_timeout)
@@ -241,10 +269,9 @@ impl Dispatcher {
 
             Ok(res)
         } else {
-            if let CollectionMetaOperations::CreateCollection(_) = &operation {
-                self.toc.check_write_lock()?;
-            }
-            self.toc.perform_collection_meta_op(operation).await
+            let toc = self.toc.clone();
+            tokio::task::spawn(async move { toc.perform_collection_meta_op(operation).await })
+                .await?
         }
     }
 
@@ -301,7 +328,7 @@ impl Dispatcher {
                 .await;
 
             for replica_set in shard_holder.all_shards() {
-                if replica_set.shard_key() != Some(&shard_key) {
+                if replica_set.shard_key().as_ref() != Some(&shard_key) {
                     continue;
                 }
 
@@ -331,7 +358,7 @@ impl Dispatcher {
     }
 
     #[must_use]
-    pub fn get_collection_hw_metrics(&self, collection: String) -> HwSharedDrain {
+    pub fn get_collection_hw_metrics(&self, collection: String) -> Arc<HwSharedDrain> {
         self.toc.get_collection_hw_metrics(collection)
     }
 }

@@ -1,4 +1,3 @@
-use std::fs::File;
 use std::io::{BufReader, BufWriter, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -6,6 +5,7 @@ use std::time::Duration;
 
 use atomicwrites::OverwriteBehavior::AllowOverwrite;
 use atomicwrites::{AtomicFile, Error as AtomicWriteError};
+use fs_err::{File, tokio as tokio_fs};
 use parking_lot::{Condvar, Mutex, RwLock, RwLockReadGuard, RwLockUpgradableReadGuard};
 use serde::{Deserialize, Serialize};
 
@@ -59,7 +59,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
         })
     }
 
-    /// Initialize new data, even if it already exists on disk at the given path.
+    /// Initialize and write new data, even if it already exists on disk at the given path.
     ///
     /// If data already exists on disk, it will be immediately overwritten.
     pub fn new(path: impl Into<PathBuf>, data: T) -> Result<Self, Error> {
@@ -70,9 +70,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
             path: path.into(),
         };
 
-        if data.path.exists() {
-            data.save()?;
-        }
+        data.save()?;
 
         Ok(data)
     }
@@ -85,8 +83,12 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
     where
         F: Fn(&T) -> bool,
     {
-        let start = std::time::Instant::now();
-        while start.elapsed() < timeout {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if remaining.is_zero() {
+                return false;
+            }
             let mut data_read_guard = self.data.read();
             if check(&data_read_guard) {
                 return true;
@@ -96,10 +98,9 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
             RwLockReadGuard::unlocked(&mut data_read_guard, || {
                 // Move the guard in so it gets unlocked before we re-lock the RwLock read guard
                 let mut guard = notification_guard;
-                self.change_notification.wait_for(&mut guard, timeout);
+                self.change_notification.wait_for(&mut guard, remaining);
             });
         }
-        false
     }
 
     /// Perform an operation over the stored data,
@@ -113,7 +114,8 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
             Self::save_data_to(&self.path, &output)?;
             let mut write_data = RwLockUpgradableReadGuard::upgrade(read_data);
             *write_data = output;
-            self.change_notification.notify_all();
+            drop(write_data);
+            self.notify_change();
             Ok(true)
         } else {
             Ok(false)
@@ -129,8 +131,21 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
         let mut write_data = RwLockUpgradableReadGuard::upgrade(read_data);
 
         *write_data = data_copy;
-        self.change_notification.notify_all();
+        drop(write_data);
+        self.notify_change();
         Ok(output)
+    }
+
+    /// Wake up any threads waiting in [`Self::wait_for`].
+    ///
+    /// Acquires `notification_lock` around `notify_all` so that a waiter
+    /// cannot miss the notification while it is in the window between
+    /// releasing its read guard on `data` and parking on the condvar: the
+    /// waiter holds `notification_lock` across that gap, so this call blocks
+    /// until the waiter has actually parked.
+    fn notify_change(&self) {
+        let _guard = self.notification_lock.lock();
+        self.change_notification.notify_all();
     }
 
     fn save_data_to(path: impl Into<PathBuf>, data: &T) -> Result<(), Error> {
@@ -162,7 +177,7 @@ impl<T: Serialize + for<'de> Deserialize<'de> + Clone> SaveOnDisk<T> {
     }
 
     pub async fn delete(self) -> std::io::Result<()> {
-        tokio::fs::remove_file(self.path).await
+        tokio_fs::remove_file(self.path).await
     }
 }
 
@@ -183,10 +198,11 @@ impl<T> DerefMut for SaveOnDisk<T> {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::thread;
     use std::thread::sleep;
     use std::time::Duration;
-    use std::{fs, thread};
 
+    use fs_err as fs;
     use tempfile::Builder;
 
     use super::SaveOnDisk;

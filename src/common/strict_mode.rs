@@ -7,7 +7,7 @@ use storage::content_manager::collection_verification::{
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::Access;
+use storage::rbac::Auth;
 
 /// Trait for different ways of providing something with `toc` that may do additional checks eg. for Strict mode.
 pub trait CheckedTocProvider {
@@ -16,7 +16,7 @@ pub trait CheckedTocProvider {
         request: &impl StrictModeVerification,
         collection_name: &str,
         timeout: Option<usize>,
-        access: &Access,
+        auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError>;
 
     async fn check_strict_mode_batch<I, R>(
@@ -25,7 +25,7 @@ pub trait CheckedTocProvider {
         conv: impl Fn(&I) -> &R,
         collection_name: &str,
         timeout: Option<usize>,
-        access: &Access,
+        auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError>
     where
         R: StrictModeVerification;
@@ -49,7 +49,7 @@ impl CheckedTocProvider for UncheckedTocProvider<'_> {
         _request: &impl StrictModeVerification,
         _collection_name: &str,
         _timeout: Option<usize>,
-        _access: &Access,
+        _auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError> {
         // No checks here
         Ok(self.toc)
@@ -61,7 +61,7 @@ impl CheckedTocProvider for UncheckedTocProvider<'_> {
         _conv: impl Fn(&I) -> &R,
         _collection_name: &str,
         _timeout: Option<usize>,
-        _access: &Access,
+        _auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError>
     where
         R: StrictModeVerification,
@@ -89,11 +89,11 @@ impl CheckedTocProvider for StrictModeCheckedTocProvider<'_> {
         request: &impl StrictModeVerification,
         collection_name: &str,
         timeout: Option<usize>,
-        access: &Access,
+        auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError> {
         let pass =
-            check_strict_mode(request, timeout, collection_name, self.dispatcher, access).await?;
-        Ok(self.dispatcher.toc(access, &pass))
+            check_strict_mode(request, timeout, collection_name, self.dispatcher, auth).await?;
+        Ok(self.dispatcher.toc(auth, &pass))
     }
 
     async fn check_strict_mode_batch<I, R>(
@@ -102,7 +102,7 @@ impl CheckedTocProvider for StrictModeCheckedTocProvider<'_> {
         conv: impl Fn(&I) -> &R,
         collection_name: &str,
         timeout: Option<usize>,
-        access: &Access,
+        auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError>
     where
         R: StrictModeVerification,
@@ -110,12 +110,13 @@ impl CheckedTocProvider for StrictModeCheckedTocProvider<'_> {
         let pass = check_strict_mode_batch(
             requests.iter().map(conv),
             timeout,
+            Some(requests.len()),
             collection_name,
             self.dispatcher,
-            access,
+            auth,
         )
         .await?;
-        Ok(self.dispatcher.toc(access, &pass))
+        Ok(self.dispatcher.toc(auth, &pass))
     }
 }
 
@@ -139,9 +140,9 @@ impl CheckedTocProvider for StrictModeCheckedInternalTocProvider<'_> {
         request: &impl StrictModeVerification,
         collection_name: &str,
         timeout: Option<usize>,
-        access: &Access,
+        auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError> {
-        check_strict_mode_toc(request, timeout, collection_name, self.toc, access).await?;
+        check_strict_mode_toc(request, timeout, collection_name, self.toc, auth).await?;
         Ok(self.toc)
     }
 
@@ -151,7 +152,7 @@ impl CheckedTocProvider for StrictModeCheckedInternalTocProvider<'_> {
         conv: impl Fn(&I) -> &R,
         collection_name: &str,
         timeout: Option<usize>,
-        access: &Access,
+        auth: &Auth,
     ) -> Result<&Arc<TableOfContent>, StorageError>
     where
         R: StrictModeVerification,
@@ -159,9 +160,10 @@ impl CheckedTocProvider for StrictModeCheckedInternalTocProvider<'_> {
         check_strict_mode_toc_batch(
             requests.iter().map(conv),
             timeout,
+            Some(requests.len()),
             collection_name,
             self.toc,
-            access,
+            auth,
         )
         .await?;
         Ok(self.toc)

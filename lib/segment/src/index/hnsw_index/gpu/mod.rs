@@ -15,15 +15,12 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use batched_points::BatchedPoints;
 use gpu_devices_manager::GpuDevicesMaganer;
-use lazy_static::lazy_static;
 use parking_lot::RwLock;
 
 use super::graph_layers_builder::GraphLayersBuilder;
 use crate::index::hnsw_index::HnswM;
 
-lazy_static! {
-    pub static ref GPU_DEVICES_MANAGER: RwLock<Option<GpuDevicesMaganer>> = RwLock::new(None);
-}
+pub static GPU_DEVICES_MANAGER: RwLock<Option<GpuDevicesMaganer>> = RwLock::new(None);
 
 /// Each GPU operation has a timeout by Vulkan API specification.
 /// Choose large enough timeout.
@@ -94,6 +91,7 @@ fn create_graph_layers_builder(
 mod tests {
     use ahash::HashSet;
     use common::counter::hardware_counter::HardwareCounterCell;
+    use common::generic_consts::Random;
     use common::types::PointOffsetType;
     use rand::SeedableRng;
     use rand::rngs::StdRng;
@@ -103,12 +101,14 @@ mod tests {
     use crate::fixtures::index_fixtures::TestRawScorerProducer;
     use crate::fixtures::payload_fixtures::random_vector;
     use crate::index::hnsw_index::HnswM;
-    use crate::index::hnsw_index::graph_layers::GraphLayers;
+    use crate::index::hnsw_index::graph_layers::{GraphLayers, SearchAlgorithm};
     use crate::index::hnsw_index::graph_layers_builder::GraphLayersBuilder;
     use crate::index::hnsw_index::graph_links::GraphLinksFormatParam;
     use crate::types::Distance;
     use crate::vector_storage::dense::volatile_dense_vector_storage::new_volatile_dense_vector_storage;
-    use crate::vector_storage::{DEFAULT_STOPPED, Random, VectorStorage, VectorStorageEnum};
+    use crate::vector_storage::{
+        DEFAULT_STOPPED, VectorStorage, VectorStorageEnum, VectorStorageRead,
+    };
 
     pub struct GpuGraphTestData {
         pub vector_storage: VectorStorageEnum,
@@ -214,13 +214,27 @@ mod tests {
             let scorer = test.vector_holder.scorer(search_vector.clone());
 
             let search_result_gpu = graph
-                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .search(
+                    top,
+                    ef,
+                    SearchAlgorithm::Hnsw,
+                    scorer,
+                    None,
+                    &DEFAULT_STOPPED,
+                )
                 .unwrap();
 
             let scorer = test.vector_holder.scorer(search_vector.clone());
 
             let search_result_cpu = ref_graph
-                .search(top, ef, scorer, None, &DEFAULT_STOPPED)
+                .search(
+                    top,
+                    ef,
+                    SearchAlgorithm::Hnsw,
+                    scorer,
+                    None,
+                    &DEFAULT_STOPPED,
+                )
                 .unwrap();
 
             let mut gpu_set = HashSet::default();

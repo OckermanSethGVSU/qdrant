@@ -1,51 +1,15 @@
 #![allow(dead_code)]
 
-use std::convert::Infallible;
-use std::future::{Ready, ready};
-
-use actix_web::{FromRequest, HttpMessage};
-
+pub mod api_keys;
 mod batch_processing;
 mod batch_processing_grpc;
-pub mod bm25;
+pub mod bm25_inference;
 pub(crate) mod config;
 mod infer_processing;
 pub mod inference_input;
 mod local_model;
+pub mod params;
 pub mod query_requests_grpc;
 pub mod query_requests_rest;
 pub mod service;
 pub mod update_requests;
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct InferenceToken(pub Option<String>);
-
-impl InferenceToken {
-    pub fn new(key: String) -> Self {
-        InferenceToken(Some(key))
-    }
-
-    pub fn as_str(&self) -> Option<&str> {
-        self.0.as_deref()
-    }
-}
-
-impl FromRequest for InferenceToken {
-    type Error = Infallible;
-    type Future = Ready<Result<Self, Self::Error>>;
-
-    fn from_request(
-        req: &actix_web::HttpRequest,
-        _payload: &mut actix_web::dev::Payload,
-    ) -> Self::Future {
-        let api_key = req.extensions().get::<InferenceToken>().cloned();
-        ready(Ok(api_key.unwrap_or_default()))
-    }
-}
-
-pub fn extract_token<R>(req: &tonic::Request<R>) -> InferenceToken {
-    req.extensions()
-        .get::<InferenceToken>()
-        .cloned()
-        .unwrap_or(InferenceToken(None))
-}

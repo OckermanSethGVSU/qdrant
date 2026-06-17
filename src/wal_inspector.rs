@@ -57,7 +57,7 @@ fn print_consensus_wal(wal_path: &Path) {
 
 fn print_collection_wal(wal_path: &Path) {
     let wal: Result<SerdeWal<OperationWithClockTag>, _> =
-        SerdeWal::new(wal_path.to_str().unwrap(), WalOptions::default());
+        SerdeWal::new(wal_path, WalOptions::default());
 
     match wal {
         Err(error) => {
@@ -66,13 +66,20 @@ fn print_collection_wal(wal_path: &Path) {
         Ok(wal) => {
             // print all entries
             let mut count = 0;
-            for (idx, op) in wal.read_all(true) {
-                println!("==========================");
-                println!(
-                    "Entry: {idx} Operation: {:?} Clock: {:?}",
-                    op.operation, op.clock_tag
-                );
-                count += 1;
+            for entry in wal.read_all(true) {
+                match entry {
+                    Ok((idx, op)) => {
+                        println!("==========================");
+                        println!(
+                            "Entry: {idx} Operation: {:?} Clock: {:?}",
+                            op.operation, op.clock_tag
+                        );
+                        count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!("Failed to read WAL entry: {e}");
+                    }
+                }
             }
             println!("==========================");
             println!("End of WAL.");

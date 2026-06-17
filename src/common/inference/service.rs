@@ -1,11 +1,13 @@
 use std::fmt::Display;
 use std::hash::Hash;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use actix_web::http::header::HttpDate;
 use api::rest::models::InferenceUsage;
 use api::rest::{Document, Image, InferenceObject};
 use collection::operations::point_ops::VectorPersisted;
+use common::defaults::APP_USER_AGENT;
 use itertools::{Either, Itertools};
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -14,8 +16,9 @@ use storage::content_manager::errors::StorageError;
 
 pub use super::inference_input::InferenceInput;
 use super::local_model;
-use crate::common::inference::InferenceToken;
+use crate::common::inference::api_keys::{InferenceApiKeys, convert_to_reqwest_headers};
 use crate::common::inference::config::InferenceConfig;
+use crate::common::inference::params::InferenceParams;
 
 #[derive(Debug, Serialize, Default, Clone, Copy)]
 #[serde(rename_all = "lowercase")]
@@ -75,14 +78,28 @@ pub struct InferenceService {
 
 static INFERENCE_SERVICE: RwLock<Option<Arc<InferenceService>>> = RwLock::new(None);
 
+/// We assume that the inference provider will handle timeouts itself, if
+/// not provided by the user or configured. But we need ensurance, that we don't
+/// wait forever for a response.
+static DEFAULT_INFERENCE_TIMEOUT_SECS: u64 = 10 * 60; // 10 minutes
+
 impl InferenceService {
     pub fn new(config: Option<InferenceConfig>) -> Self {
         let config = config.unwrap_or_default();
-        let timeout = Duration::from_secs(config.timeout);
+        let InferenceConfig {
+            address: _,
+            timeout,
+            token: _,
+        } = &config;
+
+        let timeout = timeout.unwrap_or(DEFAULT_INFERENCE_TIMEOUT_SECS);
+        let client_builder = Client::builder()
+            .user_agent(APP_USER_AGENT.as_str())
+            .timeout(Duration::from_secs(timeout));
+
         Self {
             config,
-            client: Client::builder()
-                .timeout(timeout)
+            client: client_builder
                 .build()
                 .expect("Invalid timeout value for HTTP client"),
         }
@@ -120,7 +137,7 @@ impl InferenceService {
         &self,
         inference_inputs: Vec<InferenceInput>,
         inference_type: InferenceType,
-        inference_token: InferenceToken,
+        inference_params: InferenceParams,
     ) -> Result<InferenceResponse, StorageError> {
         let (
             (local_inference_inputs, local_inference_positions),
@@ -151,7 +168,7 @@ impl InferenceService {
         }
 
         let remote_result = self
-            .infer_remote(remote_inference_inputs, inference_type, inference_token)
+            .infer_remote(remote_inference_inputs, inference_type, inference_params)
             .await?;
 
         Ok(Self::merge_local_and_remote_result(
@@ -166,13 +183,19 @@ impl InferenceService {
         &self,
         inference_inputs: Vec<InferenceInput>,
         inference_type: InferenceType,
-        inference_token: InferenceToken,
+        inference_params: InferenceParams,
     ) -> Result<InferenceResponse, StorageError> {
         // Assume that either:
         // - User doesn't have access to generating random JWT tokens (like in serverless)
         // - Inference server checks validity of the tokens.
 
-        let token = inference_token.0.or_else(|| self.config.token.clone());
+        let InferenceParams { api_keys, timeout } = inference_params;
+        let InferenceApiKeys {
+            keys: ext_api_keys,
+            token: inference_token,
+        } = api_keys;
+
+        let token = inference_token.or_else(|| self.config.token.clone());
 
         let Some(url) = self.config.address.as_ref() else {
             return Err(StorageError::service_error(
@@ -180,19 +203,32 @@ impl InferenceService {
             ));
         };
 
-        let request = InferenceRequest {
+        let request_body = InferenceRequest {
             inputs: inference_inputs,
             inference: Some(inference_type),
             token,
         };
 
-        let response = self.client.post(url).json(&request).send().await;
+        let request = self.client.post(url);
+        let request = if let Some(timeout) = timeout {
+            request.timeout(timeout)
+        } else {
+            request
+        };
 
-        let (response_body, status) = match response {
+        let mut request = request.json(&request_body);
+        if !ext_api_keys.is_empty() {
+            request = request.headers(convert_to_reqwest_headers(&ext_api_keys));
+        }
+
+        let response = request.send().await;
+
+        let (response_body, status, retry_after) = match response {
             Ok(response) => {
                 let status = response.status();
+                let retry_after = Self::parse_retry_after(response.headers());
                 match response.text().await {
-                    Ok(body) => (body, status),
+                    Ok(body) => (body, status, retry_after),
                     Err(err) => {
                         return Err(StorageError::service_error(format!(
                             "Failed to read inference response body: {err}"
@@ -202,7 +238,7 @@ impl InferenceService {
             }
             Err(error) => {
                 if let Some(status) = error.status() {
-                    (error.to_string(), status)
+                    (error.to_string(), status, None)
                 } else {
                     return Err(StorageError::service_error(format!(
                         "Failed to send inference request: {error}"
@@ -211,7 +247,7 @@ impl InferenceService {
             }
         };
 
-        Self::handle_inference_response(status, &response_body)
+        Self::handle_inference_response(status, &response_body, retry_after)
     }
 
     fn merge_local_and_remote_result(
@@ -242,9 +278,33 @@ impl InferenceService {
         }
     }
 
+    fn parse_retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+        headers
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| {
+                // Check if the value is a valid duration in seconds
+                if let Ok(seconds) = value.parse::<u64>() {
+                    return Some(Duration::from_secs(seconds));
+                }
+
+                // Check if the value is a valid Date
+                if let Ok(http_date) = value.parse::<HttpDate>() {
+                    let ts = SystemTime::from(http_date);
+                    return ts
+                        .duration_since(SystemTime::now())
+                        .ok()
+                        .map(|d| d.max(Duration::ZERO));
+                }
+
+                None
+            })
+    }
+
     pub(crate) fn handle_inference_response(
         status: reqwest::StatusCode,
         response_body: &str,
+        retry_after: Option<Duration>,
     ) -> Result<InferenceResponse, StorageError> {
         match status {
             reqwest::StatusCode::OK => {
@@ -259,7 +319,7 @@ impl InferenceService {
                 // Try to extract error description from the response body, if it is a valid JSON
                 let parsed_body: Result<InferenceError, _> = serde_json::from_str(response_body);
                 match parsed_body {
-                    Ok(InferenceError { error}) => {
+                    Ok(InferenceError { error }) => {
                         Err(StorageError::bad_request(format!(
                             "Inference request validation failed: {error}",
                         )))
@@ -275,6 +335,12 @@ impl InferenceService {
                 Err(StorageError::service_error(format!(
                     "Authentication failed for inference service ({status}): {response_body}",
                 )))
+            }
+            status @ reqwest::StatusCode::TOO_MANY_REQUESTS => {
+                Err(StorageError::rate_limit_exceeded(
+                    format!("Too many requests for inference service ({status}): {response_body}"),
+                    retry_after,
+                ))
             }
             status @ (reqwest::StatusCode::INTERNAL_SERVER_ERROR
             | reqwest::StatusCode::SERVICE_UNAVAILABLE
@@ -295,13 +361,13 @@ impl InferenceService {
                         "Unexpected inference error ({status}): {response_body}",
                     )))
                 }
-            },
+            }
         }
     }
 
     fn is_address_valid(&self) -> bool {
         self.config.address.is_none() // In BM25 we don't need an address so we allow InferenceService to have an empty address.
-        || self.config.address.as_ref().is_some_and(|i| !i.is_empty())
+            || self.config.address.as_ref().is_some_and(|i| !i.is_empty())
     }
 }
 
@@ -336,11 +402,12 @@ mod test {
     use api::rest::Bm25Config;
     use rand::rngs::StdRng;
     use rand::seq::SliceRandom;
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::common::inference::bm25::Bm25;
+    use crate::common::inference::api_keys::InferenceApiKeys;
+    use crate::common::inference::bm25_inference::Bm25;
     use crate::common::inference::inference_input::InferenceDataType;
 
     const BM25_LOCAL_MODEL_NAME: &str = "bm25";
@@ -442,7 +509,9 @@ mod test {
                 let bm25_config = InferenceInput::parse_bm25_config(input.options).unwrap();
 
                 // Re-run bm25 and check that response is correct.
-                let bm25 = Bm25::new(bm25_config).doc_embed(input.data.as_str().unwrap());
+                let bm25 = Bm25::new(bm25_config)
+                    .unwrap()
+                    .doc_embed(input.data.as_str().unwrap());
                 assert_eq!(response, bm25);
             } else {
                 let expected_vector = VectorPersisted::Dense(vec![0.0; idx]);
@@ -487,7 +556,7 @@ mod test {
 
         let config = InferenceConfig {
             address: Some(server.url()), // Use mock's URL as address when doing inference.
-            timeout: 5,                  // Mock should answer fast enough.
+            timeout: None,
             token: Some(String::default()),
         };
 
@@ -501,7 +570,7 @@ mod test {
             .infer(
                 inference_inputs,
                 InferenceType::Update,
-                InferenceToken::new("key".to_string()),
+                InferenceParams::new(InferenceApiKeys::new(Some("key".to_string())), None),
             )
             .await
             .expect("Failed to do inference");

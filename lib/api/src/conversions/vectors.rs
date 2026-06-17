@@ -1,7 +1,8 @@
 use itertools::Itertools;
 use segment::common::operation_error::OperationError;
 use segment::data_types::vectors::{
-    DenseVector, MultiDenseVectorInternal, NamedVectorStruct, VectorInternal, VectorStructInternal,
+    DenseVector, MultiDenseVector, MultiDenseVectorInternal, NamedVectorStruct, VectorInternal,
+    VectorStructInternal,
 };
 use sparse::common::sparse_vector::SparseVector;
 use tonic::Status;
@@ -13,16 +14,13 @@ use crate::rest::schema as rest;
 fn convert_to_plain_multi_vector(
     data: Vec<f32>,
     vectors_count: usize,
-) -> Result<rest::MultiDenseVector, OperationError> {
+) -> Result<MultiDenseVector, OperationError> {
     let dim = data.len() / vectors_count;
     if dim * vectors_count != data.len() {
-        return Err(OperationError::ValidationError {
-            description: format!(
-                "Data length is not divisible by vectors count. Data length: {}, vectors count: {}",
-                data.len(),
-                vectors_count
-            ),
-        });
+        return Err(OperationError::validation_error(format!(
+            "Data length is not divisible by vectors count. Data length: {}, vectors count: {vectors_count}",
+            data.len(),
+        )));
     }
 
     Ok(data
@@ -97,30 +95,30 @@ impl TryFrom<rest::VectorStructOutput> for grpc::VectorsOutput {
 
 impl From<VectorInternal> for grpc::VectorOutput {
     fn from(vector: VectorInternal) -> Self {
-        match vector {
-            VectorInternal::Dense(vector) => Self {
-                data: vector,
-                indices: None,
-                vectors_count: None,
-                vector: None,
-            },
-            VectorInternal::Sparse(vector) => Self {
-                data: vector.values,
-                indices: Some(grpc::SparseIndices {
-                    data: vector.indices,
-                }),
-                vectors_count: None,
-                vector: None,
-            },
-            VectorInternal::MultiDense(vector) => {
-                let vector_count = vector.multi_vectors().count() as u32;
-                Self {
-                    data: vector.flattened_vectors,
-                    indices: None,
-                    vectors_count: Some(vector_count),
-                    vector: None,
-                }
+        let vector = match vector {
+            VectorInternal::Dense(vector) => {
+                grpc::vector_output::Vector::Dense(grpc::DenseVector { data: vector })
             }
+            VectorInternal::Sparse(SparseVector { indices, values }) => {
+                grpc::vector_output::Vector::Sparse(grpc::SparseVector { values, indices })
+            }
+            VectorInternal::MultiDense(multivector_internal) => {
+                grpc::vector_output::Vector::MultiDense(grpc::MultiDenseVector {
+                    vectors: multivector_internal
+                        .into_multi_vectors()
+                        .into_iter()
+                        .map(|v| grpc::DenseVector { data: v })
+                        .collect(),
+                })
+            }
+        };
+
+        #[expect(deprecated)]
+        Self {
+            data: vec![],
+            indices: None,
+            vectors_count: None,
+            vector: Some(vector),
         }
     }
 }
@@ -166,6 +164,7 @@ impl TryFrom<grpc::Vectors> for rest::VectorStruct {
         match vectors_options {
             Some(vectors_options) => Ok(match vectors_options {
                 grpc::vectors::VectorsOptions::Vector(vector) => {
+                    #[expect(deprecated)]
                     let grpc::Vector {
                         data,
                         indices,
@@ -239,6 +238,7 @@ impl TryFrom<grpc::Vector> for rest::Vector {
     type Error = Status;
 
     fn try_from(vector: grpc::Vector) -> Result<Self, Self::Error> {
+        #[expect(deprecated)]
         let grpc::Vector {
             data,
             indices,
@@ -304,6 +304,7 @@ impl grpc::MultiDenseVector {
 impl TryFrom<grpc::VectorOutput> for VectorInternal {
     type Error = OperationError;
 
+    #[expect(deprecated)]
     fn try_from(vector: grpc::VectorOutput) -> Result<Self, Self::Error> {
         let grpc::VectorOutput {
             data,
@@ -347,6 +348,8 @@ impl TryFrom<grpc::VectorOutput> for VectorInternal {
 
 impl TryFrom<grpc::VectorsOutput> for VectorStructInternal {
     type Error = OperationError;
+
+    #[expect(deprecated)]
     fn try_from(vectors_output: grpc::VectorsOutput) -> Result<Self, Self::Error> {
         let grpc::VectorsOutput { vectors_options } = vectors_output;
         match vectors_options {
@@ -366,9 +369,9 @@ impl TryFrom<grpc::VectorsOutput> for VectorStructInternal {
                                 Ok(VectorStructInternal::Single(data))
                             }
                             grpc::vector_output::Vector::Sparse(_sparse) => {
-                                return Err(OperationError::ValidationError {
-                                    description: "Sparse vector must be named".to_string(),
-                                });
+                                return Err(OperationError::validation_error(
+                                    "Sparse vector must be named",
+                                ));
                             }
                             grpc::vector_output::Vector::MultiDense(multi) => {
                                 Ok(VectorStructInternal::MultiDense(
@@ -379,9 +382,9 @@ impl TryFrom<grpc::VectorsOutput> for VectorStructInternal {
                     }
 
                     if indices.is_some() {
-                        return Err(OperationError::ValidationError {
-                            description: "Sparse vector must be named".to_string(),
-                        });
+                        return Err(OperationError::validation_error(
+                            "Sparse vector must be named",
+                        ));
                     }
 
                     if let Some(vectors_count) = vectors_count {
@@ -402,46 +405,37 @@ impl TryFrom<grpc::VectorsOutput> for VectorStructInternal {
                     VectorStructInternal::Named(named_vectors?)
                 }
             }),
-            None => Err(OperationError::ValidationError {
-                description: "No Vector Provided".to_string(),
-            }),
+            None => Err(OperationError::validation_error("No Vector Provided")),
         }
     }
 }
 
 impl From<VectorInternal> for grpc::Vector {
     fn from(vector: VectorInternal) -> Self {
-        // ToDo(v1.17): before deprecating `data`, `indices`, and `vectors_count`, ensure
-        //             that `vector` field is generated here.
-        match vector {
-            VectorInternal::Dense(vector) => Self {
-                data: vector,
-                indices: None,
-                vectors_count: None,
-                vector: None,
-            },
-            VectorInternal::Sparse(vector) => {
-                let SparseVector { values, indices } = vector;
-                Self {
-                    data: values,
-                    indices: Some(grpc::SparseIndices { data: indices }),
-                    vectors_count: None,
-                    vector: None,
-                }
+        let vector = match vector {
+            VectorInternal::Dense(vector) => {
+                grpc::vector::Vector::Dense(grpc::DenseVector { data: vector })
             }
-            VectorInternal::MultiDense(vector) => {
-                let vector_count = vector.multi_vectors().count() as u32;
-                let MultiDenseVectorInternal {
-                    flattened_vectors,
-                    dim: _,
-                } = vector;
-                Self {
-                    data: flattened_vectors,
-                    indices: None,
-                    vectors_count: Some(vector_count),
-                    vector: None,
-                }
+            VectorInternal::Sparse(SparseVector { indices, values }) => {
+                grpc::vector::Vector::Sparse(grpc::SparseVector { values, indices })
             }
+            VectorInternal::MultiDense(multivector_internal) => {
+                grpc::vector::Vector::MultiDense(grpc::MultiDenseVector {
+                    vectors: multivector_internal
+                        .into_multi_vectors()
+                        .into_iter()
+                        .map(|v| grpc::DenseVector { data: v })
+                        .collect(),
+                })
+            }
+        };
+
+        #[expect(deprecated)]
+        Self {
+            data: vec![],
+            indices: None,
+            vectors_count: None,
+            vector: Some(vector),
         }
     }
 }
@@ -481,6 +475,7 @@ impl TryFrom<grpc::Vector> for VectorInternal {
     type Error = Status;
 
     fn try_from(vector: grpc::Vector) -> Result<Self, Self::Error> {
+        #[expect(deprecated)]
         let grpc::Vector {
             data,
             indices,

@@ -1,12 +1,14 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
+use ahash::AHashMap;
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
-use rand::{Rng, rng};
+use rand::{RngExt, rng};
 use segment::data_types::vectors::NamedQuery;
 use segment::types::{Distance, ExtendedPointId, WithPayloadInterface, WithVector};
+use shard::query::query_enum::QueryEnum;
 use tempfile::Builder;
 
 use crate::collection::{Collection, RequestShardTransfer};
@@ -16,7 +18,6 @@ use crate::operations::point_ops::{
     PointInsertOperationsInternal, PointOperations, PointStructPersisted, VectorStructPersisted,
     WriteOrdering,
 };
-use crate::operations::query_enum::QueryEnum;
 use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::shared_storage_config::SharedStorageConfig;
 use crate::operations::types::VectorsConfig;
@@ -27,8 +28,10 @@ use crate::operations::vector_params_builder::VectorParamsBuilder;
 use crate::optimizers_builder::OptimizersConfig;
 use crate::shards::channel_service::ChannelService;
 use crate::shards::collection_shard_distribution::CollectionShardDistribution;
-use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState, ReplicaState};
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::replica_set::{AbortShardTransfer, ChangePeerFromState};
 use crate::shards::shard::{PeerId, ShardId};
+use crate::shards::shard_trait::WaitUntil;
 
 const DIM: u64 = 4;
 const PEER_ID: u64 = 1;
@@ -66,7 +69,7 @@ async fn fixture() -> Collection {
     let snapshots_path = Builder::new().prefix("test_snapshots").tempdir().unwrap();
 
     let collection_name = "test".to_string();
-    let shards: HashMap<ShardId, HashSet<PeerId>> = (0..SHARD_COUNT)
+    let shards: AHashMap<ShardId, HashSet<PeerId>> = (0..SHARD_COUNT)
         .map(|i| (i, HashSet::from([PEER_ID])))
         .collect();
 
@@ -119,10 +122,11 @@ async fn fixture() -> Collection {
     collection
         .update_from_client(
             operation,
-            true,
+            WaitUntil::from(true),
+            None,
             WriteOrdering::Weak,
             None,
-            HwMeasurementAcc::disposable(),
+            HwMeasurementAcc::new(),
         )
         .await
         .expect("failed to insert points");
@@ -165,7 +169,7 @@ async fn test_limit_offset_with_prefetch() {
                 None,
                 ShardSelectorInternal::All,
                 None,
-                HwMeasurementAcc::disposable(),
+                HwMeasurementAcc::new(),
             )
             .await
             .expect("failed to query")
@@ -222,7 +226,7 @@ async fn test_limit_offset_with_prefetch() {
                 None,
                 ShardSelectorInternal::All,
                 None,
-                HwMeasurementAcc::disposable(),
+                HwMeasurementAcc::new(),
             )
             .await
             .expect("failed to query")

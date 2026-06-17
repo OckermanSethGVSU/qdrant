@@ -1,12 +1,14 @@
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use atomic_refcell::AtomicRefCell;
 use common::counter::hardware_counter::HardwareCounterCell;
-use common::types::{PointOffsetType, ScoredPointOffset, TelemetryDetail};
+use common::types::{DeferredBehavior, PointOffsetType, ScoredPointOffset, TelemetryDetail};
 use parking_lot::Mutex;
+use sparse::common::types::DimId;
 
-use super::hnsw_index::point_scorer::FilteredScorer;
+use super::hnsw_index::point_scorer::BatchFilteredSearcher;
 use crate::common::BYTES_IN_KB;
 use crate::common::operation_error::OperationResult;
 use crate::common::operation_time_statistics::{
@@ -14,20 +16,20 @@ use crate::common::operation_time_statistics::{
 };
 use crate::data_types::query_context::VectorQueryContext;
 use crate::data_types::vectors::{QueryVector, VectorRef};
-use crate::id_tracker::IdTrackerSS;
+use crate::id_tracker::{IdTrackerEnum, IdTrackerRead};
 use crate::index::struct_payload_index::StructPayloadIndex;
 use crate::index::vector_index_search_common::{
     get_oversampled_top, is_quantized_search, postprocess_search_result,
 };
-use crate::index::{PayloadIndex, VectorIndex};
+use crate::index::{PayloadIndexRead, VectorIndex, VectorIndexRead};
 use crate::telemetry::VectorIndexSearchesTelemetry;
 use crate::types::{Filter, SearchParams};
 use crate::vector_storage::quantized::quantized_vectors::QuantizedVectors;
-use crate::vector_storage::{VectorStorage, VectorStorageEnum};
+use crate::vector_storage::{VectorStorage, VectorStorageEnum, VectorStorageRead};
 
 #[derive(Debug)]
 pub struct PlainVectorIndex {
-    id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+    id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
     vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
     quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
     payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
@@ -37,7 +39,7 @@ pub struct PlainVectorIndex {
 
 impl PlainVectorIndex {
     pub fn new(
-        id_tracker: Arc<AtomicRefCell<IdTrackerSS>>,
+        id_tracker: Arc<AtomicRefCell<IdTrackerEnum>>,
         vector_storage: Arc<AtomicRefCell<VectorStorageEnum>>,
         quantized_vectors: Arc<AtomicRefCell<Option<QuantizedVectors>>>,
         payload_index: Arc<AtomicRefCell<StructPayloadIndex>>,
@@ -57,141 +59,114 @@ impl PlainVectorIndex {
         search_optimized_threshold_kb: usize,
         filter: Option<&Filter>,
         hw_counter: &HardwareCounterCell,
-    ) -> bool {
+    ) -> OperationResult<bool> {
         let vector_storage = self.vector_storage.borrow();
         let available_vector_count = vector_storage.available_vector_count();
-        if available_vector_count > 0 {
-            let vector_size_bytes =
-                vector_storage.size_of_available_vectors_in_bytes() / available_vector_count;
-            let indexing_threshold_bytes = search_optimized_threshold_kb * BYTES_IN_KB;
+        if available_vector_count == 0 {
+            return Ok(true);
+        }
 
-            if let Some(payload_filter) = filter {
-                let payload_index = self.payload_index.borrow();
-                let cardinality = payload_index.estimate_cardinality(payload_filter, hw_counter);
-                let scan_size = vector_size_bytes.saturating_mul(cardinality.max);
-                scan_size <= indexing_threshold_bytes
-            } else {
-                let vector_storage_size = vector_size_bytes.saturating_mul(available_vector_count);
-                vector_storage_size <= indexing_threshold_bytes
-            }
+        let vector_size_bytes =
+            vector_storage.size_of_available_vectors_in_bytes() / available_vector_count;
+        let indexing_threshold_bytes = search_optimized_threshold_kb * BYTES_IN_KB;
+
+        if let Some(payload_filter) = filter {
+            let cardinality = self
+                .payload_index
+                .borrow()
+                .with_view(|v| v.estimate_cardinality(payload_filter, hw_counter))?;
+            let scan_size = vector_size_bytes.saturating_mul(cardinality.max);
+            Ok(scan_size <= indexing_threshold_bytes)
         } else {
-            true
+            let vector_storage_size = vector_size_bytes.saturating_mul(available_vector_count);
+            Ok(vector_storage_size <= indexing_threshold_bytes)
         }
     }
 }
 
-impl VectorIndex for PlainVectorIndex {
+impl VectorIndexRead for PlainVectorIndex {
     fn search(
         &self,
-        vectors: &[&QueryVector],
+        query_vectors: &[&QueryVector],
         filter: Option<&Filter>,
         top: usize,
         params: Option<&SearchParams>,
         query_context: &VectorQueryContext,
     ) -> OperationResult<Vec<Vec<ScoredPointOffset>>> {
-        let is_indexed_only = params.map(|p| p.indexed_only).unwrap_or(false);
+        let is_indexed_only = params.is_some_and(|p| p.indexed_only);
         if is_indexed_only
             && !self.is_small_enough_for_unindexed_search(
                 query_context.search_optimized_threshold_kb(),
                 filter,
                 &query_context.hardware_counter(),
-            )
+            )?
         {
-            return Ok(vec![vec![]; vectors.len()]);
+            return Ok(vec![vec![]; query_vectors.len()]);
+        }
+        if top == 0 {
+            return Ok(vec![vec![]; query_vectors.len()]);
         }
 
         let is_stopped = query_context.is_stopped();
 
         let hw_counter = query_context.hardware_counter();
 
-        match filter {
+        let _timer = ScopeDurationMeasurer::new(if filter.is_some() {
+            &self.filtered_searches_telemetry
+        } else {
+            &self.unfiltered_searches_telemetry
+        });
+        let vector_storage = self.vector_storage.borrow();
+        let quantized_storage = self.quantized_vectors.borrow();
+        let id_tracker = self.id_tracker.borrow();
+        let deleted_points = query_context
+            .deleted_points()
+            .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
+        let quantization_enabled = is_quantized_search(quantized_storage.as_ref(), params);
+        let quantized_vectors = quantization_enabled
+            .then_some(quantized_storage.as_ref())
+            .flatten();
+        let oversampled_top = get_oversampled_top(quantized_storage.as_ref(), params, top);
+        let batch_searcher = BatchFilteredSearcher::new(
+            query_vectors,
+            &vector_storage,
+            quantized_vectors,
+            None,
+            oversampled_top,
+            deleted_points,
+            query_context.hardware_counter(),
+        )?;
+
+        let mut search_results = match filter {
             Some(filter) => {
-                let _timer = ScopeDurationMeasurer::new(&self.filtered_searches_telemetry);
-                let id_tracker = self.id_tracker.borrow();
-                let payload_index = self.payload_index.borrow();
-                let vector_storage = self.vector_storage.borrow();
-                let quantized_storage = self.quantized_vectors.borrow();
-                let filtered_ids_vec = payload_index.query_points(filter, &hw_counter);
-                let deleted_points = query_context
-                    .deleted_points()
-                    .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
-                vectors
-                    .iter()
-                    .map(|&vector| {
-                        let quantization_enabled =
-                            is_quantized_search(quantized_storage.as_ref(), params);
-                        let scorer = FilteredScorer::new(
-                            vector.to_owned(),
-                            &vector_storage,
-                            quantization_enabled
-                                .then_some(quantized_storage.as_ref())
-                                .flatten(),
-                            None,
-                            deleted_points,
-                            query_context.hardware_counter(),
-                        )?;
-                        let oversampled_top =
-                            get_oversampled_top(quantized_storage.as_ref(), params, top);
-                        let search_result = scorer.peek_top_iter(
-                            &mut filtered_ids_vec.iter().copied(),
-                            oversampled_top,
-                            &is_stopped,
-                        )?;
-                        let res = postprocess_search_result(
-                            search_result,
-                            id_tracker.deleted_point_bitslice(),
-                            &vector_storage,
-                            quantized_storage.as_ref(),
-                            vector,
-                            params,
-                            top,
-                            query_context.hardware_counter(),
-                        )?;
-                        Ok(res)
-                    })
-                    .collect()
+                let filtered_ids_vec = self
+                    .payload_index
+                    .borrow()
+                    .with_view(|v| v.query_points(filter, &hw_counter, &is_stopped))?;
+                batch_searcher.peek_top_iter(filtered_ids_vec.iter().copied(), &is_stopped)?
             }
             None => {
-                let _timer = ScopeDurationMeasurer::new(&self.unfiltered_searches_telemetry);
-                let vector_storage = self.vector_storage.borrow();
-                let quantized_storage = self.quantized_vectors.borrow();
-                let id_tracker = self.id_tracker.borrow();
-                let deleted_points = query_context
-                    .deleted_points()
-                    .unwrap_or_else(|| id_tracker.deleted_point_bitslice());
-                vectors
-                    .iter()
-                    .map(|&vector| {
-                        let quantization_enabled =
-                            is_quantized_search(quantized_storage.as_ref(), params);
-                        let scorer = FilteredScorer::new(
-                            vector.to_owned(),
-                            &vector_storage,
-                            quantization_enabled
-                                .then_some(quantized_storage.as_ref())
-                                .flatten(),
-                            None,
-                            deleted_points,
-                            query_context.hardware_counter(),
-                        )?;
-                        let oversampled_top =
-                            get_oversampled_top(quantized_storage.as_ref(), params, top);
-                        let search_result = scorer.peek_top_all(oversampled_top, &is_stopped)?;
-                        let res = postprocess_search_result(
-                            search_result,
-                            id_tracker.deleted_point_bitslice(),
-                            &vector_storage,
-                            quantized_storage.as_ref(),
-                            vector,
-                            params,
-                            top,
-                            query_context.hardware_counter(),
-                        )?;
-                        Ok(res)
-                    })
-                    .collect()
+                let iter = id_tracker.point_mappings().filter_deferred_and_deleted(
+                    batch_searcher.iter_not_deleted(),
+                    DeferredBehavior::Exclude,
+                );
+                batch_searcher.peek_top_iter(iter, &is_stopped)?
             }
+        };
+
+        for (search_result, query_vector) in search_results.iter_mut().zip(query_vectors) {
+            *search_result = postprocess_search_result(
+                std::mem::take(search_result),
+                deleted_points,
+                &vector_storage,
+                quantized_storage.as_ref(),
+                query_vector,
+                params,
+                top,
+                query_context.hardware_counter(),
+            )?;
         }
+        Ok(search_results)
     }
 
     fn get_telemetry_data(&self, detail: TelemetryDetail) -> VectorIndexSearchesTelemetry {
@@ -215,10 +190,6 @@ impl VectorIndex for PlainVectorIndex {
         }
     }
 
-    fn files(&self) -> Vec<PathBuf> {
-        vec![]
-    }
-
     fn indexed_vector_count(&self) -> usize {
         0
     }
@@ -227,6 +198,25 @@ impl VectorIndex for PlainVectorIndex {
         self.vector_storage
             .borrow()
             .size_of_available_vectors_in_bytes()
+    }
+
+    fn fill_idf_statistics(
+        &self,
+        _idf: &mut HashMap<DimId, usize>,
+        _hw_counter: &HardwareCounterCell,
+    ) -> OperationResult<()> {
+        // Plain (dense) index doesn't track IDF.
+        Ok(())
+    }
+
+    fn is_index(&self) -> bool {
+        false
+    }
+}
+
+impl VectorIndex for PlainVectorIndex {
+    fn files(&self) -> Vec<PathBuf> {
+        vec![]
     }
 
     fn update_vector(

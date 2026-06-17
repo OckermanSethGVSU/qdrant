@@ -1,5 +1,10 @@
+pub mod operation_name;
+pub mod optimization;
 pub mod payload_ops;
 pub mod point_ops;
+#[cfg(feature = "staging")]
+pub mod staging;
+pub mod vector_name_ops;
 pub mod vector_ops;
 
 use segment::json_path::JsonPath;
@@ -7,7 +12,11 @@ use segment::types::{PayloadFieldSchema, PointIdType};
 use serde::{Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
 
+pub use self::vector_name_ops::{
+    CreateVectorName, DeleteVectorName, VectorNameConfig, VectorNameOperations,
+};
 use crate::PeerId;
+use crate::operations::point_ops::PointOperations;
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, EnumDiscriminants, Hash)]
 #[strum_discriminants(derive(EnumIter))]
@@ -17,6 +26,10 @@ pub enum CollectionUpdateOperations {
     VectorOperation(vector_ops::VectorOperations),
     PayloadOperation(payload_ops::PayloadOps),
     FieldIndexOperation(FieldIndexOperations),
+    VectorNameOperation(VectorNameOperations),
+    /// Staging-only operations for testing and debugging purposes
+    #[cfg(feature = "staging")]
+    StagingOperation(staging::StagingOperations),
 }
 
 impl CollectionUpdateOperations {
@@ -34,27 +47,37 @@ impl CollectionUpdateOperations {
         )
     }
 
-    pub fn is_write_operation(&self) -> bool {
-        match self {
-            CollectionUpdateOperations::PointOperation(operation) => operation.is_write_operation(),
-            CollectionUpdateOperations::VectorOperation(operation) => {
-                operation.is_write_operation()
-            }
-            CollectionUpdateOperations::PayloadOperation(operation) => {
-                operation.is_write_operation()
-            }
-            CollectionUpdateOperations::FieldIndexOperation(operation) => {
-                operation.is_write_operation()
-            }
-        }
-    }
-
     pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
             Self::PointOperation(op) => op.point_ids(),
             Self::VectorOperation(op) => op.point_ids(),
             Self::PayloadOperation(op) => op.point_ids(),
             Self::FieldIndexOperation(_) => None,
+            Self::VectorNameOperation(_) => None,
+            #[cfg(feature = "staging")]
+            Self::StagingOperation(_) => None,
+        }
+    }
+
+    /// List point IDs that can be created during the operation.
+    /// Do not list IDs that are deleted or modified.
+    pub fn upsert_point_ids(&self) -> Option<Vec<PointIdType>> {
+        match self {
+            Self::PointOperation(op) => match op {
+                PointOperations::UpsertPoints(op) => Some(op.point_ids()),
+                PointOperations::UpsertPointsConditional(op) => Some(op.points_op.point_ids()),
+                PointOperations::DeletePoints { .. } => None,
+                PointOperations::DeletePointsByFilter(_) => None,
+                PointOperations::SyncPoints(op) => {
+                    Some(op.points.iter().map(|point| point.id).collect())
+                }
+            },
+            Self::VectorOperation(_) => None,
+            Self::PayloadOperation(_) => None,
+            Self::FieldIndexOperation(_) => None,
+            Self::VectorNameOperation(_) => None,
+            #[cfg(feature = "staging")]
+            Self::StagingOperation(_) => None,
         }
     }
 
@@ -67,6 +90,9 @@ impl CollectionUpdateOperations {
             Self::VectorOperation(op) => op.retain_point_ids(filter),
             Self::PayloadOperation(op) => op.retain_point_ids(filter),
             Self::FieldIndexOperation(_) => (),
+            Self::VectorNameOperation(_) => (),
+            #[cfg(feature = "staging")]
+            Self::StagingOperation(_) => (),
         }
     }
 }
@@ -79,15 +105,6 @@ pub enum FieldIndexOperations {
     CreateIndex(CreateIndex),
     /// Delete index for the field
     DeleteIndex(JsonPath),
-}
-
-impl FieldIndexOperations {
-    pub fn is_write_operation(&self) -> bool {
-        match self {
-            FieldIndexOperations::CreateIndex(_) => true,
-            FieldIndexOperations::DeleteIndex(_) => false,
-        }
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
@@ -163,6 +180,7 @@ impl ClockTag {
     }
 }
 
+#[cfg(feature = "api")]
 impl From<api::grpc::qdrant::ClockTag> for ClockTag {
     fn from(tag: api::grpc::qdrant::ClockTag) -> Self {
         let api::grpc::qdrant::ClockTag {
@@ -182,6 +200,7 @@ impl From<api::grpc::qdrant::ClockTag> for ClockTag {
     }
 }
 
+#[cfg(feature = "api")]
 impl From<ClockTag> for api::grpc::qdrant::ClockTag {
     fn from(tag: ClockTag) -> Self {
         let ClockTag {
@@ -203,6 +222,8 @@ impl From<ClockTag> for api::grpc::qdrant::ClockTag {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
     use proptest::prelude::*;
     use segment::types::*;
 
@@ -280,6 +301,7 @@ mod tests {
                 any::<vector_ops::VectorOperations>().prop_map(Self::VectorOperation),
                 any::<payload_ops::PayloadOps>().prop_map(Self::PayloadOperation),
                 any::<FieldIndexOperations>().prop_map(Self::FieldIndexOperation),
+                any::<VectorNameOperations>().prop_map(Self::VectorNameOperation),
             ]
             .boxed()
         }
@@ -329,6 +351,7 @@ mod tests {
             let delete = Self::DeleteVectors(
                 PointIdsList {
                     points: Vec::new(),
+                    #[cfg(feature = "api")]
                     shard_key: None,
                 },
                 Vec::new(),
@@ -407,5 +430,92 @@ mod tests {
 
             prop_oneof![Just(create), Just(delete),].boxed()
         }
+    }
+
+    impl Arbitrary for VectorNameOperations {
+        type Parameters = ();
+        type Strategy = BoxedStrategy<Self>;
+
+        fn arbitrary_with(_: Self::Parameters) -> Self::Strategy {
+            use crate::operations::vector_name_ops::{
+                self as vnops, DenseVectorConfig, SparseVectorConfig,
+            };
+
+            let create_dense = Self::CreateVectorName(CreateVectorName {
+                vector_name: "test_vector".into(),
+                config: vnops::VectorNameConfig::dense(DenseVectorConfig {
+                    size: 4,
+                    distance: Distance::Cosine,
+                    multivector_config: None,
+                    datatype: None,
+                }),
+            });
+
+            let create_sparse = Self::CreateVectorName(CreateVectorName {
+                vector_name: "sparse_test".into(),
+                config: vnops::VectorNameConfig::sparse(SparseVectorConfig {
+                    modifier: None,
+                    datatype: None,
+                }),
+            });
+
+            let delete = Self::DeleteVectorName(DeleteVectorName {
+                vector_name: "test_vector".into(),
+            });
+
+            prop_oneof![Just(create_dense), Just(create_sparse), Just(delete),].boxed()
+        }
+    }
+
+    #[test]
+    fn test_delete_by_filter_with_has_id_uuids_cbor_roundtrip() {
+        let uuids: Vec<PointIdType> = vec![ExtendedPointId::Uuid(
+            uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap(),
+        )];
+
+        let filter = Filter {
+            should: None,
+            min_should: None,
+            must: None,
+            must_not: Some(vec![Condition::HasId(HasIdCondition::from(
+                uuids.into_iter().collect::<ahash::AHashSet<_>>(),
+            ))]),
+        };
+
+        let operation = CollectionUpdateOperations::PointOperation(
+            PointOperations::DeletePointsByFilter(filter),
+        );
+
+        let cbor_bytes = serde_cbor::to_vec(&operation).unwrap();
+        let deserialized: CollectionUpdateOperations = serde_cbor::from_slice(&cbor_bytes).unwrap();
+
+        assert_eq!(operation, deserialized);
+    }
+
+    #[test]
+    fn test_wal_roundtrip_delete_by_filter_with_has_id_uuids() {
+        use crate::wal::WalRawRecord;
+
+        let uuids: Vec<PointIdType> = vec![ExtendedPointId::Uuid(
+            uuid::Uuid::parse_str("6ba7b810-9dad-11d1-80b4-00c04fd430c8").unwrap(),
+        )];
+
+        let filter = Filter {
+            should: None,
+            min_should: None,
+            must: None,
+            must_not: Some(vec![Condition::HasId(HasIdCondition::from(
+                uuids.into_iter().collect::<ahash::AHashSet<_>>(),
+            ))]),
+        };
+
+        let operation = CollectionUpdateOperations::PointOperation(
+            PointOperations::DeletePointsByFilter(filter),
+        );
+
+        let raw = WalRawRecord::new(&operation).unwrap();
+        let deserialized: CollectionUpdateOperations = raw.deserialize().unwrap();
+
+        assert_eq!(operation, deserialized);
     }
 }

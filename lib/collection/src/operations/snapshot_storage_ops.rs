@@ -1,10 +1,12 @@
-use std::fs::File;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use common::budget::ResourceBudget;
+use fs_err as fs;
+use fs_err::{File, tokio as tokio_fs};
 use futures::StreamExt;
-use object_store::WriteMultipart;
+use object_store::{ObjectStoreExt, WriteMultipart};
+use segment::common::BYTES_IN_MB;
 use tokio::io::AsyncWriteExt;
 
 use super::snapshot_ops::SnapshotDescription;
@@ -78,7 +80,7 @@ pub async fn get_appropriate_chunk_size(local_source_path: &Path) -> CollectionR
     /// Source: <https://docs.aws.amazon.com/AmazonS3/latest/userguide/qfacts.html>
     const MAX_UPLOAD_SIZE: usize = 5 * 1024 * 1024 * 1024 * 1024;
 
-    let file_meta = tokio::fs::metadata(local_source_path).await?;
+    let file_meta = tokio_fs::metadata(local_source_path).await?;
     let file_size = file_meta.len() as usize;
 
     // check if the file size exceeds the maximum upload size
@@ -176,6 +178,7 @@ pub async fn delete_snapshot(
 ) -> CollectionResult<bool> {
     let s3_path = trim_dot_slash(path)?;
 
+    #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
     client.head(&s3_path).await.map_err(|e| match e {
         object_store::Error::NotFound { .. } => {
             CollectionError::not_found(format!("Snapshot {s3_path:?}"))
@@ -195,7 +198,9 @@ pub async fn download_snapshot(
     path: &Path,
     target_path: &Path,
 ) -> CollectionResult<()> {
+    let download_start_time = tokio::time::Instant::now();
     let s3_path = trim_dot_slash(path)?;
+    #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
     let download = client.get(&s3_path).await.map_err(|e| match e {
         object_store::Error::NotFound { .. } => {
             CollectionError::not_found(format!("Snapshot {s3_path:?}"))
@@ -209,10 +214,10 @@ pub async fn download_snapshot(
     if let Some(target_dir) = target_path.parent()
         && !target_dir.exists()
     {
-        std::fs::create_dir_all(target_dir)?;
+        fs::create_dir_all(target_dir)?;
     }
 
-    let mut file = tokio::fs::File::create(target_path)
+    let mut file = tokio_fs::File::create(target_path)
         .await
         .map_err(|e| CollectionError::service_error(format!("Failed to create file: {e}")))?;
 
@@ -231,8 +236,19 @@ pub async fn download_snapshot(
         .await
         .map_err(|e| CollectionError::service_error(format!("Failed to flush file: {e}")))?;
 
+    let download_duration = download_start_time.elapsed();
+    let total_size_mb = total_size as f64 / BYTES_IN_MB as f64;
+    let download_speed_mbps = total_size_mb / download_duration.as_secs_f64();
+    log::debug!(
+        "Object storage snapshot download completed: path={}, size={:.2} MB, duration={:.2}s, speed={:.2} MB/s",
+        target_path.display(),
+        total_size_mb,
+        download_duration.as_secs_f64(),
+        download_speed_mbps
+    );
+
     // check len to file len
-    let file_meta = tokio::fs::metadata(target_path).await?;
+    let file_meta = tokio_fs::metadata(target_path).await?;
     if file_meta.len() != total_size as u64 {
         return Err(CollectionError::service_error(format!(
             "Downloaded file size does not match the expected size: {} != {}",

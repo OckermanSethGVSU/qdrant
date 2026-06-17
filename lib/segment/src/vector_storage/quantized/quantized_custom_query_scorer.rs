@@ -60,7 +60,7 @@ where
                 let original_vector_prequantized = TElement::quantization_preprocess(
                     quantization_config,
                     TMetric::distance(),
-                    &original_vector,
+                    Cow::Borrowed(&original_vector),
                 );
                 Ok(quantized_storage.encode_query(&original_vector_prequantized))
             })
@@ -89,6 +89,22 @@ where
     TQuery: Query<TEncodedVectors::EncodedQuery>,
 {
     type TVector = [TElement];
+
+    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
+        debug_assert_eq!(ids.len(), scores.len());
+
+        let storage = self.quantized_storage;
+
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(ids.len() * storage.quantized_vector_size());
+
+        for (idx, vector) in storage.iter_batch(ids) {
+            scores[idx] = self.query.score_by(|query| {
+                storage.score(query, &vector, &self.hardware_counter) // inhibit `rustfmt`
+            });
+        }
+    }
 
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         // account for read outside of `score_by` because the closure is called once per example

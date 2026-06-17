@@ -8,27 +8,22 @@ use std::time::{Duration, SystemTimeError};
 
 use api::grpc::transport_channel_pool::RequestError;
 use api::rest::{
-    BaseGroupRequest, LookupLocation, OrderByInterface, RecommendStrategy,
-    SearchGroupsRequestInternal, SearchRequestInternal, ShardKeySelector, VectorStructOutput,
+    BaseGroupRequest, LookupLocation, RecommendStrategy, SearchGroupsRequestInternal,
+    SearchRequestInternal, ShardKeySelector, VectorStructOutput,
 };
 use common::ext::OptionExt;
 use common::rate_limiting::{RateLimitError, RetryError};
 use common::types::ScoreType;
 use common::validation::validate_range_generic;
 use common::{defaults, save_on_disk};
-use io::file_operations::FileStorageError;
+use http::uri::InvalidUri;
 use issues::IssueRecord;
-use merge::Merge;
-use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
 use segment::common::anonymize::Anonymize;
 use segment::common::operation_error::{CancelledError, OperationError};
 use segment::data_types::groups::GroupId;
-use segment::data_types::order_by::{OrderBy, OrderValue};
-use segment::data_types::vectors::{
-    DEFAULT_VECTOR_NAME, DenseVector, NamedQuery, NamedVectorStruct, VectorRef,
-    VectorStructInternal,
-};
+use segment::data_types::modifier::Modifier;
+use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, DenseVector};
 use segment::types::{
     Distance, Filter, HnswConfig, MultiVectorConfig, Payload, PayloadIndexInfo, PayloadKeyType,
     PointIdType, QuantizationConfig, SearchParams, SeqNumberType, ShardKey,
@@ -36,9 +31,12 @@ use segment::types::{
     VectorStorageDatatype, WithPayloadInterface, WithVector,
 };
 use semver::Version;
-use serde;
-use serde::{Deserialize, Serialize};
+use serde::{self, Deserialize, Serialize};
 use serde_json::{Error as JsonError, Map, Value};
+pub use shard::count::CountRequestInternal;
+use shard::payload_index_schema::PayloadIndexSchema;
+pub use shard::query::scroll::{QueryScrollRequestInternal, ScrollOrder};
+pub use shard::scroll::ScrollRequestInternal;
 pub use shard::search::CoreSearchRequest;
 use shard::wal::WalError;
 use sparse::common::sparse_vector::SparseVector;
@@ -46,19 +44,16 @@ use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
 use tokio::sync::oneshot::error::RecvError as OneshotRecvError;
 use tokio::task::JoinError;
-use tonic::codegen::http::uri::InvalidUri;
 use uuid::Uuid;
 use validator::{Validate, ValidationError, ValidationErrors};
 
-use super::{ClockTag, config_diff};
+use super::ClockTag;
 use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
 use crate::operations::cluster_ops::ReshardingDirection;
 use crate::operations::config_diff::{HnswConfigDiff, QuantizationConfigDiff};
-use crate::operations::point_ops::{PointStructPersisted, VectorStructPersisted};
-use crate::operations::query_enum::QueryEnum;
-use crate::operations::universal_query::shard_query::{ScoringQuery, ShardQueryRequest};
 use crate::optimizers_builder::OptimizersConfig;
-use crate::shards::replica_set::ReplicaState;
+use crate::shards::replica_set::replica_set_state::ReplicaState;
+use crate::shards::resharding::ReshardingStage;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::transfer::ShardTransferMethod;
 
@@ -127,44 +122,42 @@ pub enum OptimizersStatus {
     Error(String),
 }
 
-/// Point data
-#[derive(Clone, Debug, PartialEq)]
-pub struct RecordInternal {
-    /// Id of the point
-    pub id: PointIdType,
-    /// Payload - values assigned to the point
-    pub payload: Option<Payload>,
-    /// Vector of the point
-    pub vector: Option<VectorStructInternal>,
-    /// Shard Key
-    pub shard_key: Option<ShardKey>,
-    /// Order value, if used for order_by
-    pub order_value: Option<OrderValue>,
+#[derive(
+    Debug, Default, Serialize, JsonSchema, Anonymize, PartialEq, Eq, PartialOrd, Ord, Clone,
+)]
+#[serde(rename_all = "snake_case")]
+pub struct CollectionWarning {
+    /// Warning message
+    #[anonymize(true)] // Might contain vector names
+    pub message: String,
 }
 
-/// Warn: panics if the vector is empty
-impl TryFrom<RecordInternal> for PointStructPersisted {
-    type Error = String;
+#[derive(Debug, Clone, Serialize, JsonSchema, Default, Anonymize)]
+pub struct ShardUpdateQueueInfo {
+    /// Number of elements in the queue
+    #[anonymize(false)]
+    pub length: usize,
 
-    fn try_from(record: RecordInternal) -> Result<Self, Self::Error> {
-        let RecordInternal {
-            id,
-            payload,
-            vector,
-            shard_key: _,
-            order_value: _,
-        } = record;
+    /// last operation number processed
+    #[anonymize(false)]
+    pub op_num: Option<usize>,
 
-        if vector.is_none() {
-            return Err("Vector is empty".to_string());
-        }
+    /// Number of points that are deferred (i.e hidden from search as they're not yet optimized).
+    #[anonymize(false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_points: Option<usize>,
+}
 
-        Ok(Self {
-            id,
-            payload,
-            vector: VectorStructPersisted::from(vector.unwrap()),
-        })
-    }
+#[derive(Debug, Clone, Serialize, JsonSchema, Default, Anonymize)]
+pub struct UpdateQueueInfo {
+    /// Number of elements in the queue
+    #[anonymize(false)]
+    pub length: usize,
+
+    /// Number of points that are deferred (i.e hidden from search as they're not yet optimized).
+    #[anonymize(false)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deferred_points: Option<usize>,
 }
 
 // Version of the collection config we can present to the user
@@ -219,6 +212,9 @@ pub struct CollectionInfo {
     pub status: CollectionStatus,
     /// Status of optimizers
     pub optimizer_status: OptimizersStatus,
+    /// Warnings related to the collection
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<CollectionWarning>,
     /// Approximate number of indexed vectors in the collection.
     /// Indexed vectors in large segments are faster to query,
     /// as it is stored in a specialized vector index.
@@ -233,18 +229,30 @@ pub struct CollectionInfo {
     pub config: CollectionConfig,
     /// Types of stored payload
     pub payload_schema: HashMap<PayloadKeyType, PayloadIndexInfo>,
+    /// Update queue info
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_queue: Option<UpdateQueueInfo>,
 }
 
 impl CollectionInfo {
-    pub fn empty(collection_config: CollectionConfigInternal) -> Self {
+    pub fn empty(
+        collection_config: CollectionConfigInternal,
+        payload_schema: PayloadIndexSchema,
+    ) -> Self {
         Self {
             status: CollectionStatus::Green,
             optimizer_status: OptimizersStatus::Ok,
+            warnings: collection_config.get_warnings(),
             indexed_vectors_count: Some(0),
             points_count: Some(0),
             segments_count: 0,
             config: CollectionConfig::from(collection_config),
-            payload_schema: HashMap::new(),
+            payload_schema: payload_schema
+                .schema
+                .into_iter()
+                .map(|(k, v)| (k, PayloadIndexInfo::new(v, 0)))
+                .collect(),
+            update_queue: Some(UpdateQueueInfo::default()),
         }
     }
 }
@@ -259,15 +267,33 @@ impl From<ShardInfoInternal> for CollectionInfo {
             segments_count,
             config,
             payload_schema,
+            update_queue,
         } = info;
         Self {
             status: status.into(),
             optimizer_status,
+            warnings: config.get_warnings(),
             indexed_vectors_count: Some(indexed_vectors_count),
             points_count: Some(points_count),
             segments_count,
             config: CollectionConfig::from(config),
             payload_schema,
+            update_queue: Some(UpdateQueueInfo::from(update_queue)),
+        }
+    }
+}
+
+impl From<ShardUpdateQueueInfo> for UpdateQueueInfo {
+    fn from(value: ShardUpdateQueueInfo) -> Self {
+        // ignore field `op_num`, no sane way to aggregate across shards
+        let ShardUpdateQueueInfo {
+            length,
+            op_num: _,
+            deferred_points,
+        } = value;
+        UpdateQueueInfo {
+            length,
+            deferred_points,
         }
     }
 }
@@ -293,6 +319,8 @@ pub struct ShardInfoInternal {
     pub config: CollectionConfigInternal,
     /// Types of stored payload
     pub payload_schema: HashMap<PayloadKeyType, PayloadIndexInfo>,
+    /// Update queue state
+    pub update_queue: ShardUpdateQueueInfo,
 }
 
 /// Current clustering distribution for the collection
@@ -321,7 +349,7 @@ pub struct ShardTransferInfo {
 
     /// Target shard ID if different than source shard ID
     ///
-    /// Used exclusively with `ReshardStreamRecords` transfer method.
+    /// Used exclusively with `ReshardingStreamRecords` transfer method.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[anonymize(false)]
     pub to_shard_id: Option<ShardId>,
@@ -364,6 +392,11 @@ pub struct ReshardingInfo {
     pub peer_id: PeerId,
 
     pub shard_key: Option<ShardKey>,
+
+    /// Only included in peer telemetry
+    #[serde(skip)]
+    #[anonymize(false)]
+    pub stage: ReshardingStage,
 }
 
 #[derive(Debug, Serialize, JsonSchema)]
@@ -396,14 +429,39 @@ pub struct RemoteShardInfo {
 
 /// `Acknowledged` - Request is saved to WAL and will be process in a queue.
 /// `Completed` - Request is completed, changes are actual.
+/// `WaitTimeout` - Request is waiting for timeout.
 #[derive(Copy, Clone, Debug, Eq, PartialEq, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum UpdateStatus {
     Acknowledged,
     Completed,
+    WaitTimeout,
     /// Internal: update is rejected due to an outdated clock
     #[schemars(skip)]
     ClockRejected,
+}
+
+impl UpdateStatus {
+    /// Returns priority of the update status
+    ///
+    /// A higher value means the status is more significant
+    pub fn priority(&self) -> i32 {
+        match self {
+            UpdateStatus::Acknowledged => 0,
+            UpdateStatus::Completed => 1,
+            UpdateStatus::WaitTimeout => 2,
+            UpdateStatus::ClockRejected => 3,
+        }
+    }
+
+    pub fn is_timeout(&self) -> bool {
+        match self {
+            UpdateStatus::WaitTimeout => true,
+            UpdateStatus::Acknowledged => false,
+            UpdateStatus::Completed => false,
+            UpdateStatus::ClockRejected => false,
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug, Serialize, JsonSchema)]
@@ -431,86 +489,6 @@ pub struct ScrollRequest {
     /// Specify in which shards to look for the points, if not specified - look in all shards
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
-}
-
-/// Scroll request - paginate over all points which matches given condition
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub struct ScrollRequestInternal {
-    /// Start ID to read points from.
-    pub offset: Option<PointIdType>,
-
-    /// Page size. Default: 10
-    #[validate(range(min = 1))]
-    pub limit: Option<usize>,
-
-    /// Look only for points which satisfies this conditions. If not provided - all points.
-    #[validate(nested)]
-    pub filter: Option<Filter>,
-
-    /// Select which payload to return with the response. Default is true.
-    pub with_payload: Option<WithPayloadInterface>,
-
-    /// Options for specifying which vectors to include into response. Default is false.
-    #[serde(default, alias = "with_vectors")]
-    pub with_vector: WithVector,
-
-    /// Order the records by a payload field.
-    pub order_by: Option<OrderByInterface>,
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-pub enum ScrollOrder {
-    #[default]
-    ById,
-    ByField(OrderBy),
-    Random,
-}
-
-/// Scroll request, used as a part of query request
-#[derive(Debug, Clone, PartialEq)]
-pub struct QueryScrollRequestInternal {
-    /// Page size. Default: 10
-    pub limit: usize,
-
-    /// Look only for points which satisfies this conditions. If not provided - all points.
-    pub filter: Option<Filter>,
-
-    /// Select which payload to return with the response. Default is true.
-    pub with_payload: WithPayloadInterface,
-
-    /// Options for specifying which vectors to include into response. Default is false.
-    pub with_vector: WithVector,
-
-    /// Order the records by a payload field.
-    pub scroll_order: ScrollOrder,
-}
-
-impl ScrollRequestInternal {
-    pub(crate) fn default_limit() -> usize {
-        10
-    }
-
-    pub(crate) fn default_with_payload() -> WithPayloadInterface {
-        WithPayloadInterface::Bool(true)
-    }
-
-    pub(crate) fn default_with_vector() -> WithVector {
-        WithVector::Bool(false)
-    }
-}
-
-impl Default for ScrollRequestInternal {
-    fn default() -> Self {
-        ScrollRequestInternal {
-            offset: None,
-            limit: Some(Self::default_limit()),
-            filter: None,
-            with_payload: Some(Self::default_with_payload()),
-            with_vector: Self::default_with_vector(),
-            order_by: None,
-        }
-    }
 }
 
 fn points_example() -> Vec<api::rest::Record> {
@@ -569,11 +547,6 @@ pub struct SearchRequestBatch {
     pub searches: Vec<SearchRequest>,
 }
 
-#[derive(Debug, Clone)]
-pub struct CoreSearchRequestBatch {
-    pub searches: Vec<CoreSearchRequest>,
-}
-
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 pub struct SearchGroupsRequest {
     #[serde(flatten)]
@@ -594,7 +567,7 @@ pub struct PointRequest {
     pub shard_key: Option<ShardKeySelector>,
 }
 
-#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct PointRequestInternal {
     /// Look for points with ids
@@ -618,7 +591,7 @@ impl RecommendExample {
     pub fn as_point_id(&self) -> Option<PointIdType> {
         match self {
             RecommendExample::PointId(id) => Some(*id),
-            _ => None,
+            RecommendExample::Dense(_) | RecommendExample::Sparse(_) => None,
         }
     }
 }
@@ -918,25 +891,6 @@ pub struct CountRequest {
     pub shard_key: Option<ShardKeySelector>,
 }
 
-/// Count Request
-/// Counts the number of points which satisfy the given filter.
-/// If filter is not provided, the count of all points in the collection will be returned.
-#[derive(Deserialize, Serialize, JsonSchema, Validate, Clone, Debug, PartialEq)]
-#[serde(rename_all = "snake_case")]
-pub struct CountRequestInternal {
-    /// Look only for points which satisfies this conditions
-    #[validate(nested)]
-    pub filter: Option<Filter>,
-    /// If true, count exact number of points. If false, count approximate number of points faster.
-    /// Approximate count might be unreliable during the indexing process. Default: true
-    #[serde(default = "default_exact_count")]
-    pub exact: bool,
-}
-
-pub const fn default_exact_count() -> bool {
-    true
-}
-
 #[derive(Debug, Default, Serialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub struct CountResult {
@@ -962,8 +916,6 @@ pub enum CollectionError {
     BadRequest { description: String },
     #[error("Operation Cancelled: {description}")]
     Cancelled { description: String },
-    #[error("Bad shard selection: {description}")]
-    BadShardSelection { description: String },
     #[error(
         "{shards_failed} out of {shards_total} shards failed to apply operation. First error captured: {first_err}"
     )]
@@ -996,11 +948,11 @@ pub enum CollectionError {
 }
 
 impl CollectionError {
-    pub fn timeout(timeout_sec: usize, operation: impl Into<String>) -> Self {
+    pub fn timeout(timeout: Duration, operation: impl Into<String>) -> Self {
         Self::Timeout {
             description: format!(
-                "Operation '{}' timed out after {timeout_sec} seconds",
-                operation.into()
+                "Operation '{}' timed out after {timeout:?}",
+                operation.into(),
             ),
         }
     }
@@ -1022,14 +974,16 @@ impl CollectionError {
         Self::NotFound { what: what.into() }
     }
 
-    pub fn bad_request(description: impl Into<String>) -> Self {
-        Self::BadRequest {
+    pub fn cancelled(description: impl Into<String>) -> Self {
+        Self::Cancelled {
             description: description.into(),
         }
     }
 
-    pub fn bad_shard_selection(description: String) -> Self {
-        Self::BadShardSelection { description }
+    pub fn bad_request(description: impl Into<String>) -> Self {
+        Self::BadRequest {
+            description: description.into(),
+        }
     }
 
     pub fn object_storage_error(what: impl Into<String>) -> Self {
@@ -1044,20 +998,10 @@ impl CollectionError {
     }
 
     pub fn remote_peer_id(&self) -> Option<PeerId> {
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         match self {
             Self::ForwardProxyError { peer_id, .. } => Some(*peer_id),
             _ => None,
-        }
-    }
-
-    pub fn shard_key_not_found(shard_key: &Option<ShardKey>) -> Self {
-        match shard_key {
-            Some(shard_key) => Self::NotFound {
-                what: format!("Shard key {shard_key} not found"),
-            },
-            None => Self::NotFound {
-                what: "Shard expected, but not provided".to_string(),
-            },
         }
     }
 
@@ -1124,7 +1068,6 @@ impl CollectionError {
             Self::NotFound { .. } => false,
             Self::PointNotFound { .. } => false,
             Self::BadRequest { .. } => false,
-            Self::BadShardSelection { .. } => false,
             Self::InconsistentShardFailure { .. } => false,
             Self::ForwardProxyError { .. } => false,
             Self::ObjectStoreError { .. } => false,
@@ -1139,6 +1082,7 @@ impl CollectionError {
     }
 
     pub fn is_missing_point(&self) -> bool {
+        #[expect(clippy::wildcard_enum_match_arm, reason = "error handling")]
         match self {
             Self::NotFound { what } => what.contains("No point with id"),
             Self::PointNotFound { .. } => true,
@@ -1148,20 +1092,14 @@ impl CollectionError {
 }
 
 impl From<SystemTimeError> for CollectionError {
-    fn from(error: SystemTimeError) -> CollectionError {
-        CollectionError::ServiceError {
-            error: format!("System time error: {error}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+    fn from(error: SystemTimeError) -> Self {
+        Self::service_error(format!("System time error: {error}"))
     }
 }
 
 impl From<String> for CollectionError {
-    fn from(error: String) -> CollectionError {
-        CollectionError::ServiceError {
-            error,
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+    fn from(error: String) -> Self {
+        Self::service_error(error)
     }
 }
 
@@ -1169,10 +1107,10 @@ impl From<OperationError> for CollectionError {
     fn from(err: OperationError) -> Self {
         match err {
             OperationError::WrongVectorDimension { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::VectorNameNotExists { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::PointIdError { missed_point_id } => {
                 Self::PointNotFound { missed_point_id }
@@ -1185,21 +1123,22 @@ impl From<OperationError> for CollectionError {
                 backtrace,
             },
             OperationError::TypeError { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::Cancelled { description } => Self::Cancelled { description },
             OperationError::TypeInferenceError { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::OutOfMemory { description, free } => {
                 Self::OutOfMemory { description, free }
             }
+            OperationError::Timeout { description } => Self::Timeout { description },
             OperationError::InconsistentStorage { .. } => Self::ServiceError {
-                error: format!("{err}"),
+                error: err.to_string(),
                 backtrace: None,
             },
             OperationError::ValidationError { .. } => Self::BadInput {
-                description: format!("{err}"),
+                description: err.to_string(),
             },
             OperationError::WrongSparse => Self::BadInput {
                 description: "Conversion between sparse and regular vectors failed".to_string(),
@@ -1207,14 +1146,10 @@ impl From<OperationError> for CollectionError {
             OperationError::WrongMulti => Self::BadInput {
                 description: "Conversion between multi and regular vectors failed".to_string(),
             },
-            OperationError::MissingRangeIndexForOrderBy { .. } => Self::bad_input(format!("{err}")),
-            OperationError::MissingMapIndexForFacet { .. } => Self::bad_input(format!("{err}")),
-            OperationError::VariableTypeError { .. } => Self::bad_input(format!("{err}")),
-            OperationError::NonFiniteNumber { .. } => Self::bad_input(format!("{err}")),
-            OperationError::RocksDbColumnFamilyNotFound { .. } => Self::ServiceError {
-                error: format!("{err}"),
-                backtrace: None,
-            },
+            OperationError::MissingRangeIndexForOrderBy { .. } => Self::bad_input(err.to_string()),
+            OperationError::MissingMapIndexForFacet { .. } => Self::bad_input(err.to_string()),
+            OperationError::VariableTypeError { .. } => Self::bad_input(err.to_string()),
+            OperationError::NonFiniteNumber { .. } => Self::bad_input(err.to_string()),
         }
     }
 }
@@ -1227,101 +1162,64 @@ impl From<CancelledError> for CollectionError {
 
 impl From<OneshotRecvError> for CollectionError {
     fn from(err: OneshotRecvError) -> Self {
-        Self::ServiceError {
-            error: format!("{err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl From<JoinError> for CollectionError {
     fn from(err: JoinError) -> Self {
-        Self::ServiceError {
-            error: format!("{err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl From<WalError> for CollectionError {
     fn from(err: WalError) -> Self {
-        Self::ServiceError {
-            error: format!("{err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl<T> From<SendError<T>> for CollectionError {
     fn from(err: SendError<T>) -> Self {
-        Self::ServiceError {
-            error: format!("Can't reach one of the workers: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Can't reach one of the workers: {err}"))
     }
 }
 
 impl From<JsonError> for CollectionError {
     fn from(err: JsonError) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Json error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Json error: {err}"))
     }
 }
 
 impl From<std::io::Error> for CollectionError {
     fn from(err: std::io::Error) -> Self {
-        CollectionError::ServiceError {
-            error: format!("File IO error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("File IO error: {err}"))
     }
 }
 
 impl From<tonic::transport::Error> for CollectionError {
     fn from(err: tonic::transport::Error) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Tonic transport error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Tonic transport error: {err}"))
     }
 }
 
 impl From<InvalidUri> for CollectionError {
     fn from(err: InvalidUri) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Invalid URI error: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(format!("Invalid URI error: {err}"))
     }
 }
 
 impl From<tonic::Status> for CollectionError {
     fn from(err: tonic::Status) -> Self {
         match err.code() {
-            tonic::Code::InvalidArgument => CollectionError::BadInput {
-                description: format!("InvalidArgument: {err}"),
-            },
-            tonic::Code::AlreadyExists => CollectionError::BadInput {
-                description: format!("AlreadyExists: {err}"),
-            },
-            tonic::Code::NotFound => CollectionError::NotFound {
-                what: format!("{err}"),
-            },
-            tonic::Code::Internal => CollectionError::ServiceError {
-                error: format!("Internal error: {err}"),
-                backtrace: Some(Backtrace::force_capture().to_string()),
-            },
-            tonic::Code::DeadlineExceeded => CollectionError::Timeout {
+            tonic::Code::InvalidArgument => Self::bad_input(format!("InvalidArgument: {err}")),
+            tonic::Code::AlreadyExists => Self::bad_input(format!("AlreadyExists: {err}")),
+            tonic::Code::NotFound => Self::not_found(err.to_string()),
+            tonic::Code::Internal => Self::service_error(format!("Internal error: {err}")),
+            tonic::Code::DeadlineExceeded => Self::Timeout {
                 description: format!("Deadline Exceeded: {err}"),
             },
-            tonic::Code::Cancelled => CollectionError::Cancelled {
-                description: format!("{err}"),
-            },
-            tonic::Code::FailedPrecondition => CollectionError::PreConditionFailed {
-                description: format!("{err}"),
-            },
+            tonic::Code::Cancelled => Self::cancelled(err.to_string()),
+            tonic::Code::FailedPrecondition => Self::pre_condition_failed(err.to_string()),
             tonic::Code::ResourceExhausted => {
                 // extract retry-after from metadata
                 // the value is passed as a String containing an integer number of seconds
@@ -1338,8 +1236,8 @@ impl From<tonic::Status> for CollectionError {
                         })
                         .map(Duration::from_secs)
                 });
-                CollectionError::RateLimitExceeded {
-                    description: format!("{err}"),
+                Self::RateLimitExceeded {
+                    description: err.to_string(),
                     retry_after,
                 }
             }
@@ -1351,26 +1249,16 @@ impl From<tonic::Status> for CollectionError {
             | tonic::Code::Unimplemented
             | tonic::Code::Unavailable
             | tonic::Code::DataLoss
-            | tonic::Code::Unauthenticated => CollectionError::ServiceError {
-                error: format!("Tonic status error: {err}"),
-                backtrace: Some(Backtrace::force_capture().to_string()),
-            },
+            | tonic::Code::Unauthenticated => {
+                Self::service_error(format!("Tonic status error: {err}"))
+            }
         }
     }
 }
 
 impl<Guard> From<std::sync::PoisonError<Guard>> for CollectionError {
     fn from(err: std::sync::PoisonError<Guard>) -> Self {
-        CollectionError::ServiceError {
-            error: format!("Mutex lock poisoned: {err}"),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
-    }
-}
-
-impl From<FileStorageError> for CollectionError {
-    fn from(err: FileStorageError) -> Self {
-        Self::service_error(err.to_string())
+        Self::service_error(format!("Mutex lock poisoned: {err}"))
     }
 }
 
@@ -1391,18 +1279,13 @@ impl From<RequestError<tonic::Status>> for CollectionError {
 
 impl From<save_on_disk::Error> for CollectionError {
     fn from(err: save_on_disk::Error) -> Self {
-        CollectionError::ServiceError {
-            error: err.to_string(),
-            backtrace: Some(Backtrace::force_capture().to_string()),
-        }
+        Self::service_error(err.to_string())
     }
 }
 
 impl From<validator::ValidationErrors> for CollectionError {
     fn from(err: validator::ValidationErrors) -> Self {
-        CollectionError::BadInput {
-            description: format!("{err}"),
-        }
+        Self::bad_input(err.to_string())
     }
 }
 
@@ -1410,9 +1293,7 @@ impl From<cancel::Error> for CollectionError {
     fn from(err: cancel::Error) -> Self {
         match err {
             cancel::Error::Join(err) => err.into(),
-            cancel::Error::Cancelled => Self::Cancelled {
-                description: err.to_string(),
-            },
+            cancel::Error::Cancelled => Self::cancelled(err.to_string()),
         }
     }
 }
@@ -1429,21 +1310,6 @@ impl From<tempfile::PathPersistError> for CollectionError {
 
 pub type CollectionResult<T> = Result<T, CollectionError>;
 
-impl RecordInternal {
-    pub fn get_vector_by_name(&self, name: &VectorName) -> Option<VectorRef<'_>> {
-        match &self.vector {
-            Some(VectorStructInternal::Single(vector)) => {
-                (name == DEFAULT_VECTOR_NAME).then_some(VectorRef::from(vector))
-            }
-            Some(VectorStructInternal::MultiDense(vectors)) => {
-                (name == DEFAULT_VECTOR_NAME).then_some(VectorRef::from(vectors))
-            }
-            Some(VectorStructInternal::Named(vectors)) => vectors.get(name).map(VectorRef::from),
-            None => None,
-        }
-    }
-}
-
 #[derive(
     Default, Debug, Deserialize, Serialize, JsonSchema, Anonymize, Eq, PartialEq, Copy, Clone, Hash,
 )]
@@ -1453,6 +1319,7 @@ pub enum Datatype {
     Float32,
     Uint8,
     Float16,
+    Turbo4,
 }
 
 impl From<Datatype> for VectorStorageDatatype {
@@ -1461,6 +1328,7 @@ impl From<Datatype> for VectorStorageDatatype {
             Datatype::Float32 => VectorStorageDatatype::Float32,
             Datatype::Uint8 => VectorStorageDatatype::Uint8,
             Datatype::Float16 => VectorStorageDatatype::Float16,
+            Datatype::Turbo4 => VectorStorageDatatype::Turbo4,
         }
     }
 }
@@ -1504,6 +1372,8 @@ pub struct VectorParams {
     ///   2 bytes.
     /// - For `uint8` datatype - vectors are stored as unsigned 8-bit integers, 1 byte.
     ///   It expects vector elements to be in range `[0, 255]`.
+    /// - For `turbo4` datatype - vectors are quantized to 4 bits per element using the
+    ///   TurboQuant algorithm.
     pub datatype: Option<Datatype>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1517,25 +1387,18 @@ pub fn validate_nonzerou64_range_min_1_max_65536(
     validate_range_generic(value.get(), Some(1), Some(65536))
 }
 
-/// Is considered empty if `None` or if diff has no field specified
-fn is_hnsw_diff_empty(hnsw_config: &Option<HnswConfigDiff>) -> bool {
-    hnsw_config
-        .as_ref()
-        .and_then(|config| config_diff::is_empty(config).ok())
-        .unwrap_or(true)
+/// Reject the `Turbo4` datatype on sparse vector configs.
+/// `validator` unwraps `Option<Datatype>` before calling, so we receive `&Datatype`.
+fn validate_sparse_datatype(datatype: &Datatype) -> Result<(), ValidationError> {
+    if matches!(datatype, Datatype::Turbo4) {
+        return Err(common::validation::sparse_turbo4_unsupported_error());
+    }
+    Ok(())
 }
 
-/// If used, include weight modification, which will be applied to sparse vectors at query time:
-/// None - no modification (default)
-/// Idf - inverse document frequency, based on statistics of the collection
-#[derive(
-    Debug, Hash, Deserialize, Serialize, JsonSchema, Anonymize, Clone, PartialEq, Eq, Default,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum Modifier {
-    #[default]
-    None,
-    Idf,
+/// Is considered empty if `None` or if diff has no field specified
+fn is_hnsw_diff_empty(hnsw_config: &Option<HnswConfigDiff>) -> bool {
+    hnsw_config.is_none() || *hnsw_config == Some(HnswConfigDiff::default())
 }
 
 /// Params of single sparse vector data storage
@@ -1546,6 +1409,7 @@ pub enum Modifier {
 pub struct SparseVectorParams {
     /// Custom params for index. If none - values from collection configuration are used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(nested)]
     pub index: Option<SparseIndexParams>,
 
     /// Configures addition value modifications for sparse vectors.
@@ -1562,7 +1426,18 @@ impl SparseVectorParams {
 
 /// Configuration for sparse inverted index.
 #[derive(
-    Debug, Hash, Deserialize, Serialize, JsonSchema, Anonymize, Copy, Clone, PartialEq, Eq, Default,
+    Debug,
+    Hash,
+    Deserialize,
+    Serialize,
+    JsonSchema,
+    Validate,
+    Anonymize,
+    Copy,
+    Clone,
+    PartialEq,
+    Eq,
+    Default,
 )]
 #[serde(rename_all = "snake_case")]
 pub struct SparseIndexParams {
@@ -1586,6 +1461,7 @@ pub struct SparseIndexParams {
     ///   Quantization to fit byte range `[0, 255]` happens during indexing automatically, so the
     ///   actual vector data does not need to conform to this range.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[validate(custom(function = "validate_sparse_datatype"))]
     pub datatype: Option<Datatype>,
 }
 
@@ -1649,6 +1525,38 @@ impl VectorsConfig {
         }
     }
 
+    /// Insert or replace a named vector. Converts `Single` to `Multi` if needed.
+    pub fn insert(&mut self, name: VectorNameBuf, params: VectorParams) {
+        match self {
+            VectorsConfig::Single(_) => {
+                let mut multi = BTreeMap::new();
+                if let VectorsConfig::Single(existing) =
+                    std::mem::replace(self, VectorsConfig::empty())
+                {
+                    multi.insert(DEFAULT_VECTOR_NAME.to_owned(), existing);
+                }
+                multi.insert(name, params);
+                *self = VectorsConfig::Multi(multi);
+            }
+            VectorsConfig::Multi(vectors) => {
+                vectors.insert(name, params);
+            }
+        }
+    }
+
+    /// Remove a named vector. Converts `Single` to empty `Multi` if name matches.
+    pub fn remove(&mut self, name: &VectorName) {
+        match self {
+            VectorsConfig::Single(_) if name == DEFAULT_VECTOR_NAME => {
+                *self = VectorsConfig::Multi(Default::default());
+            }
+            VectorsConfig::Single(_) => {}
+            VectorsConfig::Multi(vectors) => {
+                vectors.remove(name);
+            }
+        }
+    }
+
     pub fn get_params_mut(&mut self, name: &VectorName) -> Option<&mut VectorParams> {
         match self {
             VectorsConfig::Single(params) => (name == DEFAULT_VECTOR_NAME).then_some(params),
@@ -1668,30 +1576,6 @@ impl VectorsConfig {
         }
     }
 
-    // TODO: Further unify `check_compatible` and `check_compatible_with_segment_config`?
-    pub fn check_compatible(&self, other: &Self) -> CollectionResult<()> {
-        match (self, other) {
-            (Self::Single(_), Self::Single(_)) | (Self::Multi(_), Self::Multi(_)) => (),
-            _ => {
-                return Err(incompatible_vectors_error(
-                    self.params_iter().map(|(name, _)| name),
-                    other.params_iter().map(|(name, _)| name),
-                ));
-            }
-        };
-
-        for (vector_name, this) in self.params_iter() {
-            let Some(other) = other.get_params(vector_name) else {
-                return Err(missing_vector_error(vector_name));
-            };
-
-            VectorParamsBase::from(this).check_compatibility(&other.into(), vector_name)?;
-        }
-
-        Ok(())
-    }
-
-    // TODO: Further unify `check_compatible` and `check_compatible_with_segment_config`?
     pub fn check_compatible_with_segment_config(
         &self,
         other: &HashMap<VectorNameBuf, segment::types::VectorDataConfig>,
@@ -1716,41 +1600,6 @@ impl VectorsConfig {
     }
 }
 
-// TODO(sparse): Further unify `check_compatible` and `check_compatible_with_segment_config`?
-pub fn check_sparse_compatible(
-    self_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
-    other_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
-) -> CollectionResult<()> {
-    for (vector_name, _this) in self_config.iter() {
-        let Some(_other) = other_config.get(vector_name) else {
-            return Err(missing_vector_error(vector_name));
-        };
-    }
-
-    Ok(())
-}
-
-pub fn check_sparse_compatible_with_segment_config(
-    self_config: &BTreeMap<VectorNameBuf, SparseVectorParams>,
-    other: &HashMap<VectorNameBuf, segment::types::SparseVectorDataConfig>,
-    exact: bool,
-) -> CollectionResult<()> {
-    if exact && self_config.len() != other.len() {
-        return Err(incompatible_vectors_error(
-            self_config.keys().map(AsRef::as_ref),
-            other.keys().map(AsRef::as_ref),
-        ));
-    }
-
-    for (vector_name, _) in self_config.iter() {
-        if other.get(vector_name).is_none() {
-            return Err(missing_vector_error(vector_name));
-        };
-    }
-
-    Ok(())
-}
-
 fn incompatible_vectors_error<'a, 'b>(
     this: impl Iterator<Item = &'a VectorName>,
     other: impl Iterator<Item = &'b VectorName>,
@@ -1758,22 +1607,18 @@ fn incompatible_vectors_error<'a, 'b>(
     let this_vectors = this.collect::<Vec<_>>().join(", ");
     let other_vectors = other.collect::<Vec<_>>().join(", ");
 
-    CollectionError::BadInput {
-        description: format!(
-            "Vectors configuration is not compatible: \
+    CollectionError::bad_input(format!(
+        "Vectors configuration is not compatible: \
              origin collection have vectors [{this_vectors}], \
              while other vectors [{other_vectors}]"
-        ),
-    }
+    ))
 }
 
 fn missing_vector_error(vector_name: &VectorName) -> CollectionError {
-    CollectionError::BadInput {
-        description: format!(
-            "Vectors configuration is not compatible: \
+    CollectionError::bad_input(format!(
+        "Vectors configuration is not compatible: \
              origin collection have vector {vector_name}, while other collection does not"
-        ),
-    }
+    ))
 }
 
 impl Validate for VectorsConfig {
@@ -1802,23 +1647,19 @@ struct VectorParamsBase {
 impl VectorParamsBase {
     fn check_compatibility(&self, other: &Self, vector_name: &VectorName) -> CollectionResult<()> {
         if self.size != other.size {
-            return Err(CollectionError::BadInput {
-                description: format!(
-                    "Vectors configuration is not compatible: \
+            return Err(CollectionError::bad_input(format!(
+                "Vectors configuration is not compatible: \
                      origin vector {} size: {}, while other vector size: {}",
-                    vector_name, self.size, other.size
-                ),
-            });
+                vector_name, self.size, other.size
+            )));
         }
 
         if self.distance != other.distance {
-            return Err(CollectionError::BadInput {
-                description: format!(
-                    "Vectors configuration is not compatible: \
+            return Err(CollectionError::bad_input(format!(
+                "Vectors configuration is not compatible: \
                      origin vector {} distance: {:?}, while other vector distance: {:?}",
-                    vector_name, self.distance, other.distance
-                ),
-            });
+                vector_name, self.distance, other.distance
+            )));
         }
 
         Ok(())
@@ -1858,9 +1699,7 @@ impl From<&segment::types::VectorDataConfig> for VectorParamsBase {
     }
 }
 
-#[derive(
-    Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq, Merge,
-)]
+#[derive(Debug, Hash, Deserialize, Serialize, JsonSchema, Validate, Clone, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub struct VectorParamsDiff {
     /// Update params for HNSW index. If empty object - it will be unset.
@@ -1900,9 +1739,7 @@ impl VectorsConfigDiff {
                 .vectors
                 .get_params(vector_name)
                 .map(|_| ())
-                .ok_or_else(|| OperationError::VectorNameNotExists {
-                    received_name: vector_name.clone(),
-                })?;
+                .ok_or_else(|| OperationError::vector_name_not_exists(vector_name.clone()))?;
         }
         Ok(())
     }
@@ -1933,9 +1770,7 @@ impl SparseVectorsConfig {
                 .sparse_vectors
                 .as_ref()
                 .and_then(|v| v.get(vector_name).map(|_| ()))
-                .ok_or_else(|| OperationError::VectorNameNotExists {
-                    received_name: vector_name.clone(),
-                })?;
+                .ok_or_else(|| OperationError::vector_name_not_exists(vector_name))?;
         }
         Ok(())
     }
@@ -1977,62 +1812,6 @@ pub enum NodeType {
     /// This is useful for nodes that are only used for writing data
     /// and backup purposes
     Listener,
-}
-
-impl From<SearchRequestInternal> for ShardQueryRequest {
-    fn from(value: SearchRequestInternal) -> Self {
-        let SearchRequestInternal {
-            vector,
-            filter,
-            score_threshold,
-            limit,
-            offset,
-            params,
-            with_vector,
-            with_payload,
-        } = value;
-
-        Self {
-            prefetches: vec![],
-            query: Some(ScoringQuery::Vector(QueryEnum::Nearest(NamedQuery::from(
-                NamedVectorStruct::from(vector),
-            )))),
-            filter,
-            score_threshold: score_threshold.map(OrderedFloat),
-            limit,
-            offset: offset.unwrap_or_default(),
-            params,
-            with_vector: with_vector.unwrap_or_default(),
-            with_payload: with_payload.unwrap_or_default(),
-        }
-    }
-}
-
-impl From<CoreSearchRequest> for ShardQueryRequest {
-    fn from(value: CoreSearchRequest) -> Self {
-        let CoreSearchRequest {
-            query,
-            filter,
-            score_threshold,
-            limit,
-            offset,
-            params,
-            with_vector,
-            with_payload,
-        } = value;
-
-        Self {
-            prefetches: vec![],
-            query: Some(ScoringQuery::Vector(query)),
-            filter,
-            score_threshold: score_threshold.map(OrderedFloat),
-            limit,
-            offset,
-            params,
-            with_vector: with_vector.unwrap_or_default(),
-            with_payload: with_payload.unwrap_or_default(),
-        }
-    }
 }
 
 /// All the unresolved issues in a Qdrant instance

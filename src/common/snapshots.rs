@@ -7,18 +7,21 @@ use collection::operations::snapshot_ops::{
     ShardSnapshotLocation, SnapshotDescription, SnapshotPriority,
 };
 use collection::operations::verification::VerificationPass;
-use collection::shards::replica_set::ReplicaState;
-use collection::shards::replica_set::snapshots::RecoveryType;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use collection::shards::shard::ShardId;
-use common::tempfile_ext::MaybeTempPath;
-use segment::data_types::manifest::SnapshotManifest;
+use collection::shards::shard_holder::recovery_guard::RecoveryProgressHandle;
+use collection::shards::transfer::RecoveryStage;
+use shard::snapshots::snapshot_data::SnapshotData;
+use shard::snapshots::snapshot_manifest::{RecoveryType, SnapshotManifest};
 use storage::content_manager::errors::StorageError;
 use storage::content_manager::snapshots;
+use storage::content_manager::snapshots::download_result::DownloadResult;
 use storage::content_manager::toc::TableOfContent;
 use storage::dispatcher::Dispatcher;
-use storage::rbac::{Access, AccessRequirements};
+use storage::rbac::AccessRequirements;
 use tokio::sync::OwnedRwLockWriteGuard;
 
+use super::auth::Auth;
 use super::http_client::HttpClient;
 
 /// # Cancel safety
@@ -26,15 +29,21 @@ use super::http_client::HttpClient;
 /// This function is cancel safe.
 pub async fn create_shard_snapshot(
     toc: Arc<TableOfContent>,
-    access: Access,
+    auth: &Auth,
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<SnapshotDescription, StorageError> {
-    let collection_pass = access.check_collection_access(
+    let collection_pass = auth.check_collection_access(
         &collection_name,
-        AccessRequirements::new().write().whole().extras(),
+        AccessRequirements::new().write().extras(),
+        "create_shard_snapshot",
     )?;
     let collection = toc.get_collection(&collection_pass).await?;
+
+    let _telemetry_scope_guard = toc
+        .snapshot_telemetry_collector(&collection_name)
+        .running_snapshots
+        .measure_scope();
 
     let snapshot = collection
         .create_shard_snapshot(shard_id, &toc.optional_temp_or_snapshot_temp_path()?)
@@ -48,17 +57,23 @@ pub async fn create_shard_snapshot(
 /// This function is cancel safe.
 pub async fn stream_shard_snapshot(
     toc: Arc<TableOfContent>,
-    access: Access,
+    auth: &Auth,
     collection_name: String,
     shard_id: ShardId,
     manifest: Option<SnapshotManifest>,
 ) -> Result<SnapshotStream, StorageError> {
-    let collection_pass = access.check_collection_access(
+    let collection_pass = auth.check_collection_access(
         &collection_name,
-        AccessRequirements::new().write().whole().extras(),
+        AccessRequirements::new().write().extras(),
+        "stream_shard_snapshot",
     )?;
 
     let collection = toc.get_collection(&collection_pass).await?;
+
+    let _telemetry_scope_guard = toc
+        .snapshot_telemetry_collector(&collection_name)
+        .running_snapshots
+        .measure_scope();
 
     if let Some(old_manifest) = &manifest {
         let current_manifest = collection.get_partial_snapshot_manifest(shard_id).await?;
@@ -93,12 +108,15 @@ pub async fn stream_shard_snapshot(
 /// This function is cancel safe.
 pub async fn list_shard_snapshots(
     toc: Arc<TableOfContent>,
-    access: Access,
+    auth: &Auth,
     collection_name: String,
     shard_id: ShardId,
 ) -> Result<Vec<SnapshotDescription>, StorageError> {
-    let collection_pass = access
-        .check_collection_access(&collection_name, AccessRequirements::new().whole().extras())?;
+    let collection_pass = auth.check_collection_access(
+        &collection_name,
+        AccessRequirements::new().extras(),
+        "list_shard_snapshots",
+    )?;
     let collection = toc.get_collection(&collection_pass).await?;
     let snapshots = collection.list_shard_snapshots(shard_id).await?;
     Ok(snapshots)
@@ -109,14 +127,15 @@ pub async fn list_shard_snapshots(
 /// This function is cancel safe.
 pub async fn delete_shard_snapshot(
     toc: Arc<TableOfContent>,
-    access: Access,
+    auth: &Auth,
     collection_name: String,
     shard_id: ShardId,
     snapshot_name: String,
 ) -> Result<(), StorageError> {
-    let collection_pass = access.check_collection_access(
+    let collection_pass = auth.check_collection_access(
         &collection_name,
-        AccessRequirements::new().write().whole().extras(),
+        AccessRequirements::new().write().extras(),
+        "delete_shard_snapshot",
     )?;
     let collection = toc.get_collection(&collection_pass).await?;
     let snapshot_manager = collection.get_snapshots_storage_manager()?;
@@ -139,7 +158,7 @@ pub async fn delete_shard_snapshot(
 #[allow(clippy::too_many_arguments)]
 pub async fn recover_shard_snapshot(
     toc: Arc<TableOfContent>,
-    access: Access,
+    auth: &Auth,
     collection_name: String,
     shard_id: ShardId,
     snapshot_location: ShardSnapshotLocation,
@@ -148,8 +167,8 @@ pub async fn recover_shard_snapshot(
     client: HttpClient,
     api_key: Option<String>,
 ) -> Result<(), StorageError> {
-    let collection_pass = access
-        .check_global_access(AccessRequirements::new().manage())?
+    let collection_pass = auth
+        .check_global_access(AccessRequirements::new().manage(), "recover_shard_snapshot")?
         .issue_pass(&collection_name)
         .into_static();
 
@@ -157,13 +176,42 @@ pub async fn recover_shard_snapshot(
     //   - but the task is *spawned* on the runtime and won't be cancelled, if request is cancelled
 
     cancel::future::spawn_cancel_on_drop(async move |cancel| {
-        let cancel_safe = async {
+        let pre_recovery_task = async {
             let collection = toc.get_collection(&collection_pass).await?;
             collection.assert_shard_exists(shard_id).await?;
 
-            let download_dir = toc.optional_temp_or_snapshot_temp_path()?;
+            // Default temporary path to storage dir, to allow faster recovery within the same volume
+            let download_dir = toc.optional_temp_or_storage_temp_path()?;
+            Result::<_, StorageError>::Ok((collection, download_dir))
+        };
 
-            let snapshot_path = match snapshot_location {
+        let (collection, download_dir) =
+            cancel::future::cancel_on_token(cancel.clone(), pre_recovery_task).await??;
+
+        // Guard tracks recovery progress and removes it on drop, on every exit path
+        // (success, error, or cancellation), so stale timings are never reported.
+        let recovery_guard = collection
+            .shards_holder()
+            .read()
+            .await
+            .start_shard_recovery(shard_id);
+
+        // For shard transfers, drop the existing shard and clear its on-disk data
+        // before downloading the new snapshot so we don't need space for both copies.
+        // Safe because the shard is in `PartialSnapshot` state for the duration of
+        // the transfer and will not serve user requests. Not done for user-triggered
+        // URL recovery, where the shard may still be active.
+        if matches!(snapshot_priority, SnapshotPriority::ShardTransfer) {
+            collection
+                .clear_local_shard_for_snapshot_recovery(shard_id)
+                .await?;
+        }
+
+        let download_task = async {
+            let DownloadResult {
+                snapshot,
+                hash
+            } = match snapshot_location {
                 ShardSnapshotLocation::Url(url) => {
                     if !matches!(url.scheme(), "http" | "https") {
                         let description = format!(
@@ -174,9 +222,17 @@ pub async fn recover_shard_snapshot(
                         return Err(StorageError::bad_input(description));
                     }
 
-                    let client = client.client(api_key.as_deref())?;
+                    recovery_guard.set_stage(RecoveryStage::Downloading);
 
-                    snapshots::download::download_snapshot(&client, url, &download_dir).await?
+                    let client = client.client(api_key.as_deref())?;
+                    snapshots::download::download_snapshot(
+                        &client,
+                        url,
+                        &download_dir,
+                        collection.snapshots_path(),
+                        checksum.is_some(),
+                    )
+                    .await?
                 }
 
                 ShardSnapshotLocation::Path(snapshot_file_name) => {
@@ -191,39 +247,62 @@ pub async fn recover_shard_snapshot(
                         )
                         .await?;
 
-                    collection
+                    let snapshot_file = collection
                         .get_snapshots_storage_manager()?
                         .get_snapshot_file(&snapshot_path, &download_dir)
-                        .await?
+                        .await?;
+
+                    let hash = if checksum.is_some() {
+                        Some(sha_256::hash_file(&snapshot_path).await?)
+                    } else {
+                        None
+                    };
+
+                    DownloadResult {
+                        snapshot: SnapshotData::Packed(snapshot_file),
+                        hash,
+                    }
                 }
             };
 
             if let Some(checksum) = checksum {
-                let snapshot_checksum = sha_256::hash_file(&snapshot_path).await?;
-                if !sha_256::hashes_equal(&snapshot_checksum, &checksum) {
-                    return Err(StorageError::bad_input(format!(
-                        "Snapshot checksum mismatch: expected {checksum}, got {snapshot_checksum}"
-                    )));
+                if let Some(snapshot_checksum) = hash {
+                    if !sha_256::hashes_equal(&snapshot_checksum, &checksum) {
+                        return Err(StorageError::bad_input(format!(
+                            "Snapshot checksum mismatch: expected {checksum}, got {snapshot_checksum}"
+                        )));
+                    }
+                } else {
+                    return Err(StorageError::service_error(
+                        "Snapshot checksum could not be verified".to_string(),
+                    ));
                 }
             }
 
-            Ok((collection, snapshot_path))
+            Ok(snapshot)
         };
 
-        let (collection, snapshot_path) =
-            cancel::future::cancel_on_token(cancel.clone(), cancel_safe).await??;
+        let snapshot_data =
+            cancel::future::cancel_on_token(cancel.clone(), download_task).await??;
 
         // `recover_shard_snapshot_impl` is *not* cancel safe
-        recover_shard_snapshot_impl(
+        let result = recover_shard_snapshot_impl(
             &toc,
             &collection,
             shard_id,
-            snapshot_path,
+            snapshot_data,
             snapshot_priority,
             RecoveryType::Full,
+            Some(recovery_guard.progress_handle()),
             cancel,
         )
-        .await
+        .await;
+
+        // `recovery_guard` is dropped here (and on every early return above),
+        // which stops tracking recovery progress for this shard.
+        drop(recovery_guard);
+
+        result
     })
     .await??;
 
@@ -233,15 +312,22 @@ pub async fn recover_shard_snapshot(
 /// # Cancel safety
 ///
 /// This function is *not* cancel safe.
+#[allow(clippy::too_many_arguments)]
 pub async fn recover_shard_snapshot_impl(
     toc: &TableOfContent,
     collection: &Collection,
     shard: ShardId,
-    snapshot_path: MaybeTempPath,
+    snapshot_data: SnapshotData,
     priority: SnapshotPriority,
     recovery_type: RecoveryType,
+    recovery_progress: Option<RecoveryProgressHandle>,
     cancel: cancel::CancellationToken,
 ) -> Result<(), StorageError> {
+    let _recover_tracker_guard = toc
+        .snapshot_telemetry_collector(collection.name())
+        .running_snapshot_recovery
+        .measure_scope();
+
     // `Collection::restore_shard_snapshot` and `activate_shard` calls *have to* be executed as a
     // single transaction
     //
@@ -251,11 +337,13 @@ pub async fn recover_shard_snapshot_impl(
     collection
         .restore_shard_snapshot(
             shard,
-            snapshot_path,
+            snapshot_data,
             recovery_type,
             toc.this_peer_id,
             toc.is_distributed(),
-            &toc.optional_temp_or_snapshot_temp_path()?,
+            // Default temporary path to storage dir, to allow faster recovery within the same volume
+            &toc.optional_temp_or_storage_temp_path()?,
+            recovery_progress,
             cancel,
         )
         .await?
@@ -298,7 +386,7 @@ pub async fn recover_shard_snapshot_impl(
 
                 for &(peer, _) in other_active_replicas.iter() {
                     toc.send_set_replica_state_proposal(
-                        collection.name(),
+                        collection.name().to_string(),
                         peer,
                         shard,
                         ReplicaState::Dead,
@@ -309,7 +397,7 @@ pub async fn recover_shard_snapshot_impl(
 
             SnapshotPriority::Replica => {
                 toc.send_set_replica_state_proposal(
-                    collection.name(),
+                    collection.name().to_string(),
                     toc.this_peer_id,
                     shard,
                     ReplicaState::Dead,
@@ -330,15 +418,18 @@ pub async fn try_take_partial_snapshot_recovery_lock(
     dispatcher: &Dispatcher,
     collection_name: &str,
     shard_id: ShardId,
-    access: &Access,
+    auth: &Auth,
     pass: &VerificationPass,
 ) -> Result<Option<OwnedRwLockWriteGuard<()>>, StorageError> {
-    let collection_pass = access
-        .check_global_access(AccessRequirements::new().manage())?
+    let collection_pass = auth
+        .check_global_access(
+            AccessRequirements::new().manage(),
+            "partial_snapshot_recovery_lock",
+        )?
         .issue_pass(collection_name);
 
     let recovery_lock = dispatcher
-        .toc(access, pass)
+        .toc(auth, pass)
         .get_collection(&collection_pass)
         .await?
         .try_take_partial_snapshot_recovery_lock(shard_id, RecoveryType::Partial)

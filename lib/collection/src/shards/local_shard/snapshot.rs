@@ -1,123 +1,153 @@
-use std::collections::HashSet;
+use std::borrow::Cow;
 use std::num::NonZeroUsize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use common::save_on_disk::SaveOnDisk;
 use common::tar_ext;
+use common::types::PointOffsetType;
+use fs_err as fs;
 use parking_lot::RwLock;
 use segment::common::operation_error::{OperationError, OperationResult};
-use segment::data_types::manifest::SnapshotManifest;
-use segment::entry::SegmentEntry;
-use segment::segment::Segment;
+use segment::data_types::manifest::SegmentManifest;
+use segment::entry::StorageSegmentEntry;
 use segment::types::{SegmentConfig, SnapshotFormat};
+use shard::files::{APPLIED_SEQ_FILE, SEGMENTS_PATH, WAL_PATH};
 use shard::locked_segment::LockedSegment;
+use shard::operations::OperationWithClockTag;
 use shard::payload_index_schema::PayloadIndexSchema;
-use shard::segment_holder::{LockedSegmentHolder, SegmentHolder};
-use tokio::sync::oneshot;
+use shard::segment_holder::SegmentHolder;
+use shard::segment_holder::locked::LockedSegmentHolder;
+use shard::snapshots::snapshot_manifest::SnapshotManifest;
+use shard::snapshots::snapshot_utils::SnapshotUtils;
+use shard::wal::SerdeWal;
+use tokio::sync::OwnedMutexGuard;
+use tokio_util::task::AbortOnDropHandle;
 use wal::{Wal, WalOptions};
 
 use crate::operations::types::{CollectionError, CollectionResult};
-use crate::shards::local_shard::{LocalShard, LocalShardClocks, SEGMENTS_PATH, WAL_PATH};
-use crate::update_handler::UpdateSignal;
-use crate::wal_delta::LockedWal;
+use crate::shards::local_shard::{LocalShard, LocalShardClocks};
 
 impl LocalShard {
-    pub fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
-        self.segments()
-            .read()
-            .snapshot_manifest()
-            .map_err(CollectionError::from)
+    pub async fn snapshot_manifest(&self) -> CollectionResult<SnapshotManifest> {
+        let task = {
+            let _runtime = self.search_runtime.tokio_handle().enter();
+
+            let segments = self.segments.clone();
+            cancel::blocking::spawn_cancel_on_drop(move |_| segments.read().snapshot_manifest())
+        };
+
+        Ok(task.await??)
     }
 
     pub fn restore_snapshot(snapshot_path: &Path) -> CollectionResult<()> {
         log::info!("Restoring shard snapshot {}", snapshot_path.display());
-        // Read dir first as the directory contents would change during restore
-        let entries = std::fs::read_dir(LocalShard::segments_path(snapshot_path))?
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Filter out hidden entries
-        let entries = entries.into_iter().filter(|entry| {
-            let is_hidden = entry
-                .file_name()
-                .to_str()
-                .is_some_and(|s| s.starts_with('.'));
-            if is_hidden {
-                log::debug!(
-                    "Ignoring hidden segment in local shard during snapshot recovery: {}",
-                    entry.path().display(),
-                );
-            }
-            !is_hidden
-        });
-
-        for entry in entries {
-            Segment::restore_snapshot_in_place(&entry.path())?;
-        }
-
+        SnapshotUtils::restore_unpacked_snapshot(snapshot_path)?;
         Ok(())
     }
 
     /// Create snapshot for local shard into `target_path`
-    pub async fn create_snapshot(
+    pub async fn get_snapshot_creator(
         &self,
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
         format: SnapshotFormat,
         manifest: Option<SnapshotManifest>,
         save_wal: bool,
-    ) -> CollectionResult<()> {
+    ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + use<>> {
         let segments = self.segments.clone();
         let wal = self.wal.wal.clone();
+        let payload_index_schema = self.payload_index_schema.clone();
 
-        if !save_wal {
+        let shard_path = self.path.clone();
+
+        let segments_path = Self::segments_path(&self.path);
+        let (segment_config, deferred_internal_id) = {
+            let collection_config = self.collection_config.read().await;
+            (
+                collection_config.to_base_segment_config(),
+                collection_config.params.get_deferred_point_id(
+                    &collection_config.hnsw_config,
+                    collection_config
+                        .optimizer_config
+                        .get_deferred_points_threshold_bytes(),
+                ),
+            )
+        };
+
+        let applied_seq_path = self.applied_seq_handler.path().to_path_buf();
+
+        let tar = tar.clone();
+        let temp_path = temp_path.to_path_buf();
+
+        let plunger_notify = if !save_wal {
             // If we are not saving WAL, we still need to make sure that all submitted by this point
             // updates have made it to the segments. So we use the Plunger to achieve that.
             // It will notify us when all submitted updates so far have been processed.
-            let (tx, rx) = oneshot::channel();
-            let plunger = UpdateSignal::Plunger(tx);
-            self.update_sender.load().send(plunger).await?;
-            rx.await?;
-        }
+            Some(self.plunge_async().await?)
+        } else {
+            None
+        };
 
-        let segments_path = Self::segments_path(&self.path);
-        let segment_config = self
-            .collection_config
-            .read()
-            .await
-            .to_base_segment_config()?;
-        let payload_index_schema = self.payload_index_schema.clone();
-        let temp_path = temp_path.to_owned();
-
-        let tar_c = tar.clone();
-        let update_lock = self.update_operation_lock.clone();
-
-        tokio::task::spawn_blocking(move || {
-            // Do not change segments while snapshotting
-            snapshot_all_segments(
-                segments.clone(),
-                &segments_path,
-                Some(segment_config),
-                payload_index_schema.clone(),
-                &temp_path,
-                &tar_c.descend(Path::new(SEGMENTS_PATH))?,
-                format,
-                manifest.as_ref(),
-                update_lock,
-            )?;
-
-            if save_wal {
-                // snapshot all shard's WAL
-                Self::snapshot_wal(wal, &tar_c)
-            } else {
-                Self::snapshot_empty_wal(wal, &temp_path, &tar_c)
+        let future = async move {
+            if let Some(plunger_notify) = plunger_notify {
+                plunger_notify.await?;
             }
-        })
-        .await??;
 
-        LocalShardClocks::archive_data(&self.path, tar).await?;
+            let handle = tokio::task::spawn_blocking(move || {
+                // Do not change segments while snapshotting
+                snapshot_all_segments(
+                    segments.clone(),
+                    &segments_path,
+                    Some(segment_config),
+                    payload_index_schema,
+                    deferred_internal_id,
+                    &temp_path,
+                    &tar.descend(Path::new(SEGMENTS_PATH))?,
+                    format,
+                    manifest.as_ref(),
+                )?;
 
-        Ok(())
+                let wal_guard = wal.blocking_lock_owned();
+
+                LocalShardClocks::archive_data(&shard_path, &tar)?;
+
+                // Staging delay
+                #[cfg(feature = "staging")]
+                {
+                    let delay_secs: f64 =
+                        std::env::var("QDRANT__STAGING__SNAPSHOT_SHARD_CLOCKS_DELAY")
+                            .ok()
+                            .and_then(|str| str.parse().ok())
+                            .unwrap_or(0.0);
+
+                    if delay_secs > 0.0 {
+                        log::debug!("Staging: Delaying snapshotting WAL for {delay_secs}s");
+                        std::thread::sleep(std::time::Duration::from_secs_f64(delay_secs));
+                        log::debug!("Staging: Delay complete, snapshotting WAL");
+                    }
+                }
+
+                if save_wal {
+                    // snapshot all shard's WAL
+                    Self::snapshot_wal(wal_guard, &tar)?;
+                    // snapshot applied_seq, it is preferred to save applied_seq later,
+                    // as higher applied_seq means more updates will be processed on restore,
+                    // which is more safe than having applied_seq too old.
+                    Self::snapshot_applied_seq(applied_seq_path, &tar)?;
+                } else {
+                    Self::snapshot_empty_wal(wal_guard, &temp_path, &tar)?;
+                }
+
+                CollectionResult::Ok(())
+            });
+
+            AbortOnDropHandle::new(handle).await??;
+
+            Ok(())
+        };
+
+        Ok(future)
     }
 
     /// Create empty WAL which is compatible with currently stored data
@@ -126,14 +156,15 @@ impl LocalShard {
     ///
     /// This function panics if called within an asynchronous execution context.
     fn snapshot_empty_wal(
-        wal: LockedWal,
+        wal_guard: OwnedMutexGuard<SerdeWal<OperationWithClockTag>>,
         temp_path: &Path,
         tar: &tar_ext::BuilderExt,
     ) -> CollectionResult<()> {
-        let (segment_capacity, latest_op_num) = {
-            let wal_guard = wal.blocking_lock();
-            (wal_guard.segment_capacity(), wal_guard.last_index())
-        };
+        let wal_segment_capacity = wal_guard.segment_capacity();
+        let wal_last_index = wal_guard.last_index();
+
+        // Empty snapshot only need indexes to be correct
+        drop(wal_guard);
 
         let temp_dir = tempfile::tempdir_in(temp_path).map_err(|err| {
             CollectionError::service_error(format!(
@@ -144,11 +175,11 @@ impl LocalShard {
         Wal::generate_empty_wal_starting_at_index(
             temp_dir.path(),
             &WalOptions {
-                segment_capacity,
+                segment_capacity: wal_segment_capacity,
                 segment_queue_len: 0,
                 retain_closed: NonZeroUsize::new(1).unwrap(),
             },
-            latest_op_num,
+            wal_last_index,
         )
         .map_err(|err| {
             CollectionError::service_error(format!("Error while create empty WAL: {err}"))
@@ -165,14 +196,15 @@ impl LocalShard {
     /// # Panics
     ///
     /// This function panics if called within an asynchronous execution context.
-    fn snapshot_wal(wal: LockedWal, tar: &tar_ext::BuilderExt) -> CollectionResult<()> {
-        // lock wal during snapshot
-        let mut wal_guard = wal.blocking_lock();
+    fn snapshot_wal(
+        mut wal_guard: OwnedMutexGuard<SerdeWal<OperationWithClockTag>>,
+        tar: &tar_ext::BuilderExt,
+    ) -> CollectionResult<()> {
         wal_guard.flush()?;
         let source_wal_path = wal_guard.path();
 
         let tar = tar.descend(Path::new(WAL_PATH))?;
-        for entry in std::fs::read_dir(source_wal_path).map_err(|err| {
+        for entry in fs::read_dir(source_wal_path).map_err(|err| {
             CollectionError::service_error(format!("Can't read WAL directory: {err}",))
         })? {
             let entry = entry.map_err(|err| {
@@ -195,6 +227,22 @@ impl LocalShard {
         }
         Ok(())
     }
+
+    /// snapshot the applied_seq file
+    fn snapshot_applied_seq(
+        applied_seq_path: PathBuf,
+        tar: &tar_ext::BuilderExt,
+    ) -> CollectionResult<()> {
+        if applied_seq_path.exists() {
+            tar.blocking_append_file(applied_seq_path.as_path(), Path::new(APPLIED_SEQ_FILE))
+                .map_err(|err| {
+                    CollectionError::service_error(format!(
+                        "Error while archiving applied_seq: {err}"
+                    ))
+                })?;
+        }
+        Ok(())
+    }
 }
 
 /// Take a snapshot of all segments into `snapshot_dir_path`
@@ -209,36 +257,38 @@ pub fn snapshot_all_segments(
     segments_path: &Path,
     segment_config: Option<SegmentConfig>,
     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    deferred_internal_id: Option<PointOffsetType>,
     temp_dir: &Path,
     tar: &tar_ext::BuilderExt,
     format: SnapshotFormat,
     manifest: Option<&SnapshotManifest>,
-    // Update lock prevents segment operations during update.
-    // For instance, we can't unproxy segments while update operation is in progress.
-    update_lock: Arc<tokio::sync::RwLock<()>>,
 ) -> OperationResult<()> {
     // Snapshotting may take long-running read locks on segments blocking incoming writes, do
     // this through proxied segments to allow writes to continue.
-
-    let mut snapshotted_segments = HashSet::<String>::new();
 
     proxy_all_segments_and_apply(
         segments,
         segments_path,
         segment_config,
         payload_index_schema,
+        deferred_internal_id,
         |segment| {
             let read_segment = segment.read();
-            read_segment.take_snapshot(
-                temp_dir,
-                tar,
-                format,
-                manifest,
-                &mut snapshotted_segments,
-            )?;
+            let request_segment_manifest = if let Some(manifest) = manifest {
+                let segment_id = read_segment.segment_id()?;
+                Some(
+                    manifest
+                        .get(&segment_id)
+                        .map(Cow::Borrowed)
+                        .unwrap_or_else(|| Cow::Owned(SegmentManifest::empty(segment_id))),
+                )
+            } else {
+                None
+            };
+            let segment_manifest_ref = request_segment_manifest.as_deref();
+            read_segment.take_snapshot(temp_dir, tar, format, segment_manifest_ref)?;
             Ok(())
         },
-        update_lock,
     )
 }
 
@@ -265,40 +315,48 @@ pub fn snapshot_all_segments(
 ///
 /// It is recommended to provide collection parameters. The segment configuration will be
 /// sourced from it.
+///
+/// Before snapshotting all segments are forcefully flushed to ensure all data is persisted.
 pub fn proxy_all_segments_and_apply<F>(
     segments: LockedSegmentHolder,
     segments_path: &Path,
     segment_config: Option<SegmentConfig>,
     payload_index_schema: Arc<SaveOnDisk<PayloadIndexSchema>>,
+    deferred_internal_id: Option<PointOffsetType>,
     mut operation: F,
-    update_lock: Arc<tokio::sync::RwLock<()>>,
 ) -> OperationResult<()>
 where
-    F: FnMut(&RwLock<dyn SegmentEntry>) -> OperationResult<()>,
+    F: FnMut(&RwLock<dyn StorageSegmentEntry>) -> OperationResult<()>,
 {
     let segments_lock = segments.upgradable_read();
 
     // Proxy all segments
+    // Proxied segments are sorted by flush ordering
     log::trace!("Proxying all shard segments to apply function");
-    let (mut proxies, tmp_segment, mut segments_lock) = SegmentHolder::proxy_all_segments(
+    let (mut proxies, tmp_segment_id, mut segments_lock) = SegmentHolder::proxy_all_segments(
         segments_lock,
         segments_path,
         segment_config,
         payload_index_schema,
+        deferred_internal_id,
     )?;
+
+    // Flush all pending changes of each segment, now wrapped segments won't change anymore
+    segments_lock.flush_all(true, true)?;
 
     // Apply provided function
     log::trace!("Applying function on all proxied shard segments");
     let mut result = Ok(());
     let mut unproxied_segment_ids = Vec::with_capacity(proxies.len());
 
+    // Proxied segments are sorted by flush ordering, important because the operation we apply
+    // might explicitly flush segments
     for (segment_id, proxy_segment) in &proxies {
         // Get segment to snapshot
         let op_result = match proxy_segment {
             LockedSegment::Proxy(proxy_segment) => {
-                let guard = proxy_segment.read();
-                let segment = guard.wrapped_segment.get();
-                // Call provided function on wrapped segment while holding guard to parent segment
+                let wrapped_segment = proxy_segment.read().wrapped_segment.clone();
+                let segment = wrapped_segment.get();
                 operation(segment)
             }
             // All segments to snapshot should be proxy, warn if this is not the case
@@ -326,11 +384,11 @@ where
         // by `Self::unproxy_all_segments` afterwards to maintain the read consistency.
         let remaining = proxies.len() - unproxied_segment_ids.len();
         if remaining > 1 {
-            let _update_guard = update_lock.blocking_write();
             match SegmentHolder::try_unproxy_segment(
                 segments_lock,
                 *segment_id,
                 proxy_segment.clone(),
+                segments.acquire_updates_lock(),
             ) {
                 Ok(lock) => {
                     segments_lock = lock;
@@ -345,8 +403,12 @@ where
     // Unproxy all segments
     // Always do this to prevent leaving proxy segments behind
     log::trace!("Unproxying all shard segments after function is applied");
-    let _update_guard = update_lock.blocking_write();
-    SegmentHolder::unproxy_all_segments(segments_lock, proxies, tmp_segment)?;
+    SegmentHolder::unproxy_all_segments(
+        segments_lock,
+        proxies,
+        tmp_segment_id,
+        segments.acquire_updates_lock(),
+    )?;
 
     result
 }

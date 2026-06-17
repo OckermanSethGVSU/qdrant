@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use ahash::AHashMap;
 use api::rest::ShardKeySelector;
 use itertools::izip;
 use schemars::JsonSchema;
@@ -100,6 +101,7 @@ impl SplitByShard for ConditionalInsertOperationInternal {
         let ConditionalInsertOperationInternal {
             points_op,
             condition,
+            update_mode,
         } = self;
 
         let points_op = points_op.split_by_shard(ring);
@@ -113,6 +115,7 @@ impl SplitByShard for ConditionalInsertOperationInternal {
                             ConditionalInsertOperationInternal {
                                 points_op: upsert_operation,
                                 condition: condition.clone(),
+                                update_mode,
                             },
                         )
                     })
@@ -121,6 +124,7 @@ impl SplitByShard for ConditionalInsertOperationInternal {
             OperationToShard::ToAll(upsert_operation) => OperationToShard::ToAll(Self {
                 points_op: upsert_operation,
                 condition,
+                update_mode,
             }),
         }
     }
@@ -129,7 +133,7 @@ impl SplitByShard for ConditionalInsertOperationInternal {
 impl SplitByShard for BatchPersisted {
     fn split_by_shard(self, ring: &HashRingRouter) -> OperationToShard<Self> {
         let batch = self;
-        let mut batch_by_shard: HashMap<ShardId, BatchPersisted> = HashMap::new();
+        let mut batch_by_shard: AHashMap<ShardId, BatchPersisted> = AHashMap::new();
         let BatchPersisted {
             ids,
             vectors,
@@ -154,7 +158,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::Single(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::MultiDense(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!();
+                                }
                             }
                             batch.payloads.as_mut().unwrap().push(payload.clone());
                         }
@@ -176,7 +184,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::MultiDense(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::Single(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!();
+                                }
                             }
                             batch.payloads.as_mut().unwrap().push(payload.clone());
                         }
@@ -209,7 +221,11 @@ impl SplitByShard for BatchPersisted {
                                             .or_default()
                                             .push(VectorPersisted::from(vector))
                                     }
-                                    _ => unreachable!(), // TODO(sparse) propagate error
+                                    BatchVectorStructPersisted::Single(_)
+                                    | BatchVectorStructPersisted::MultiDense(_) => {
+                                        // TODO(sparse) propagate error
+                                        unreachable!();
+                                    }
                                 }
                             }
                             batch.payloads.as_mut().unwrap().push(payload.clone());
@@ -235,7 +251,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::Single(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::MultiDense(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!();
+                                }
                             }
                         }
                     }
@@ -256,7 +276,11 @@ impl SplitByShard for BatchPersisted {
                                 BatchVectorStructPersisted::MultiDense(vectors) => {
                                     vectors.push(vector.clone())
                                 }
-                                _ => unreachable!(), // TODO(sparse) propagate error
+                                BatchVectorStructPersisted::Single(_)
+                                | BatchVectorStructPersisted::Named(_) => {
+                                    // TODO(sparse) propagate error
+                                    unreachable!()
+                                }
                             }
                         }
                     }
@@ -288,7 +312,11 @@ impl SplitByShard for BatchPersisted {
                                             .or_default()
                                             .push(VectorPersisted::from(vector))
                                     }
-                                    _ => unreachable!(), // TODO(sparse) propagate error
+                                    BatchVectorStructPersisted::Single(_)
+                                    | BatchVectorStructPersisted::MultiDense(_) => {
+                                        // TODO(sparse) propagate error
+                                        unreachable!();
+                                    }
                                 }
                             }
                         }
@@ -394,6 +422,7 @@ mod tests {
             },
             shard_key: None,
             update_filter: None,
+            update_mode: None,
         });
         assert!(batch.validate().is_err());
 
@@ -405,6 +434,7 @@ mod tests {
             },
             shard_key: None,
             update_filter: None,
+            update_mode: None,
         });
         assert!(batch.validate().is_ok());
 
@@ -416,6 +446,7 @@ mod tests {
             },
             shard_key: None,
             update_filter: None,
+            update_mode: None,
         });
         assert!(batch.validate().is_err());
     }

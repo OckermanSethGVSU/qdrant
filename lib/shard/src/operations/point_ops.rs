@@ -1,12 +1,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt::{Debug, Formatter};
 use std::hash::{Hash, Hasher};
-use std::{iter, mem};
+use std::mem;
 
-use api::conversions::json::payload_to_proto;
-use api::rest::{
-    DenseVector, MultiDenseVector, ShardKeySelector, VectorOutput, VectorStructOutput,
-};
 use common::validation::validate_multi_vector;
 use itertools::Itertools as _;
 use ordered_float::OrderedFloat;
@@ -14,33 +10,48 @@ use schemars::JsonSchema;
 use segment::common::operation_error::OperationError;
 use segment::common::utils::unordered_hash_unique;
 use segment::data_types::named_vectors::NamedVectors;
+use segment::data_types::segment_record::SegmentRecord;
 use segment::data_types::vectors::{
-    BatchVectorStructInternal, DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, VectorInternal,
-    VectorStructInternal,
+    BatchVectorStructInternal, DEFAULT_VECTOR_NAME, DenseVector, MultiDenseVector,
+    MultiDenseVectorInternal, VectorInternal, VectorStructInternal,
 };
 use segment::types::{Filter, Payload, PointIdType, VectorNameBuf};
 use serde::{Deserialize, Serialize};
 use sparse::common::types::{DimId, DimWeight};
 use strum::{EnumDiscriminants, EnumIter};
-use tonic::Status;
 use validator::{Validate, ValidationErrors};
 
-use super::payload_ops::*;
-use super::vector_ops::*;
-use super::*;
+/// Defines the mode of the upsert operation
+///
+/// * `Upsert` - default mode, insert new points, update existing points
+/// * `InsertOnly` - only insert new points, do not update existing points
+/// * `UpdateOnly` - only update existing points, do not insert new points
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Deserialize, Serialize, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    // Default mode - insert new points, update existing points
+    #[default]
+    Upsert,
+    // Only insert new points, do not update existing points
+    InsertOnly,
+    // Only update existing points, do not insert new points
+    UpdateOnly,
+}
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema, Validate, Hash)]
 #[serde(rename_all = "snake_case")]
 pub struct PointIdsList {
     pub points: Vec<PointIdType>,
+    #[cfg(feature = "api")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shard_key: Option<ShardKeySelector>,
+    pub shard_key: Option<api::rest::ShardKeySelector>,
 }
 
 impl From<Vec<PointIdType>> for PointIdsList {
     fn from(points: Vec<PointIdType>) -> Self {
         Self {
             points,
+            #[cfg(feature = "api")]
             shard_key: None,
         }
     }
@@ -108,16 +119,6 @@ pub enum PointOperations {
 }
 
 impl PointOperations {
-    pub fn is_write_operation(&self) -> bool {
-        match self {
-            PointOperations::UpsertPoints(_) => true,
-            PointOperations::UpsertPointsConditional(_) => true,
-            PointOperations::DeletePoints { .. } => false,
-            PointOperations::DeletePointsByFilter(_) => false,
-            PointOperations::SyncPoints(_) => true,
-        }
-    }
-
     pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
             Self::UpsertPoints(op) => Some(op.point_ids()),
@@ -233,149 +234,6 @@ impl PointInsertOperationsInternal {
             Self::PointsList(points) => points.retain(|point| filter(&point.id)),
         }
     }
-
-    pub fn into_update_only(
-        self,
-        update_filter: Option<Filter>,
-    ) -> Vec<CollectionUpdateOperations> {
-        let mut operations = Vec::new();
-
-        match self {
-            Self::PointsBatch(batch) => {
-                let mut update_vectors = UpdateVectorsOp {
-                    points: Vec::new(),
-                    update_filter: update_filter.clone(),
-                };
-
-                match batch.vectors {
-                    BatchVectorStructPersisted::Single(vectors) => {
-                        let ids = batch.ids.iter().copied();
-                        let vectors = vectors.into_iter().map(VectorStructPersisted::Single);
-
-                        update_vectors.points = ids
-                            .zip(vectors)
-                            .map(|(id, vector)| PointVectorsPersisted { id, vector })
-                            .collect();
-                    }
-
-                    BatchVectorStructPersisted::MultiDense(vectors) => {
-                        let ids = batch.ids.iter().copied();
-                        let vectors = vectors.into_iter().map(VectorStructPersisted::MultiDense);
-
-                        update_vectors.points = ids
-                            .zip(vectors)
-                            .map(|(id, vector)| PointVectorsPersisted { id, vector })
-                            .collect();
-                    }
-
-                    BatchVectorStructPersisted::Named(batch_vectors) => {
-                        let ids = batch.ids.iter().copied();
-
-                        let mut batch_vectors: HashMap<_, _> = batch_vectors
-                            .into_iter()
-                            .map(|(name, vectors)| (name, vectors.into_iter()))
-                            .collect();
-
-                        let vectors = iter::repeat(()).filter_map(move |_| {
-                            let mut point_vectors =
-                                HashMap::with_capacity(batch_vectors.capacity());
-
-                            for (vector_name, vectors) in batch_vectors.iter_mut() {
-                                point_vectors.insert(vector_name.clone(), vectors.next()?);
-                            }
-
-                            Some(VectorStructPersisted::Named(point_vectors))
-                        });
-
-                        update_vectors.points = ids
-                            .zip(vectors)
-                            .map(|(id, vector)| PointVectorsPersisted { id, vector })
-                            .collect();
-                    }
-                }
-
-                let update_vectors = vector_ops::VectorOperations::UpdateVectors(update_vectors);
-                let update_vectors = CollectionUpdateOperations::VectorOperation(update_vectors);
-
-                operations.push(update_vectors);
-
-                if let Some(payloads) = batch.payloads {
-                    let ids = batch.ids.iter().copied();
-
-                    for (id, payload) in ids.zip(payloads) {
-                        if let Some(payload) = payload {
-                            let set_payload = if let Some(update_filter) = update_filter.clone() {
-                                SetPayloadOp {
-                                    points: None,
-                                    payload,
-                                    filter: Some(update_filter.with_point_ids(vec![id])),
-                                    key: None,
-                                }
-                            } else {
-                                SetPayloadOp {
-                                    points: Some(vec![id]),
-                                    payload,
-                                    filter: None,
-                                    key: None,
-                                }
-                            };
-
-                            let set_payload =
-                                payload_ops::PayloadOps::OverwritePayload(set_payload);
-                            let set_payload =
-                                CollectionUpdateOperations::PayloadOperation(set_payload);
-
-                            operations.push(set_payload);
-                        }
-                    }
-                }
-            }
-
-            Self::PointsList(points) => {
-                let mut update_vectors = UpdateVectorsOp {
-                    points: Vec::new(),
-                    update_filter: update_filter.clone(),
-                };
-
-                for point in points {
-                    update_vectors.points.push(PointVectorsPersisted {
-                        id: point.id,
-                        vector: point.vector,
-                    });
-
-                    if let Some(payload) = point.payload {
-                        let set_payload = if let Some(update_filter) = update_filter.clone() {
-                            SetPayloadOp {
-                                points: None,
-                                payload,
-                                filter: Some(update_filter.with_point_ids(vec![point.id])),
-                                key: None,
-                            }
-                        } else {
-                            SetPayloadOp {
-                                points: Some(vec![point.id]),
-                                payload,
-                                filter: None,
-                                key: None,
-                            }
-                        };
-
-                        let set_payload = payload_ops::PayloadOps::OverwritePayload(set_payload);
-                        let set_payload = CollectionUpdateOperations::PayloadOperation(set_payload);
-
-                        operations.push(set_payload);
-                    }
-                }
-
-                let update_vectors = vector_ops::VectorOperations::UpdateVectors(update_vectors);
-                let update_vectors = CollectionUpdateOperations::VectorOperation(update_vectors);
-
-                operations.insert(0, update_vectors);
-            }
-        }
-
-        operations
-    }
 }
 
 impl From<BatchPersisted> for PointInsertOperationsInternal {
@@ -395,6 +253,9 @@ pub struct ConditionalInsertOperationInternal {
     pub points_op: PointInsertOperationsInternal,
     /// Condition to check, if the point already exists
     pub condition: Filter,
+    /// Mode of the upsert operation. If None, defaults to Upsert behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<UpdateMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, Hash)]
@@ -414,8 +275,9 @@ pub struct BatchPersisted {
     pub payloads: Option<Vec<Option<Payload>>>,
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<BatchPersisted> for Vec<api::grpc::qdrant::PointStruct> {
-    type Error = Status;
+    type Error = tonic::Status;
 
     fn try_from(batch: BatchPersisted) -> Result<Self, Self::Error> {
         let BatchPersisted {
@@ -432,10 +294,10 @@ impl TryFrom<BatchPersisted> for Vec<api::grpc::qdrant::PointStruct> {
             let payload = payloads.as_ref().and_then(|payloads| {
                 payloads.get(i).map(|payload| match payload {
                     None => HashMap::new(),
-                    Some(payload) => payload_to_proto(payload.clone()),
+                    Some(payload) => api::conversions::json::payload_to_proto(payload.clone()),
                 })
             });
-            let vectors: Option<VectorStructInternal> = vector.map(|v| v.into());
+            let vectors: Option<VectorStructInternal> = vector.map(NamedVectors::into);
 
             let point = api::grpc::qdrant::PointStruct {
                 id,
@@ -535,8 +397,41 @@ impl PointStructPersisted {
         }
         named_vectors
     }
+
+    pub fn is_equal_to(&self, segment_record: &SegmentRecord) -> bool {
+        let SegmentRecord {
+            id,
+            vectors,
+            payload,
+        } = segment_record;
+
+        if &self.id != id {
+            return false;
+        }
+
+        let self_vectors = self.get_vectors().into_owned_map();
+
+        if let Some(segment_vectors) = vectors {
+            if self_vectors.len() != segment_vectors.len() {
+                return false;
+            }
+            for (name, vec) in segment_vectors {
+                if self_vectors.get(name) != Some(vec) {
+                    return false;
+                }
+            }
+        } else if !self_vectors.is_empty() {
+            return false;
+        }
+
+        // Check if payloads are equal, empty and non-existent payloads are considered equal
+        let self_payload = self.payload.as_ref().filter(|p| !p.is_empty());
+        let segment_payload = payload.as_ref().filter(|p| !p.is_empty());
+        self_payload == segment_payload
+    }
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<api::rest::schema::Record> for PointStructPersisted {
     type Error = String;
 
@@ -561,8 +456,9 @@ impl TryFrom<api::rest::schema::Record> for PointStructPersisted {
     }
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<PointStructPersisted> for api::grpc::qdrant::PointStruct {
-    type Error = Status;
+    type Error = tonic::Status;
 
     fn try_from(value: PointStructPersisted) -> Result<Self, Self::Error> {
         let PointStructPersisted {
@@ -571,13 +467,14 @@ impl TryFrom<PointStructPersisted> for api::grpc::qdrant::PointStruct {
             payload,
         } = value;
 
-        let vectors_internal = VectorStructInternal::try_from(vector)
-            .map_err(|e| Status::invalid_argument(format!("Failed to convert vectors: {e}")))?;
+        let vectors_internal = VectorStructInternal::try_from(vector).map_err(|e| {
+            tonic::Status::invalid_argument(format!("Failed to convert vectors: {e}"))
+        })?;
 
         let vectors = api::grpc::qdrant::Vectors::from(vectors_internal);
         let converted_payload = match payload {
             None => HashMap::new(),
-            Some(payload) => payload_to_proto(payload),
+            Some(payload) => api::conversions::json::payload_to_proto(payload),
         };
 
         Ok(Self {
@@ -698,12 +595,15 @@ impl From<VectorStructInternal> for VectorStructPersisted {
     }
 }
 
-impl From<VectorStructOutput> for VectorStructPersisted {
-    fn from(value: VectorStructOutput) -> Self {
+#[cfg(feature = "api")]
+impl From<api::rest::VectorStructOutput> for VectorStructPersisted {
+    fn from(value: api::rest::VectorStructOutput) -> Self {
         match value {
-            VectorStructOutput::Single(vector) => VectorStructPersisted::Single(vector),
-            VectorStructOutput::MultiDense(vector) => VectorStructPersisted::MultiDense(vector),
-            VectorStructOutput::Named(vectors) => VectorStructPersisted::Named(
+            api::rest::VectorStructOutput::Single(vector) => VectorStructPersisted::Single(vector),
+            api::rest::VectorStructOutput::MultiDense(vector) => {
+                VectorStructPersisted::MultiDense(vector)
+            }
+            api::rest::VectorStructOutput::Named(vectors) => VectorStructPersisted::Named(
                 vectors
                     .into_iter()
                     .map(|(k, v)| (k, VectorPersisted::from(v)))
@@ -865,12 +765,13 @@ impl From<VectorInternal> for VectorPersisted {
     }
 }
 
-impl From<VectorOutput> for VectorPersisted {
-    fn from(value: VectorOutput) -> Self {
+#[cfg(feature = "api")]
+impl From<api::rest::VectorOutput> for VectorPersisted {
+    fn from(value: api::rest::VectorOutput) -> Self {
         match value {
-            VectorOutput::Dense(vector) => VectorPersisted::Dense(vector),
-            VectorOutput::Sparse(vector) => VectorPersisted::Sparse(vector),
-            VectorOutput::MultiDense(vector) => VectorPersisted::MultiDense(vector),
+            api::rest::VectorOutput::Dense(vector) => VectorPersisted::Dense(vector),
+            api::rest::VectorOutput::Sparse(vector) => VectorPersisted::Sparse(vector),
+            api::rest::VectorOutput::MultiDense(vector) => VectorPersisted::MultiDense(vector),
         }
     }
 }

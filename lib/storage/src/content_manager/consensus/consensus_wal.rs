@@ -1,9 +1,10 @@
+use std::cmp;
 use std::path::Path;
-use std::{cmp, fs};
 
+use fs_err as fs;
 use prost_for_raft::Message;
-use protobuf::Message as _;
 use raft::eraftpb::Entry as RaftEntry;
+use raft::protocompat::PbMessageExt as _;
 use wal::Wal;
 
 use crate::StorageError;
@@ -45,7 +46,9 @@ impl ConsensusOpWal {
     }
 
     pub fn clear(&mut self) -> Result<(), StorageError> {
+        log::debug!("Clearing consensus WAL");
         self.wal.clear()?;
+        self.wal.flush_open_segment()?;
         Ok(())
     }
 
@@ -191,7 +194,6 @@ impl ConsensusOpWal {
 
                 // Check that new entry index is sequential (it's not greater than next WAL index),
                 // or truncate entries at the tail of WAL, if it overwrites some
-                #[allow(clippy::comparison_chain)] // stupid ahh diagnostics 🙄
                 if new_entry_wal_index > next_wal_index {
                     return Err(StorageError::service_error(format!(
                         "Can't append entry with Raft index {} (expected WAL index {}), \
@@ -294,7 +296,10 @@ impl ConsensusOpWal {
         );
 
         log::debug!(
-            "Compacting WAL until Raft index {until_raft_index}, WAL index {compact_until_wal_index}",
+            "Compacting WAL until Raft index {until_raft_index}/WAL index {compact_until_wal_index} \
+             (first WAL index {}, WAL size {})",
+            offset.wal_index,
+            self.wal.num_entries(),
         );
 
         // Compact WAL

@@ -2,11 +2,11 @@ use common::types::ScoreType;
 use half::f16;
 use num_traits::Float;
 
-use crate::data_types::vectors::{DenseVector, VectorElementTypeHalf};
+use crate::data_types::vectors::{DenseVector, TypedDenseVector, VectorElementTypeHalf};
 use crate::spaces::metric::Metric;
 #[cfg(target_arch = "x86_64")]
 use crate::spaces::metric_f16::avx::euclid::avx_euclid_similarity_half;
-#[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[cfg(all(target_arch = "aarch64", target_feature = "neon", not(windows)))]
 use crate::spaces::metric_f16::neon::euclid::neon_euclid_similarity_half;
 #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
 use crate::spaces::metric_f16::sse::euclid::sse_euclid_similarity_half;
@@ -39,7 +39,7 @@ impl Metric<VectorElementTypeHalf> for EuclidMetric {
             }
         }
 
-        #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+        #[cfg(all(target_arch = "aarch64", target_feature = "neon", not(windows)))]
         {
             if std::arch::is_aarch64_feature_detected!("neon")
                 && std::arch::is_aarch64_feature_detected!("fp16")
@@ -50,6 +50,13 @@ impl Metric<VectorElementTypeHalf> for EuclidMetric {
         }
 
         euclid_similarity_half(v1, v2)
+    }
+
+    fn query_similarity(
+        query: &TypedDenseVector<VectorElementTypeHalf>,
+        vector: &[VectorElementTypeHalf],
+    ) -> ScoreType {
+        Self::similarity(query, vector)
     }
 
     fn preprocess(vector: DenseVector) -> DenseVector {

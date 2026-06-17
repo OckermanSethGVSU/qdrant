@@ -7,7 +7,6 @@ use half::f16;
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use schemars::JsonSchema;
-use serde::ser::SerializeStruct;
 use serde::{Deserialize, Serialize};
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::types::DimId;
@@ -17,8 +16,11 @@ use super::named_vectors::NamedVectors;
 use super::primitive::PrimitiveVectorElement;
 use crate::common::operation_error::{OperationError, OperationResult};
 use crate::common::utils::transpose_map_into_named_vector;
+use crate::data_types::segment_record::NamedVectorsOwned;
 use crate::types::{VectorName, VectorNameBuf};
-use crate::vector_storage::query::{ContextQuery, DiscoveryQuery, RecoQuery, TransformInto};
+use crate::vector_storage::query::{
+    ContextQuery, DiscoverQuery, NaiveFeedbackQuery, RecoQuery, TransformInto,
+};
 
 /// How many dimensions of a sparse vector are considered to be a single unit for cost estimation.
 const SPARSE_DIMS_COST_UNIT: usize = 64;
@@ -262,6 +264,9 @@ pub type TypedDenseVector<T> = Vec<T>;
 pub type DenseVector = TypedDenseVector<VectorElementType>;
 
 /// Type for multi dense vector
+pub type MultiDenseVector = Vec<DenseVector>;
+
+/// Type for multi dense vector
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct TypedMultiDenseVector<T> {
     pub flattened_vectors: TypedDenseVector<T>, // vectors are flattened into a single vector
@@ -271,18 +276,15 @@ pub struct TypedMultiDenseVector<T> {
 impl<T> TypedMultiDenseVector<T> {
     pub fn try_from_flatten(vectors: Vec<T>, dim: usize) -> Result<Self, OperationError> {
         if dim == 0 {
-            return Err(OperationError::ValidationError {
-                description: "MultiDenseVector cannot have zero dimension".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "MultiDenseVector cannot have zero dimension",
+            ));
         }
         if !vectors.len().is_multiple_of(dim) || vectors.is_empty() {
-            return Err(OperationError::ValidationError {
-                description: format!(
-                    "Invalid multi-vector length: {}, expected multiple of {}",
-                    vectors.len(),
-                    dim
-                ),
-            });
+            return Err(OperationError::validation_error(format!(
+                "Invalid multi-vector length: {}, expected multiple of {dim}",
+                vectors.len()
+            )));
         }
 
         Ok(TypedMultiDenseVector {
@@ -293,15 +295,15 @@ impl<T> TypedMultiDenseVector<T> {
 
     pub fn try_from_matrix(matrix: Vec<Vec<T>>) -> Result<Self, OperationError> {
         if matrix.is_empty() {
-            return Err(OperationError::ValidationError {
-                description: "MultiDenseVector cannot be empty".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "MultiDenseVector cannot be empty",
+            ));
         }
         let dim = matrix[0].len();
         if dim == 0 {
-            return Err(OperationError::ValidationError {
-                description: "MultiDenseVector cannot have zero dimension".to_string(),
-            });
+            return Err(OperationError::validation_error(
+                "MultiDenseVector cannot have zero dimension",
+            ));
         }
         // assert all vectors have the same dimension
         if let Some(bad_vec) = matrix.iter().find(|v| v.len() != dim) {
@@ -419,6 +421,15 @@ pub struct TypedMultiDenseVectorRef<'a, T> {
 }
 
 impl<'a, T: PrimitiveVectorElement> TypedMultiDenseVectorRef<'a, T> {
+    pub fn new(flattened_vectors: &'a [T], dim: usize) -> Self {
+        debug_assert_eq!(flattened_vectors.len() % dim, 0);
+
+        Self {
+            flattened_vectors,
+            dim,
+        }
+    }
+
     /// Slices the multi vector into the underlying individual vectors
     pub fn multi_vectors(self) -> impl Iterator<Item = &'a [T]> {
         self.flattened_vectors.chunks_exact(self.dim)
@@ -579,6 +590,29 @@ impl From<NamedVectors<'_>> for VectorStructInternal {
     }
 }
 
+impl From<NamedVectorsOwned> for VectorStructInternal {
+    fn from(v: NamedVectorsOwned) -> Self {
+        if v.len() == 1 {
+            let (name, vector_internal) = v.into_iter().next().unwrap();
+            if name != DEFAULT_VECTOR_NAME {
+                return VectorStructInternal::Named(HashMap::from([(name, vector_internal)]));
+            }
+            match vector_internal {
+                VectorInternal::Dense(v) => VectorStructInternal::Single(v),
+                VectorInternal::Sparse(v) => {
+                    debug_assert!(false, "Sparse vector cannot be default");
+                    let mut map = HashMap::new();
+                    map.insert(DEFAULT_VECTOR_NAME.to_owned(), VectorInternal::Sparse(v));
+                    VectorStructInternal::Named(map)
+                }
+                VectorInternal::MultiDense(v) => VectorStructInternal::MultiDense(v),
+            }
+        } else {
+            VectorStructInternal::Named(v.into_iter().collect())
+        }
+    }
+}
+
 impl VectorStructInternal {
     pub fn get(&self, name: &VectorName) -> Option<VectorRef<'_>> {
         match self {
@@ -691,19 +725,6 @@ impl Named for NamedVectorStruct {
 }
 
 impl NamedVectorStruct {
-    pub fn new_from_vector(vector: VectorInternal, name: impl Into<VectorNameBuf>) -> Self {
-        let name = name.into();
-        match vector {
-            VectorInternal::Dense(vector) => NamedVectorStruct::Dense(NamedVector { name, vector }),
-            VectorInternal::Sparse(vector) => {
-                NamedVectorStruct::Sparse(NamedSparseVector { name, vector })
-            }
-            VectorInternal::MultiDense(vector) => {
-                NamedVectorStruct::MultiDense(NamedMultiDenseVector { name, vector })
-            }
-        }
-    }
-
     pub fn get_vector(&self) -> VectorRef<'_> {
         match self {
             NamedVectorStruct::Default(v) => v.as_slice().into(),
@@ -756,7 +777,7 @@ impl BatchVectorStructInternal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Hash)]
 pub struct NamedQuery<TQuery> {
     pub query: TQuery,
     pub using: Option<VectorNameBuf>,
@@ -771,10 +792,10 @@ impl NamedQuery<VectorInternal> {
     }
 }
 
-impl<TVector> NamedQuery<TVector> {
-    pub fn new_from_vector(vector: TVector, using: impl Into<String>) -> NamedQuery<TVector> {
+impl<TQuery> NamedQuery<TQuery> {
+    pub fn new(query: TQuery, using: impl Into<String>) -> NamedQuery<TQuery> {
         NamedQuery {
-            query: vector,
+            query,
             using: Some(using.into()),
         }
     }
@@ -815,41 +836,14 @@ impl<T: Validate> Validate for NamedQuery<T> {
     }
 }
 
-impl<T: Serialize> Serialize for NamedQuery<T> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: serde::Serializer,
-    {
-        let Self { query, using } = self;
-        let mut state = serializer.serialize_struct("NamedQuery", 2)?;
-        state.serialize_field("query", query)?;
-        state.serialize_field("using", using)?;
-        state.end()
-    }
-}
-
-impl<T: Hash> Hash for NamedQuery<T> {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        let Self { query, using } = self;
-        query.hash(state);
-        using.hash(state);
-    }
-}
-
-impl NamedQuery<RecoQuery<VectorInternal>> {
-    pub fn new(query: RecoQuery<VectorInternal>, using: Option<VectorNameBuf>) -> Self {
-        // TODO: maybe validate there is no sparse vector without vector name
-        NamedQuery { query, using }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub enum QueryVector {
     Nearest(VectorInternal),
     RecommendBestScore(RecoQuery<VectorInternal>),
     RecommendSumScores(RecoQuery<VectorInternal>),
-    Discovery(DiscoveryQuery<VectorInternal>),
+    Discover(DiscoverQuery<VectorInternal>),
     Context(ContextQuery<VectorInternal>),
+    FeedbackNaive(NaiveFeedbackQuery<VectorInternal>),
 }
 
 impl TransformInto<QueryVector, VectorInternal, VectorInternal> for QueryVector {
@@ -865,8 +859,9 @@ impl TransformInto<QueryVector, VectorInternal, VectorInternal> for QueryVector 
             QueryVector::RecommendSumScores(v) => {
                 Ok(QueryVector::RecommendSumScores(v.transform(&mut f)?))
             }
-            QueryVector::Discovery(v) => Ok(QueryVector::Discovery(v.transform(&mut f)?)),
+            QueryVector::Discover(v) => Ok(QueryVector::Discover(v.transform(&mut f)?)),
             QueryVector::Context(v) => Ok(QueryVector::Context(v.transform(&mut f)?)),
+            QueryVector::FeedbackNaive(v) => Ok(QueryVector::FeedbackNaive(v.transform(&mut f)?)),
         }
     }
 }

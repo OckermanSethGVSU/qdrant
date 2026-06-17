@@ -5,13 +5,12 @@ use std::time::Duration;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use futures::{TryFutureExt, future};
 use itertools::{Either, Itertools};
-use rand::Rng;
+use rand::RngExt;
 use segment::common::reciprocal_rank_fusion::rrf_scoring;
 use segment::common::score_fusion::{ScoreFusion, score_fusion};
 use segment::data_types::vectors::VectorStructInternal;
 use segment::types::{Order, ScoredPoint, WithPayloadInterface, WithVector};
 use segment::utils::scored_point_ties::ScoredPointTies;
-use tokio::sync::RwLockReadGuard;
 use tokio::time::Instant;
 
 use super::Collection;
@@ -28,7 +27,7 @@ use crate::operations::shard_selector_internal::ShardSelectorInternal;
 use crate::operations::types::{CollectionError, CollectionResult};
 use crate::operations::universal_query::collection_query::CollectionQueryRequest;
 use crate::operations::universal_query::shard_query::{
-    FusionInternal, MmrInternal, ScoringQuery, ShardQueryRequest, ShardQueryResponse,
+    self, FusionInternal, MmrInternal, ScoringQuery, ShardQueryRequest, ShardQueryResponse,
 };
 
 /// A factor which determines if we need to use the 2-step search or not.
@@ -119,7 +118,7 @@ impl Collection {
             let mut new_request = request.clone();
             let request_limit = new_request.limit + new_request.offset;
 
-            let is_exact = request.params.as_ref().map(|p| p.exact).unwrap_or(false);
+            let is_exact = request.params.as_ref().is_some_and(|p| p.exact);
 
             if is_exact || request_limit < Self::SHARD_QUERY_SUBSAMPLING_LIMIT {
                 new_requests.push(new_request);
@@ -220,11 +219,20 @@ impl Collection {
 
         let metadata_required = is_payload_required || with_vectors;
 
-        let sum_limits: usize = requests_batch.iter().map(|s| s.limit).sum();
-        let sum_offsets: usize = requests_batch.iter().map(|s| s.offset).sum();
+        let sum_limits: usize = requests_batch
+            .iter()
+            .fold(0usize, |acc, s| acc.saturating_add(s.limit));
+        let sum_offsets: usize = requests_batch
+            .iter()
+            .fold(0usize, |acc, s| acc.saturating_add(s.offset));
 
         // Number of records we need to retrieve to fill the search result.
-        let require_transfers = self.shards_holder.read().await.len() * (sum_limits + sum_offsets);
+        let require_transfers = self
+            .shards_holder
+            .read()
+            .await
+            .len()
+            .saturating_mul(sum_limits.saturating_add(sum_offsets));
         // Actually used number of records.
         let used_transfers = sum_limits;
 
@@ -255,10 +263,8 @@ impl Collection {
                 .await?;
             // update timeout
             let timeout = timeout.map(|t| t.saturating_sub(start.elapsed()));
-            let filled_results = without_payload_results
-                .into_iter()
-                .zip(requests_batch.into_iter())
-                .map(|(without_payload_result, req)| {
+            let filled_results = without_payload_results.into_iter().zip(requests_batch).map(
+                |(without_payload_result, req)| {
                     self.fill_search_result_with_payload(
                         without_payload_result,
                         Some(req.with_payload),
@@ -268,7 +274,8 @@ impl Collection {
                         timeout,
                         hw_measurement_acc.clone(),
                     )
-                });
+                },
+            );
             future::try_join_all(filled_results).await
         } else {
             self.do_query_batch_impl(
@@ -309,6 +316,7 @@ impl Collection {
             .zip(requests_batch.iter())
             .map(|(shards_results, request)| async {
                 // shards_results shape: [num_shards, num_intermediate_results, num_points]
+                // merged_intermediates shape: [num_intermediate_results, num_points]
                 let merged_intermediates = self
                     .merge_intermediate_results_from_shards(request, shards_results)
                     .await?;
@@ -361,7 +369,12 @@ impl Collection {
             Some(ScoringQuery::Fusion(fusion)) => {
                 // If the root query is a Fusion, the returned results correspond to each the prefetches.
                 let mut fused = match fusion {
-                    FusionInternal::RrfK(k) => rrf_scoring(intermediates, *k),
+                    FusionInternal::Rrf { k, weights } => {
+                        let weights_slice = weights
+                            .as_ref()
+                            .map(|w| w.iter().map(|f| f.into_inner()).collect::<Vec<_>>());
+                        rrf_scoring(intermediates, *k, weights_slice.as_deref())?
+                    }
                     FusionInternal::Dbsf => score_fusion(intermediates, ScoreFusion::dbsf()),
                 };
                 if let Some(&score_threshold) = score_threshold.as_ref() {
@@ -406,7 +419,11 @@ impl Collection {
                 };
                 mmr_result
             }
-            _ => {
+            None
+            | Some(ScoringQuery::Vector(_))
+            | Some(ScoringQuery::OrderBy(_))
+            | Some(ScoringQuery::Formula(_))
+            | Some(ScoringQuery::Sample(_)) => {
                 // Otherwise, it will be a list with a single list of scored points.
                 debug_assert_eq!(intermediates.len(), 1);
                 intermediates.pop().ok_or_else(|| {
@@ -425,7 +442,7 @@ impl Collection {
     /// To be called on the user-responding instance. Resolves ids into vectors, and merges the results from local and remote shards.
     ///
     /// This function is used to query the collection. It will return a list of scored points.
-    pub async fn query_batch<'a, F, Fut>(
+    pub async fn query_batch<F, Fut>(
         &self,
         requests_batch: Vec<(CollectionQueryRequest, ShardSelectorInternal)>,
         collection_by_name: F,
@@ -435,7 +452,7 @@ impl Collection {
     ) -> CollectionResult<Vec<Vec<ScoredPoint>>>
     where
         F: Fn(String) -> Fut,
-        Fut: Future<Output = Option<RwLockReadGuard<'a, Collection>>>,
+        Fut: Future<Output = Option<Arc<Collection>>>,
     {
         let start = Instant::now();
 
@@ -618,7 +635,8 @@ impl Collection {
             query_infos.into_iter().zip(all_shards_result_by_transposed)
         {
             // `shards_results` shape: [num_shards, num_scored_points]
-            let order = ScoringQuery::order(query_info.scoring_query, &collection_params)?;
+            let order =
+                shard_query::query_result_order(query_info.scoring_query, &collection_params)?;
             let number_of_shards = shards_results.len();
 
             // Equivalent to:

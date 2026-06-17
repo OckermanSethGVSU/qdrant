@@ -17,7 +17,7 @@ use collection::operations::types::{
 use collection::operations::vector_params_builder::VectorParamsBuilder;
 use collection::shards::channel_service::ChannelService;
 use collection::shards::collection_shard_distribution::CollectionShardDistribution;
-use collection::shards::replica_set::ReplicaState;
+use collection::shards::replica_set::replica_set_state::ReplicaState;
 use common::budget::ResourceBudget;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::flags::{FeatureFlags, init_feature_flags};
@@ -32,7 +32,7 @@ use crate::common::{
     dummy_request_shard_transfer,
 };
 
-// RUST_LOG=trace cargo nextest run --all continuous --nocapture
+// RUST_LOG=trace cargo nextest run --workspace continuous --nocapture
 #[tokio::test(flavor = "multi_thread")]
 async fn test_continuous_snapshot() {
     // Initialize logger for tests
@@ -80,7 +80,7 @@ async fn test_continuous_snapshot() {
         Arc::new(storage_config),
         shard_distribution,
         None,
-        ChannelService::new(REST_PORT, None),
+        ChannelService::new(REST_PORT, false, None, None),
         dummy_on_replica_failure(),
         dummy_request_shard_transfer(),
         dummy_abort_shard_transfer(),
@@ -113,20 +113,21 @@ async fn test_continuous_snapshot() {
                 // Delete all points
                 let delete_points =
                     CollectionUpdateOperations::PointOperation(PointOperations::DeletePoints {
-                        ids: (0..points_count).map(|i| i.into()).collect(),
+                        ids: (0..points_count).map(u64::into).collect(),
                     });
-                let hw_counter = HwMeasurementAcc::disposable();
+                let hw_counter = HwMeasurementAcc::new();
                 collection
                     .update_from_client_simple(
                         delete_points,
                         true,
+                        None,
                         WriteOrdering::default(),
                         hw_counter,
                     )
                     .await?;
 
+                // Insert one point at a time
                 for i in 0..points_count {
-                    // Insert one point at a time
                     let point = PointStructPersisted {
                         id: i.into(),
                         vector: VectorStructPersisted::Single(vec![i as f32, 0.0, 0.0, 0.0]),
@@ -136,11 +137,12 @@ async fn test_continuous_snapshot() {
                         CollectionUpdateOperations::PointOperation(PointOperations::UpsertPoints(
                             PointInsertOperationsInternal::PointsList(vec![point]),
                         ));
-                    let hw_counter = HwMeasurementAcc::disposable();
+                    let hw_counter = HwMeasurementAcc::new();
                     let insert = collection
                         .update_from_client_simple(
                             insert_points,
                             true,
+                            None,
                             WriteOrdering::default(),
                             hw_counter,
                         )
@@ -155,7 +157,7 @@ async fn test_continuous_snapshot() {
                         with_payload: None,
                         with_vector: WithVector::Bool(false),
                     };
-                    let hw_counter = HwMeasurementAcc::disposable();
+                    let hw_counter = HwMeasurementAcc::new();
                     let retrieve_result = collection
                         .retrieve(
                             retrieve_point,
@@ -181,16 +183,39 @@ async fn test_continuous_snapshot() {
                             key: None,
                         }),
                     );
-                    let hw_counter = HwMeasurementAcc::disposable();
+                    let hw_counter = HwMeasurementAcc::new();
                     let set_result = collection
                         .update_from_client_simple(
                             set_payload,
                             true,
+                            None,
                             WriteOrdering::default(),
                             hw_counter,
                         )
                         .await?;
                     assert_eq!(set_result.status, UpdateStatus::Completed);
+                }
+
+                // Retrieve one point at a time again with payload & vector
+                for i in 0..points_count {
+                    let retrieve_point = PointRequestInternal {
+                        ids: vec![i.into()],
+                        with_payload: Some(true.into()),
+                        with_vector: WithVector::Bool(true),
+                    };
+                    let hw_counter = HwMeasurementAcc::new();
+                    let retrieve_result = collection
+                        .retrieve(
+                            retrieve_point,
+                            None,
+                            &ShardSelectorInternal::All,
+                            None,
+                            hw_counter,
+                        )
+                        .await?;
+                    assert_eq!(retrieve_result.len(), 1);
+                    assert!(retrieve_result[0].vector.is_some(), "missing vector");
+                    assert!(retrieve_result[0].payload.is_some(), "missing payload");
                 }
             }
             CollectionResult::Ok(())
@@ -213,7 +238,7 @@ async fn test_continuous_snapshot() {
         })
     };
 
-    let timeout = sleep(Duration::from_secs(20));
+    let timeout = sleep(Duration::from_secs(10));
     tokio::pin!(timeout);
 
     tokio::select! {

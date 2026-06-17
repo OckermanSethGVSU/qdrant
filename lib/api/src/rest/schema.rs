@@ -8,22 +8,35 @@ use ordered_float::NotNan;
 use schemars::JsonSchema;
 use segment::common::utils::MaybeOneOrMany;
 use segment::data_types::index::{StemmingAlgorithm, StopwordsInterface, TokenizerType};
-use segment::data_types::order_by::OrderBy;
+use segment::data_types::order_by::OrderByInterface;
+use segment::data_types::vectors::{DenseVector, MultiDenseVector};
 use segment::json_path::JsonPath;
 use segment::types::{
     Condition, Filter, GeoPoint, IntPayloadType, Payload, PointIdType, SearchParams, ShardKey,
     VectorNameBuf, WithPayloadInterface, WithVector,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::Value as JsonValue;
 use sparse::common::sparse_vector::SparseVector;
-use validator::{Validate, ValidationErrors};
+use validator::{Validate, ValidationError, ValidationErrors};
 
-/// Type for dense vector
-pub type DenseVector = Vec<segment::data_types::vectors::VectorElementType>;
+use crate::rest::validate::validate_relevance_feedback_input;
 
-/// Type for multi dense vector
-pub type MultiDenseVector = Vec<DenseVector>;
+/// Reject zero-length dense vectors at the API boundary.
+///
+/// Without this check, `wait=false` upserts silently enqueue empty vectors that
+/// later get discarded by the segment dimension check, and can also reach code
+/// that asserts on non-zero length and panics (see qdrant/qdrant#9045, #7967).
+pub(crate) fn validate_non_empty_dense(vector: &[f32]) -> Result<(), ValidationErrors> {
+    if vector.is_empty() {
+        let mut err = ValidationError::new("empty_vector");
+        err.message = Some(Cow::Borrowed("dense vector must not be empty"));
+        let mut errors = ValidationErrors::new();
+        errors.add("vector", err);
+        return Err(errors);
+    }
+    Ok(())
+}
 
 /// Vector Data
 /// Vectors can be described directly with values
@@ -51,7 +64,7 @@ pub enum VectorOutput {
 impl Validate for Vector {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
-            Vector::Dense(_) => Ok(()),
+            Vector::Dense(v) => validate_non_empty_dense(v),
             Vector::Sparse(v) => v.validate(),
             Vector::MultiDense(m) => validate_multi_vector(m),
             Vector::Document(_) => Ok(()),
@@ -133,7 +146,7 @@ impl VectorStruct {
 impl Validate for VectorStruct {
     fn validate(&self) -> Result<(), validator::ValidationErrors> {
         match self {
-            VectorStruct::Single(_) => Ok(()),
+            VectorStruct::Single(v) => validate_non_empty_dense(v),
             VectorStruct::MultiDense(v) => validate_multi_vector(v),
             VectorStruct::Named(v) => common::validation::validate_iter(v.values()),
             VectorStruct::Document(_) => Ok(()),
@@ -147,7 +160,7 @@ impl Validate for VectorStruct {
 pub struct Options {
     /// Parameters for the model
     /// Values of the parameters are model-specific
-    pub options: Option<HashMap<String, Value>>,
+    pub options: Option<HashMap<String, JsonValue>>,
 }
 
 impl Hash for Options {
@@ -223,6 +236,10 @@ pub struct TextPreprocessingConfig {
     /// Default is `true`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lowercase: Option<bool>,
+    /// If true, normalize tokens by folding accented characters to ASCII (e.g., "ação" -> "acao").
+    /// Default is `false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ascii_folding: Option<bool>,
     /// Configuration of the stopwords filter. Supports list of pre-defined languages and custom stopwords.
     /// Default: initialized for specified `language` or English if not specified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -242,7 +259,7 @@ pub struct TextPreprocessingConfig {
 }
 
 impl Bm25Config {
-    pub fn to_options(&self) -> HashMap<String, Value> {
+    pub fn to_options(&self) -> HashMap<String, JsonValue> {
         debug_assert!(
             false,
             "this code should never be called, it is only for schema generation",
@@ -252,12 +269,12 @@ impl Bm25Config {
             .expect("conversion of internal structure to JSON should never fail");
 
         match value {
-            Value::Null
-            | Value::Bool(_)
-            | Value::Number(_)
-            | Value::String(_)
-            | Value::Array(_) => HashMap::default(), // not expected
-            Value::Object(map) => map.into_iter().collect(),
+            JsonValue::Null
+            | JsonValue::Bool(_)
+            | JsonValue::Number(_)
+            | JsonValue::String(_)
+            | JsonValue::Array(_) => HashMap::default(), // not expected
+            JsonValue::Object(map) => map.into_iter().collect(),
         }
     }
 }
@@ -269,7 +286,7 @@ impl Bm25Config {
 #[serde(untagged, rename_all = "snake_case")]
 pub enum DocumentOptions {
     // This option should go first
-    Common(HashMap<String, Value>),
+    Common(HashMap<String, JsonValue>),
     // This should never be deserialized into, but we keep it for schema generation
     Bm25(Bm25Config),
 }
@@ -292,7 +309,7 @@ mod tests {
 }
 
 impl DocumentOptions {
-    pub fn into_options(self) -> HashMap<String, Value> {
+    pub fn into_options(self) -> HashMap<String, JsonValue> {
         match self {
             DocumentOptions::Common(options) => options,
             DocumentOptions::Bm25(bm25) => bm25.to_options(),
@@ -344,7 +361,7 @@ pub struct Document {
 pub struct Image {
     /// Image data: base64 encoded image or an URL
     #[schemars(example = "image_value_example")]
-    pub image: Value,
+    pub image: JsonValue,
     /// Name of the model used to generate the vector.
     /// List of available models depends on a provider.
     #[validate(length(min = 1))]
@@ -363,7 +380,7 @@ pub struct Image {
 pub struct InferenceObject {
     /// Arbitrary data, used as input for the embedding model.
     /// Used if the model requires more than one input or a custom input.
-    pub object: Value,
+    pub object: JsonValue,
     /// Name of the model used to generate the vector.
     /// List of available models depends on a provider.
     #[validate(length(min = 1))]
@@ -394,12 +411,20 @@ pub struct Batch {
     pub payloads: Option<Vec<Option<Payload>>>,
 }
 
+#[derive(Debug, Deserialize, Serialize, JsonSchema, Clone, PartialEq, Eq, Hash)]
+pub struct ShardKeyWithFallback {
+    pub target: ShardKey,
+    /// Fallback shard key will be used if target shard key is not created or active
+    pub fallback: ShardKey,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, JsonSchema, PartialEq, Hash)]
 #[serde(untagged)]
 #[serde(expecting = "Expected a string or an integer")]
 pub enum ShardKeySelector {
     ShardKey(ShardKey),
     ShardKeys(Vec<ShardKey>),
+    ShardKeyWithFallback(ShardKeyWithFallback),
     // ToDo: select by pattern
 }
 
@@ -496,14 +521,6 @@ pub enum NamedVectorStruct {
     // No support for multi-dense vectors in search
 }
 
-#[derive(Deserialize, Serialize, JsonSchema, Clone, Debug, PartialEq)]
-#[serde(untagged)]
-#[serde(expecting = "Expected a string, or an object with a key, direction and/or start_from")]
-pub enum OrderByInterface {
-    Key(JsonPath),
-    Struct(OrderBy),
-}
-
 /// Fusion algorithm allows to combine results of multiple prefetches.
 ///
 /// Available fusion algorithms:
@@ -525,6 +542,12 @@ pub struct Rrf {
     #[validate(range(min = 1))]
     #[serde(default)]
     pub k: Option<usize>,
+
+    /// Weights for each prefetch source. Higher weight gives more influence on the final ranking.
+    /// If not specified, all prefetches are weighted equally.
+    /// The number of weights should match the number of prefetches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub weights: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -641,6 +664,9 @@ pub enum Query {
 
     /// Sample points from the collection, non-deterministically.
     Sample(SampleQuery),
+
+    /// Use feedback from an oracle to improve the results
+    RelevanceFeedback(RelevanceFeedbackQuery),
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -703,7 +729,7 @@ pub struct FormulaQuery {
     pub formula: Expression,
 
     #[serde(default)]
-    pub defaults: HashMap<String, Value>,
+    pub defaults: HashMap<String, JsonValue>,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
@@ -711,6 +737,13 @@ pub struct FormulaQuery {
 pub struct SampleQuery {
     #[validate(nested)]
     pub sample: Sample,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(rename_all = "snake_case")]
+pub struct RelevanceFeedbackQuery {
+    #[validate(nested)]
+    pub relevance_feedback: RelevanceFeedbackInput,
 }
 
 /// Maximal Marginal Relevance (MMR) algorithm for re-ranking the points.
@@ -849,6 +882,44 @@ impl ContextPair {
     pub fn iter(&self) -> impl Iterator<Item = &VectorInput> {
         std::iter::once(&self.positive).chain(std::iter::once(&self.negative))
     }
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+#[validate(schema(function = "validate_relevance_feedback_input"))]
+pub struct RelevanceFeedbackInput {
+    #[validate(nested)]
+    pub target: VectorInput,
+    #[validate(nested)]
+    pub feedback: Vec<FeedbackItem>,
+    #[validate(nested)]
+    pub strategy: FeedbackStrategy,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct FeedbackItem {
+    #[validate(nested)]
+    pub example: VectorInput,
+    pub score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[serde(untagged)]
+pub enum FeedbackStrategy {
+    Naive(NaiveFeedbackStrategy),
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct NaiveFeedbackStrategy {
+    #[validate(nested)]
+    pub naive: NaiveFeedbackStrategyParams,
+}
+
+#[derive(Debug, Serialize, Deserialize, JsonSchema, Validate)]
+pub struct NaiveFeedbackStrategyParams {
+    pub a: f32,
+    #[validate(range(min = 0.0))]
+    pub b: f32,
+    pub c: f32,
 }
 
 #[derive(Debug, Serialize, Deserialize, JsonSchema)]
@@ -1339,6 +1410,23 @@ pub struct PointStruct {
     pub payload: Option<Payload>,
 }
 
+/// Defines the mode of the upsert operation
+///
+/// * `upsert` - default mode, insert new points, update existing points
+/// * `insert_only` - only insert new points, do not update existing points
+/// * `update_only` - only update existing points, do not insert new points
+#[derive(Debug, Default, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum UpdateMode {
+    // Default mode - insert new points, update existing points
+    #[default]
+    Upsert,
+    // Only insert new points, do not update existing points
+    InsertOnly,
+    // Only update existing points, do not insert new points
+    UpdateOnly,
+}
+
 #[derive(Debug, Deserialize, Serialize, Clone, Validate, JsonSchema)]
 pub struct PointsBatch {
     #[validate(nested)]
@@ -1346,10 +1434,15 @@ pub struct PointsBatch {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
 
-    /// If specified, only points that match this filter will be updated, others will be inserted
+    /// Filter to apply when updating existing points. Only points matching this filter will be updated.
+    /// Points that don't match will keep their current state. New points will be inserted regardless of the filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub update_filter: Option<Filter>,
+
+    /// Mode of the upsert operation: insert_only, upsert (default), update_only
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<UpdateMode>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize, JsonSchema)]
@@ -1380,10 +1473,14 @@ pub struct PointsList {
     pub points: Vec<PointStruct>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shard_key: Option<ShardKeySelector>,
-    /// If specified, only points that match this filter will be updated, others will be inserted
+    /// Filter to apply when updating existing points. Only points matching this filter will be updated.
+    /// Points that don't match will keep their current state. New points will be inserted regardless of the filter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[validate(nested)]
     pub update_filter: Option<Filter>,
+    /// Mode of the upsert operation: insert_only, upsert (default), update_only
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub update_mode: Option<UpdateMode>,
 }
 
 impl<'de> serde::Deserialize<'de> for PointInsertOperations {
@@ -1391,24 +1488,26 @@ impl<'de> serde::Deserialize<'de> for PointInsertOperations {
     where
         D: serde::Deserializer<'de>,
     {
-        let value = serde_json::Value::deserialize(deserializer)?;
+        let value = JsonValue::deserialize(deserializer)?;
         match value {
-            serde_json::Value::Object(map) => {
-                if map.contains_key("batch") {
-                    PointsBatch::deserialize(serde_json::Value::Object(map))
-                        .map(PointInsertOperations::PointsBatch)
-                        .map_err(serde::de::Error::custom)
-                } else if map.contains_key("points") {
-                    PointsList::deserialize(serde_json::Value::Object(map))
-                        .map(PointInsertOperations::PointsList)
-                        .map_err(serde::de::Error::custom)
-                } else {
-                    Err(serde::de::Error::custom(
-                        "Invalid PointInsertOperations format",
-                    ))
-                }
+            JsonValue::Object(map) if map.contains_key("batch") => {
+                PointsBatch::deserialize(JsonValue::Object(map))
+                    .map(PointInsertOperations::PointsBatch)
+                    .map_err(serde::de::Error::custom)
             }
-            _ => Err(serde::de::Error::custom(
+            JsonValue::Object(map) if map.contains_key("points") => {
+                PointsList::deserialize(JsonValue::Object(map))
+                    .map(PointInsertOperations::PointsList)
+                    .map_err(serde::de::Error::custom)
+            }
+            JsonValue::Object(_) => Err(serde::de::Error::custom(
+                "Invalid PointInsertOperations format",
+            )),
+            JsonValue::Null
+            | JsonValue::Bool(_)
+            | JsonValue::Number(_)
+            | JsonValue::String(_)
+            | JsonValue::Array(_) => Err(serde::de::Error::custom(
                 "Invalid PointInsertOperations format",
             )),
         }
@@ -1447,14 +1546,14 @@ impl PointInsertOperations {
     }
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, Default, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, Default, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum MaxOptimizationThreadsSetting {
     #[default]
     Auto,
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Hash, JsonSchema)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, PartialEq, Eq, Hash, JsonSchema)]
 #[serde(untagged)]
 pub enum MaxOptimizationThreads {
     Setting(MaxOptimizationThreadsSetting),

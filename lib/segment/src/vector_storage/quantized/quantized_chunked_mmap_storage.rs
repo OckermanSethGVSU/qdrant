@@ -1,17 +1,18 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::mmap::{Advice, AdviceSetting, MmapFlusher};
 use common::types::PointOffsetType;
-use memory::madvise::{Advice, AdviceSetting};
-use memory::mmap_type::MmapFlusher;
+use common::universal_io::{MmapFile, MmapFs, UniversalKind};
 
 use crate::common::operation_error::OperationResult;
-use crate::vector_storage::Random;
-use crate::vector_storage::chunked_mmap_vectors::ChunkedMmapVectors;
-use crate::vector_storage::chunked_vector_storage::{ChunkedVectorStorage, VectorOffsetType};
+use crate::vector_storage::VectorOffsetType;
+use crate::vector_storage::chunked_vectors::ChunkedVectors;
 
 pub struct QuantizedChunkedMmapStorage {
-    data: ChunkedMmapVectors<u8>,
+    data: ChunkedVectors<u8, MmapFile>,
 }
 
 impl QuantizedChunkedMmapStorage {
@@ -21,7 +22,8 @@ impl QuantizedChunkedMmapStorage {
         } else {
             AdviceSetting::Global
         };
-        let data = ChunkedMmapVectors::<u8>::open(
+        let data = ChunkedVectors::open(
+            MmapFs,
             path,
             quantized_vector_size,
             advice,
@@ -33,12 +35,25 @@ impl QuantizedChunkedMmapStorage {
     pub fn populate(&self) -> OperationResult<()> {
         self.data.populate()
     }
+
+    pub fn clear_cache(&self) -> OperationResult<()> {
+        let Self { data } = self;
+        data.clear_cache()
+    }
 }
 
 impl quantization::EncodedStorage for QuantizedChunkedMmapStorage {
-    fn get_vector_data(&self, index: PointOffsetType) -> &[u8] {
-        ChunkedVectorStorage::get::<Random>(&self.data, index as VectorOffsetType)
+    fn get_vector_data(&self, index: PointOffsetType) -> Cow<'_, [u8]> {
+        self.data
+            .get::<Random>(index as VectorOffsetType)
             .unwrap_or_default()
+    }
+
+    fn iter_batch(
+        &self,
+        offsets: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
+        self.data.iter(offsets)
     }
 
     fn upsert_vector(
@@ -47,8 +62,28 @@ impl quantization::EncodedStorage for QuantizedChunkedMmapStorage {
         vector: &[u8],
         hw_counter: &common::counter::hardware_counter::HardwareCounterCell,
     ) -> std::io::Result<()> {
-        ChunkedVectorStorage::insert(&mut self.data, id as VectorOffsetType, vector, hw_counter)
+        self.data
+            .insert(id as VectorOffsetType, vector, hw_counter)
             .map_err(std::io::Error::other)
+    }
+
+    fn is_in_ram_or_mmap() -> bool {
+        type StorageType = ChunkedVectors<u8, MmapFile>;
+
+        // This should produce compilation error, if `QuantizedChunkedMmapStorage::data` type is changed,
+        // to ensure that we always use correct type for this check
+        fn _static_assert_storage_type(storage: QuantizedChunkedMmapStorage) {
+            let _: StorageType = storage.data;
+        }
+
+        match StorageType::storage_kind() {
+            UniversalKind::IoUring |
+            UniversalKind::DiskCache | UniversalKind::S3 |
+            UniversalKind::Gcs |
+            UniversalKind::Azure => false,
+            UniversalKind::SimpleDiskCache | // FIXME: only `true` if it was entirely prefilled
+            UniversalKind::Mmap => true,
+        }
     }
 
     fn is_on_disk(&self) -> bool {
@@ -69,29 +104,33 @@ impl quantization::EncodedStorage for QuantizedChunkedMmapStorage {
     }
 
     fn files(&self) -> Vec<PathBuf> {
-        ChunkedMmapVectors::files(&self.data)
+        self.data.files()
     }
 
     fn immutable_files(&self) -> Vec<PathBuf> {
-        ChunkedMmapVectors::immutable_files(&self.data)
+        self.data.immutable_files()
+    }
+
+    fn heap_size_bytes(&self) -> usize {
+        let Self { data } = self;
+        data.heap_size_bytes()
     }
 }
 
-#[allow(dead_code)]
 pub struct QuantizedChunkedMmapStorageBuilder {
-    data: ChunkedMmapVectors<u8>,
+    data: ChunkedVectors<u8, MmapFile>,
     hw_counter: HardwareCounterCell,
 }
 
 impl QuantizedChunkedMmapStorageBuilder {
-    #[allow(dead_code)]
     pub fn new(path: &Path, quantized_vector_size: usize, in_ram: bool) -> OperationResult<Self> {
         let advice = if in_ram {
             AdviceSetting::from(Advice::Normal)
         } else {
             AdviceSetting::Global
         };
-        let data = ChunkedMmapVectors::<u8>::open(
+        let data = ChunkedVectors::open(
+            MmapFs,
             path,
             quantized_vector_size,
             advice,
@@ -106,6 +145,7 @@ impl QuantizedChunkedMmapStorageBuilder {
 
 impl quantization::EncodedStorageBuilder for QuantizedChunkedMmapStorageBuilder {
     type Storage = QuantizedChunkedMmapStorage;
+    type Error = std::io::Error;
 
     fn build(self) -> std::io::Result<QuantizedChunkedMmapStorage> {
         let Self {

@@ -1,9 +1,8 @@
 mod count;
-mod discovery;
+mod discover;
 mod facet;
 mod local_shard;
 mod matrix;
-pub mod operation_rate_cost;
 mod query;
 mod recommend;
 mod search;
@@ -14,6 +13,7 @@ use std::fmt::Display;
 use itertools::Itertools;
 use segment::json_path::JsonPath;
 use segment::types::{Filter, SearchParams, StrictModeConfig};
+pub use shard::operation_rate_cost;
 
 use super::types::{CollectionError, CollectionResult};
 use crate::collection::Collection;
@@ -36,6 +36,15 @@ pub struct VerificationPass {
 /// Trait to verify strict mode for requests.
 /// This trait ignores the `enabled` parameter in `StrictModeConfig`.
 pub trait StrictModeVerification {
+    /// Whether executing this request can grow process memory usage (e.g. upsert, set payload).
+    ///
+    /// Used by the process-level resident memory check. Delete-style operations
+    /// should return `false` so they can still run when memory is high — blocking
+    /// them would deadlock the path that frees memory.
+    fn consumes_memory(&self) -> bool {
+        false
+    }
+
     /// Implementing this method allows adding a custom check for request specific values.
     #[allow(async_fn_in_trait)]
     async fn check_custom(
@@ -208,6 +217,107 @@ pub fn check_timeout(
     check_limit_opt(Some(timeout), strict_mode_config.max_timeout, "timeout")
 }
 
+pub fn check_search_batch_size(
+    batch_size: usize,
+    strict_mode_config: &StrictModeConfig,
+) -> CollectionResult<()> {
+    check_limit_opt(
+        Some(batch_size),
+        strict_mode_config.search_max_batchsize,
+        "search batch size",
+    )
+}
+
+/// Reject a memory-consuming update if the process resident memory exceeds
+/// the configured percentage of total system memory.
+///
+/// `resident_reader` returns the current process resident memory in bytes,
+/// or `None` when the platform does not expose the stat. In production this
+/// is [`::common::memory_usage::resident_bytes`]; tests pass a closure.
+///
+/// Returns `Ok(())` when no threshold is configured, when the reader returns
+/// `None`, or when current usage is below the threshold. Total memory is
+/// cached once — cgroup limits are read at first call, so container memory
+/// limits are respected if present at startup.
+pub fn check_resident_memory(
+    strict_mode_config: &StrictModeConfig,
+    resident_reader: impl FnOnce() -> Option<usize>,
+) -> CollectionResult<()> {
+    let Some(percent) = strict_mode_config.max_resident_memory_percent else {
+        return Ok(());
+    };
+
+    let Some(resident) = resident_reader() else {
+        return Ok(());
+    };
+
+    let total = total_memory_bytes();
+    if total == 0 {
+        return Ok(());
+    }
+
+    let threshold = total.saturating_mul(u64::from(percent)) / 100;
+    if (resident as u64) >= threshold {
+        let used_percent = (resident as u64).saturating_mul(100) / total;
+        return Err(CollectionError::strict_mode(
+            format!(
+                "Resident memory usage is at {used_percent}% of total memory, exceeding the configured limit of {percent}%",
+            ),
+            "Reduce memory usage (e.g. delete points or free segments) or raise `max_resident_memory_percent` in strict mode.",
+        ));
+    }
+
+    Ok(())
+}
+
+/// Total system memory (or cgroup limit) in bytes. Cached once — total memory
+/// is effectively constant for a running process.
+fn total_memory_bytes() -> u64 {
+    use std::sync::OnceLock;
+    static TOTAL: OnceLock<u64> = OnceLock::new();
+    *TOTAL.get_or_init(|| segment::utils::mem::Mem::new().total_memory_bytes())
+}
+
+/// Reject a disk-consuming update if the filesystem hosting Qdrant storage is
+/// filled above the configured percentage of its total capacity.
+///
+/// `usage_reader` returns the current disk usage snapshot, or `None` when the
+/// stat call failed (e.g. path missing, permission denied). In production this
+/// is [`::common::disk_usage::disk_usage`] which is internally TTL-cached so
+/// hot request paths do not call `statvfs` on every operation.
+///
+/// Returns `Ok(())` when no threshold is configured, when the reader returns
+/// `None`, when `total` is reported as zero, or when current usage is below
+/// the threshold.
+pub fn check_disk_usage(
+    strict_mode_config: &StrictModeConfig,
+    usage_reader: impl FnOnce() -> Option<::common::disk_usage::DiskUsage>,
+) -> CollectionResult<()> {
+    let Some(percent) = strict_mode_config.max_disk_usage_percent else {
+        return Ok(());
+    };
+
+    let Some(usage) = usage_reader() else {
+        return Ok(());
+    };
+
+    if usage.total == 0 {
+        return Ok(());
+    }
+
+    let used_percent = usage.used().saturating_mul(100) / usage.total;
+    if used_percent >= u64::from(percent) {
+        return Err(CollectionError::strict_mode(
+            format!(
+                "Disk usage is at {used_percent}% of total capacity, exceeding the configured limit of {percent}%",
+            ),
+            "Reduce disk usage (e.g. delete points or drop collections) or raise `max_disk_usage_percent` in strict mode.",
+        ));
+    }
+
+    Ok(())
+}
+
 pub(crate) fn check_bool_opt(
     value: Option<bool>,
     allowed: Option<bool>,
@@ -329,6 +439,7 @@ pub fn check_grouping_field(
 mod test {
     use std::sync::Arc;
 
+    use api::rest::{PointInsertOperations, PointStruct, PointsList, SearchRequestInternal};
     use common::budget::ResourceBudget;
     use common::counter::hardware_accumulator::HwMeasurementAcc;
     use segment::types::{
@@ -337,13 +448,14 @@ mod test {
     };
     use tempfile::Builder;
 
-    use super::StrictModeVerification;
+    use super::{StrictModeVerification, check_disk_usage, check_resident_memory};
     use crate::collection::{Collection, RequestShardTransfer};
     use crate::config::{CollectionConfigInternal, CollectionParams, WalConfig};
     use crate::operations::point_ops::{FilterSelector, PointsSelector};
     use crate::operations::shared_storage_config::SharedStorageConfig;
     use crate::operations::types::{
-        CollectionError, CountRequestInternal, DiscoverRequestInternal,
+        CollectionError, CountRequestInternal, DiscoverRequestInternal, SearchRequest,
+        SearchRequestBatch,
     };
     use crate::optimizers_builder::OptimizersConfig;
     use crate::shards::channel_service::ChannelService;
@@ -362,32 +474,34 @@ mod test {
         test_filter_read(&collection).await;
         test_filter_write(&collection).await;
         test_request_exact(&collection).await;
+        test_search_batch_limit(&collection).await;
+        test_upsert_batch_limit(&collection).await;
     }
 
     async fn test_query_limit(collection: &Collection) {
-        assert_strict_mode_error(discovery_fixture(Some(10), None, None), collection).await;
-        assert_strict_mode_success(discovery_fixture(Some(4), None, None), collection).await;
+        assert_strict_mode_error(discover_fixture(Some(10), None, None), collection).await;
+        assert_strict_mode_success(discover_fixture(Some(4), None, None), collection).await;
     }
 
     async fn test_filter_read(collection: &Collection) {
         let filter = filter_fixture(UNINDEXED_KEY);
-        assert_strict_mode_error(discovery_fixture(None, Some(filter), None), collection).await;
+        assert_strict_mode_error(discover_fixture(None, Some(filter), None), collection).await;
 
         let filter = filter_fixture(INDEXED_KEY);
-        assert_strict_mode_success(discovery_fixture(None, Some(filter), None), collection).await;
+        assert_strict_mode_success(discover_fixture(None, Some(filter), None), collection).await;
     }
 
     async fn test_search_params(collection: &Collection) {
         let restricted_params = search_params_fixture(true);
         assert_strict_mode_error(
-            discovery_fixture(None, None, Some(restricted_params)),
+            discover_fixture(None, None, Some(restricted_params)),
             collection,
         )
         .await;
 
         let allowed_params = search_params_fixture(false);
         assert_strict_mode_success(
-            discovery_fixture(None, None, Some(allowed_params)),
+            discover_fixture(None, None, Some(allowed_params)),
             collection,
         )
         .await;
@@ -418,6 +532,260 @@ mod test {
             filter: None,
             exact: false,
         };
+        assert_strict_mode_success(request, collection).await;
+    }
+
+    async fn test_search_batch_limit(collection: &Collection) {
+        let request = SearchRequestBatch {
+            searches: vec![
+                SearchRequest {
+                    search_request: SearchRequestInternal {
+                        vector: api::rest::NamedVectorStruct::Default(vec![0.2, 0.1, 0.9, 0.7]),
+                        filter: None,
+                        params: None,
+                        limit: 3,
+                        offset: None,
+                        with_payload: None,
+                        with_vector: None,
+                        score_threshold: None,
+                    },
+                    shard_key: None,
+                };
+                5
+            ],
+        };
+        assert_strict_mode_error(request, collection).await;
+
+        let request = SearchRequestBatch {
+            searches: vec![
+                SearchRequest {
+                    search_request: SearchRequestInternal {
+                        vector: api::rest::NamedVectorStruct::Default(vec![0.2, 0.1, 0.9, 0.7]),
+                        filter: None,
+                        params: None,
+                        limit: 3,
+                        offset: None,
+                        with_payload: None,
+                        with_vector: None,
+                        score_threshold: None,
+                    },
+                    shard_key: None,
+                };
+                2
+            ],
+        };
+        assert_strict_mode_success(request, collection).await;
+    }
+
+    #[test]
+    fn test_resident_memory_check_disabled_passes() {
+        let cfg = StrictModeConfig::default();
+        // Reader should never be called when no threshold is configured.
+        assert!(check_resident_memory(&cfg, || unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn test_resident_memory_check_no_reader_passes() {
+        // Platforms that don't expose resident memory (reader returns None)
+        // must silently skip the check rather than reject updates.
+        let cfg = StrictModeConfig {
+            max_resident_memory_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        assert!(check_resident_memory(&cfg, || None).is_ok());
+    }
+
+    #[test]
+    fn test_resident_memory_check_over_threshold_rejects() {
+        // Force resident usage to effectively all of RAM — any non-zero
+        // threshold must reject.
+        let cfg = StrictModeConfig {
+            max_resident_memory_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        let res = check_resident_memory(&cfg, || Some(usize::MAX));
+        assert!(
+            matches!(res, Err(CollectionError::StrictMode { .. })),
+            "expected StrictMode error but got {res:?}",
+        );
+    }
+
+    #[test]
+    fn test_resident_memory_check_under_threshold_passes() {
+        // Zero resident bytes is always under any threshold.
+        let cfg = StrictModeConfig {
+            max_resident_memory_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        assert!(check_resident_memory(&cfg, || Some(0)).is_ok());
+    }
+
+    #[test]
+    fn test_disk_usage_check_disabled_passes() {
+        let cfg = StrictModeConfig::default();
+        // Reader should never be called when no threshold is configured.
+        assert!(check_disk_usage(&cfg, || unreachable!()).is_ok());
+    }
+
+    #[test]
+    fn test_disk_usage_check_no_reader_passes() {
+        // When the underlying stat fails (returns None), the check must
+        // silently skip rather than reject updates.
+        let cfg = StrictModeConfig {
+            max_disk_usage_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        assert!(check_disk_usage(&cfg, || None).is_ok());
+    }
+
+    #[test]
+    fn test_disk_usage_check_zero_total_passes() {
+        // A filesystem reporting total=0 (e.g. some pseudo-filesystems) must
+        // not cause a divide-by-zero or a spurious rejection.
+        let cfg = StrictModeConfig {
+            max_disk_usage_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        assert!(
+            check_disk_usage(&cfg, || Some(::common::disk_usage::DiskUsage {
+                total: 0,
+                available: 0,
+            }))
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_disk_usage_check_over_threshold_rejects() {
+        // 90% full vs. a 50% threshold must reject.
+        let cfg = StrictModeConfig {
+            max_disk_usage_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        let res = check_disk_usage(&cfg, || {
+            Some(::common::disk_usage::DiskUsage {
+                total: 1_000,
+                available: 100,
+            })
+        });
+        assert!(
+            matches!(res, Err(CollectionError::StrictMode { .. })),
+            "expected StrictMode error but got {res:?}",
+        );
+    }
+
+    #[test]
+    fn test_disk_usage_check_under_threshold_passes() {
+        // 10% full vs. a 50% threshold must pass.
+        let cfg = StrictModeConfig {
+            max_disk_usage_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        let res = check_disk_usage(&cfg, || {
+            Some(::common::disk_usage::DiskUsage {
+                total: 1_000,
+                available: 900,
+            })
+        });
+        assert!(res.is_ok(), "expected Ok but got {res:?}");
+    }
+
+    #[test]
+    fn test_disk_usage_check_available_above_total_passes() {
+        // Some quota-backed filesystems report `available > total`. The check
+        // must treat used as saturating-zero and pass.
+        let cfg = StrictModeConfig {
+            max_disk_usage_percent: Some(50),
+            ..StrictModeConfig::default()
+        };
+        let res = check_disk_usage(&cfg, || {
+            Some(::common::disk_usage::DiskUsage {
+                total: 1_000,
+                available: 2_000,
+            })
+        });
+        assert!(res.is_ok(), "expected Ok but got {res:?}");
+    }
+
+    #[test]
+    fn test_consumes_memory_flags() {
+        use api::rest::{PointInsertOperations, PointsList};
+
+        use crate::operations::payload_ops::{DeletePayload, SetPayload};
+        use crate::operations::point_ops::{FilterSelector, PointsSelector};
+        use crate::operations::vector_ops::DeleteVectors;
+
+        // Insert-type ops consume memory.
+        let insert = PointInsertOperations::PointsList(PointsList {
+            points: vec![],
+            shard_key: None,
+            update_filter: None,
+            update_mode: None,
+        });
+        assert!(insert.consumes_memory());
+
+        let set_payload = SetPayload {
+            payload: Default::default(),
+            points: None,
+            filter: None,
+            key: None,
+            shard_key: None,
+        };
+        assert!(set_payload.consumes_memory());
+
+        // Delete-type ops must NOT consume memory (they free it).
+        let delete_vecs = DeleteVectors {
+            points: None,
+            filter: None,
+            vector: Default::default(),
+            shard_key: None,
+        };
+        assert!(!delete_vecs.consumes_memory());
+
+        let delete_payload = DeletePayload {
+            keys: vec![],
+            points: None,
+            filter: None,
+            shard_key: None,
+        };
+        assert!(!delete_payload.consumes_memory());
+
+        let delete_points = PointsSelector::FilterSelector(FilterSelector {
+            filter: Filter::default(),
+            shard_key: None,
+        });
+        assert!(!delete_points.consumes_memory());
+    }
+
+    async fn test_upsert_batch_limit(collection: &Collection) {
+        let request = PointInsertOperations::PointsList(PointsList {
+            points: vec![
+                PointStruct {
+                    id: 1.into(),
+                    vector: api::rest::VectorStruct::Single(vec![0.1, 0.2, 0.3, 0.4]),
+                    payload: None,
+                };
+                5
+            ],
+            shard_key: None,
+            update_filter: None,
+            update_mode: None,
+        });
+        assert_strict_mode_error(request, collection).await;
+
+        let request = PointInsertOperations::PointsList(PointsList {
+            points: vec![
+                PointStruct {
+                    id: 1.into(),
+                    vector: api::rest::VectorStruct::Single(vec![0.1, 0.2, 0.3, 0.4]),
+                    payload: None,
+                };
+                4
+            ],
+            shard_key: None,
+            update_filter: None,
+            update_mode: None,
+        });
         assert_strict_mode_success(request, collection).await;
     }
 
@@ -464,7 +832,7 @@ mod test {
         }
     }
 
-    fn discovery_fixture(
+    fn discover_fixture(
         limit: Option<usize>,
         filter: Option<Filter>,
         search_params: Option<SearchParams>,
@@ -493,6 +861,8 @@ mod test {
             search_max_hnsw_ef: Some(3),
             search_allow_exact: Some(false),
             search_max_oversampling: Some(0.2),
+            search_max_batchsize: Some(4),
+            upsert_max_batchsize: Some(4),
             ..Default::default()
         };
 

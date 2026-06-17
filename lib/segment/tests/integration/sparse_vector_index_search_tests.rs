@@ -1,25 +1,31 @@
 use std::cmp::max;
 use std::collections::HashMap;
-use std::fs::remove_file;
 use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::generic_consts::Random;
+use common::storage_version::VERSION_FILE;
 use common::types::{PointOffsetType, TelemetryDetail};
-use io::storage_version::VERSION_FILE;
+use common::universal_io::MmapFile;
+use fs_err as fs;
 use itertools::Itertools;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use segment::common::operation_error::OperationResult;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::vectors::{QueryVector, VectorInternal};
-use segment::entry::entry_point::SegmentEntry;
+use segment::entry::{SegmentEntry, StorageSegmentEntry as _};
 use segment::fixtures::payload_fixtures::STR_KEY;
 use segment::fixtures::sparse_fixtures::{fixture_sparse_index, fixture_sparse_index_from_iter};
+use segment::id_tracker::{IdTracker, IdTrackerRead};
+use segment::index::field_index::PayloadFieldIndexRead;
 use segment::index::sparse_index::sparse_index_config::{SparseIndexConfig, SparseIndexType};
 use segment::index::sparse_index::sparse_vector_index::{
     SparseVectorIndex, SparseVectorIndexOpenArgs,
 };
-use segment::index::{PayloadIndex, VectorIndex, VectorIndexEnum};
+use segment::index::{
+    PayloadIndex, PayloadIndexRead, VectorIndex, VectorIndexEnum, VectorIndexRead,
+};
 use segment::json_path::JsonPath;
 use segment::segment::Segment;
 use segment::segment_constructor::{build_segment, load_segment};
@@ -30,7 +36,7 @@ use segment::types::{
     SegmentConfig, SeqNumberType, SparseVectorDataConfig, SparseVectorStorageType, VectorName,
     VectorStorageDatatype,
 };
-use segment::vector_storage::{Random, VectorStorage};
+use segment::vector_storage::{VectorStorage, VectorStorageRead};
 use segment::{fixture_for_all_indices, payload_json};
 use sparse::common::sparse_vector::SparseVector;
 use sparse::common::sparse_vector_fixture::{random_full_sparse_vector, random_sparse_vector};
@@ -41,6 +47,7 @@ use sparse::index::inverted_index::inverted_index_compressed_mmap::InvertedIndex
 use sparse::index::inverted_index::inverted_index_ram::InvertedIndexRam;
 use sparse::index::posting_list_common::PostingListIter as _;
 use tempfile::Builder;
+use uuid::Uuid;
 
 /// Max dimension of sparse vectors used in tests
 const MAX_SPARSE_DIM: usize = 4096;
@@ -86,7 +93,7 @@ fn compare_sparse_vectors_search_with_without_filter(full_scan_threshold: usize)
     // compares results with and without filters
     // expects the filter to have no effect on the results because the filter matches everything
     for query in query_vectors {
-        let maximum_number_of_results = sparse_vector_index.max_result_count(&query);
+        let maximum_number_of_results = sparse_vector_index.max_result_count(&query).unwrap();
         // get all results minus 10 to force a bit of pruning
         let top = max(1, maximum_number_of_results.saturating_sub(10));
         let query_vector: QueryVector = query.clone().into();
@@ -164,9 +171,10 @@ fn check_index_storage_consistency<T: InvertedIndex>(sparse_vector_index: &Spars
             .iter()
             .zip(remapped_vector.values.iter())
         {
+            let arena = sparse::SearchScratchArena::new_slow();
             let posting_list = sparse_vector_index
                 .inverted_index()
-                .get(*dim_id, &hw_counter)
+                .get(*dim_id, &arena, &hw_counter)
                 .unwrap();
             // assert posting list sorted by record id
             assert!(
@@ -184,7 +192,7 @@ fn check_index_storage_consistency<T: InvertedIndex>(sparse_vector_index: &Spars
             );
         }
         // check the vector can be found via search using large top
-        let top = sparse_vector_index.max_result_count(vector);
+        let top = sparse_vector_index.max_result_count(vector).unwrap();
         let query_vector: QueryVector = vector.to_owned().into();
         let results = sparse_vector_index
             .search(&[&query_vector], None, top, None, &Default::default())
@@ -215,7 +223,7 @@ fn sparse_vector_index_consistent_with_storage() {
     // create mmap sparse vector index
     let mut sparse_index_config = sparse_vector_ram_index.config();
     sparse_index_config.index_type = SparseIndexType::Mmap;
-    let sparse_vector_mmap_index: SparseVectorIndex<InvertedIndexCompressedMmap<f32>> =
+    let sparse_vector_mmap_index: SparseVectorIndex<InvertedIndexCompressedMmap<f32, MmapFile>> =
         SparseVectorIndex::open(SparseVectorIndexOpenArgs {
             config: sparse_index_config,
             id_tracker: sparse_vector_ram_index.id_tracker().clone(),
@@ -241,7 +249,7 @@ fn sparse_vector_index_consistent_with_storage() {
     // load index from memmap file
     let mut sparse_index_config = sparse_vector_ram_index.config();
     sparse_index_config.index_type = SparseIndexType::Mmap;
-    let sparse_vector_mmap_index: SparseVectorIndex<InvertedIndexCompressedMmap<f32>> =
+    let sparse_vector_mmap_index: SparseVectorIndex<InvertedIndexCompressedMmap<f32, MmapFile>> =
         SparseVectorIndex::open(SparseVectorIndexOpenArgs {
             config: sparse_index_config,
             id_tracker: sparse_vector_ram_index.id_tracker().clone(),
@@ -265,13 +273,14 @@ fn sparse_vector_index_consistent_with_storage() {
 #[test]
 fn sparse_vector_index_load_missing_mmap() {
     let data_dir = Builder::new().prefix("data_dir").tempdir().unwrap();
-    let sparse_vector_index: OperationResult<SparseVectorIndex<InvertedIndexCompressedMmap<f32>>> =
-        fixture_sparse_index_from_iter(
-            data_dir.path(),
-            [].iter().cloned(),
-            10_000,
-            SparseIndexType::Mmap,
-        );
+    let sparse_vector_index: OperationResult<
+        SparseVectorIndex<InvertedIndexCompressedMmap<f32, MmapFile>>,
+    > = fixture_sparse_index_from_iter(
+        data_dir.path(),
+        [].iter().cloned(),
+        10_000,
+        SparseIndexType::Mmap,
+    );
     // absent configuration file for mmap are ignored
     // a new index is created
     assert!(sparse_vector_index.is_ok())
@@ -403,7 +412,7 @@ fn sparse_vector_index_ram_filtered_search() {
 
     // assert payload field index created and empty
     let payload_index = sparse_vector_index.payload_index().borrow();
-    let indexed_fields = payload_index.indexed_fields();
+    let indexed_fields = payload_index.with_view(|v| v.indexed_fields());
     assert_eq!(
         *indexed_fields.get(&JsonPath::new(field_name)).unwrap(),
         FieldType(Keyword)
@@ -592,11 +601,12 @@ fn sparse_vector_index_persistence_test() {
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
                 storage_type: SparseVectorStorageType::default(),
+                modifier: None,
             },
         )]),
         payload_storage_type: Default::default(),
     };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_segment(dir.path(), &config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -609,7 +619,7 @@ fn sparse_vector_index_persistence_test() {
             .upsert_point(n as SeqNumberType, idx, named_vector, &hw_counter)
             .unwrap();
     }
-    segment.flush(true, false).unwrap();
+    segment.flush(false).unwrap();
 
     let search_vector = random_sparse_vector(&mut rnd, dim);
     let query_vector: QueryVector = search_vector.into();
@@ -628,12 +638,12 @@ fn sparse_vector_index_persistence_test() {
 
     assert_eq!(search_result.len(), top);
 
-    let path = segment.current_path.clone();
+    let path = segment.segment_path.clone();
     drop(segment);
 
     // persistence using rebuild of inverted index
     // for appendable segment vector index has to be rebuilt
-    let segment = load_segment(&path, &stopped).unwrap().unwrap();
+    let segment = load_segment(&path, Uuid::nil(), None, &stopped).unwrap();
     let search_after_reload_result = segment
         .search(
             SPARSE_VECTOR_NAME,
@@ -720,7 +730,7 @@ fn check_persistence<TInvertedIndex: InvertedIndex>(
 
     // drop version file and reload index
     drop(sparse_vector_index);
-    remove_file(&version_file).unwrap();
+    fs::remove_file(&version_file).unwrap();
     let sparse_vector_index = open_index();
     assert!(version_file.exists(), "version file should be recreated");
     check_search(&sparse_vector_index);
@@ -744,7 +754,7 @@ fn check_sparse_vector_index_files<I: InvertedIndex>() {
     let files = index.files();
     // sparse index config + version + inverted index config + inverted index data + tracker
     assert_eq!(files.len(), 5);
-    for file in files.iter() {
+    for file in &files {
         assert!(file.exists(), "file {file:?} does not exist");
     }
 }
@@ -763,11 +773,12 @@ fn sparse_vector_test_large_index() {
                     datatype: Some(VectorStorageDatatype::Float32),
                 },
                 storage_type: SparseVectorStorageType::Mmap,
+                modifier: None,
             },
         )]),
         payload_storage_type: Default::default(),
     };
-    let mut segment = build_segment(dir.path(), &config, true).unwrap();
+    let mut segment = build_segment(dir.path(), &config, None, true).unwrap();
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -798,4 +809,25 @@ fn sparse_vector_test_large_index() {
         }
         _ => panic!("unexpected vector index type"),
     }
+}
+
+#[test]
+fn test_sparse_search_top_zero() {
+    let mut rnd = StdRng::seed_from_u64(43);
+    let data_dir = Builder::new().prefix("data_dir").tempdir().unwrap();
+
+    let sparse_vector_index = fixture_sparse_index::<InvertedIndexCompressedImmutableRam<f32>, _>(
+        &mut rnd,
+        NUM_VECTORS,
+        MAX_SPARSE_DIM,
+        LOW_FULL_SCAN_THRESHOLD,
+        data_dir.path(),
+    );
+
+    let query_vector = random_sparse_vector(&mut rnd, MAX_SPARSE_DIM).into();
+
+    let top = 0;
+    sparse_vector_index
+        .search(&[&query_vector], None, top, None, &Default::default())
+        .unwrap();
 }

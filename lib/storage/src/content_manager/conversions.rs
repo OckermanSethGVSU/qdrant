@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::str::FromStr;
 
 use api::conversions::json;
+use api::grpc::qdrant as grpc;
+use chrono::{DateTime, Utc};
 use collection::operations::config_diff::{
     CollectionParamsDiff, HnswConfigDiff, OptimizersConfigDiff, QuantizationConfigDiff,
 };
@@ -14,10 +16,11 @@ use tonic::metadata::MetadataValue;
 use crate::content_manager::collection_meta_ops::{
     AliasOperations, ChangeAliasesOperation, CollectionMetaOperations, CreateAlias,
     CreateAliasOperation, CreateCollection, CreateCollectionOperation, DeleteAlias,
-    DeleteAliasOperation, DeleteCollectionOperation, InitFrom, RenameAlias, RenameAliasOperation,
+    DeleteAliasOperation, DeleteCollectionOperation, RenameAlias, RenameAliasOperation,
     UpdateCollection, UpdateCollectionOperation,
 };
 use crate::content_manager::errors::StorageError;
+use crate::types::{ConsensusThreadStatus, StateRole};
 
 impl From<StorageError> for Status {
     fn from(error: StorageError) -> Self {
@@ -49,7 +52,7 @@ impl From<StorageError> for Status {
             StorageError::ShardUnavailable { .. } => tonic::Code::Unavailable,
             StorageError::EmptyPartialSnapshot { .. } => tonic::Code::FailedPrecondition,
         };
-        let mut status = Status::new(error_code, format!("{error}"));
+        let mut status = Status::new(error_code, error.to_string());
         // add metadata headers
         for (header_key, header_value) in metadata_headers {
             if let Ok(metadata) = MetadataValue::from_str(&header_value) {
@@ -62,11 +65,11 @@ impl From<StorageError> for Status {
     }
 }
 
-impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
+impl TryFrom<grpc::CreateCollection> for CollectionMetaOperations {
     type Error = Status;
 
-    fn try_from(value: api::grpc::qdrant::CreateCollection) -> Result<Self, Self::Error> {
-        let api::grpc::qdrant::CreateCollection {
+    fn try_from(value: grpc::CreateCollection) -> Result<Self, Self::Error> {
+        let grpc::CreateCollection {
             collection_name,
             hnsw_config,
             wal_config,
@@ -77,7 +80,6 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
             vectors_config,
             replication_factor,
             write_consistency_factor,
-            init_from_collection,
             quantization_config,
             sharding_method,
             sparse_vectors_config,
@@ -95,8 +97,8 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
                 sparse_vectors: sparse_vectors_config
                     .map(|v| SparseVectorsConfig::try_from(v).map(|SparseVectorsConfig(x)| x))
                     .transpose()?,
-                hnsw_config: hnsw_config.map(|v| v.into()),
-                wal_config: wal_config.map(|v| v.into()),
+                hnsw_config: hnsw_config.map(Into::into),
+                wal_config: wal_config.map(Into::into),
                 optimizers_config: optimizers_config.map(TryFrom::try_from).transpose()?,
                 shard_number,
                 on_disk_payload,
@@ -108,8 +110,6 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
                     .transpose()?,
                 strict_mode_config: strict_mode_config.map(strict_mode_from_api),
                 uuid: None,
-                #[expect(deprecated)]
-                init_from: init_from_collection.map(|v| InitFrom { collection: v }),
                 metadata: if metadata.is_empty() {
                     None
                 } else {
@@ -121,8 +121,8 @@ impl TryFrom<api::grpc::qdrant::CreateCollection> for CollectionMetaOperations {
     }
 }
 
-pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> StrictModeConfig {
-    let api::grpc::qdrant::StrictModeConfig {
+pub fn strict_mode_from_api(value: grpc::StrictModeConfig) -> StrictModeConfig {
+    let grpc::StrictModeConfig {
         enabled,
         max_query_limit,
         max_timeout,
@@ -132,6 +132,7 @@ pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> Stric
         search_allow_exact,
         search_max_oversampling,
         upsert_max_batchsize,
+        search_max_batchsize,
         max_collection_vector_size_bytes,
         read_rate_limit,
         write_rate_limit,
@@ -142,6 +143,8 @@ pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> Stric
         multivector_config,
         sparse_config,
         max_payload_index_count,
+        max_resident_memory_percent,
+        max_disk_usage_percent,
     } = value;
     StrictModeConfig {
         enabled,
@@ -153,6 +156,7 @@ pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> Stric
         search_allow_exact,
         search_max_oversampling: search_max_oversampling.map(f64::from),
         upsert_max_batchsize: upsert_max_batchsize.map(|i| i as usize),
+        search_max_batchsize: search_max_batchsize.map(|i| i as usize),
         max_collection_vector_size_bytes: max_collection_vector_size_bytes.map(|i| i as usize),
         read_rate_limit: read_rate_limit.map(|i| i as usize),
         write_rate_limit: write_rate_limit.map(|i| i as usize),
@@ -163,14 +167,16 @@ pub fn strict_mode_from_api(value: api::grpc::qdrant::StrictModeConfig) -> Stric
         multivector_config: multivector_config.map(StrictModeMultivectorConfig::from),
         sparse_config: sparse_config.map(StrictModeSparseConfig::from),
         max_payload_index_count: max_payload_index_count.map(|i| i as usize),
+        max_resident_memory_percent: max_resident_memory_percent.map(|i| i as u8),
+        max_disk_usage_percent: max_disk_usage_percent.map(|i| i as u8),
     }
 }
 
-impl TryFrom<api::grpc::qdrant::UpdateCollection> for CollectionMetaOperations {
+impl TryFrom<grpc::UpdateCollection> for CollectionMetaOperations {
     type Error = Status;
 
-    fn try_from(value: api::grpc::qdrant::UpdateCollection) -> Result<Self, Self::Error> {
-        let api::grpc::qdrant::UpdateCollection {
+    fn try_from(value: grpc::UpdateCollection) -> Result<Self, Self::Error> {
+        let grpc::UpdateCollection {
             collection_name,
             optimizers_config,
             timeout: _,
@@ -211,11 +217,11 @@ impl TryFrom<api::grpc::qdrant::UpdateCollection> for CollectionMetaOperations {
     }
 }
 
-impl TryFrom<api::grpc::qdrant::DeleteCollection> for CollectionMetaOperations {
+impl TryFrom<grpc::DeleteCollection> for CollectionMetaOperations {
     type Error = Status;
 
-    fn try_from(value: api::grpc::qdrant::DeleteCollection) -> Result<Self, Self::Error> {
-        let api::grpc::qdrant::DeleteCollection {
+    fn try_from(value: grpc::DeleteCollection) -> Result<Self, Self::Error> {
+        let grpc::DeleteCollection {
             collection_name,
             timeout: _,
         } = value;
@@ -225,9 +231,9 @@ impl TryFrom<api::grpc::qdrant::DeleteCollection> for CollectionMetaOperations {
     }
 }
 
-impl From<api::grpc::qdrant::CreateAlias> for AliasOperations {
-    fn from(value: api::grpc::qdrant::CreateAlias) -> Self {
-        let api::grpc::qdrant::CreateAlias {
+impl From<grpc::CreateAlias> for AliasOperations {
+    fn from(value: grpc::CreateAlias) -> Self {
+        let grpc::CreateAlias {
             collection_name,
             alias_name,
         } = value;
@@ -240,18 +246,18 @@ impl From<api::grpc::qdrant::CreateAlias> for AliasOperations {
     }
 }
 
-impl From<api::grpc::qdrant::DeleteAlias> for AliasOperations {
-    fn from(value: api::grpc::qdrant::DeleteAlias) -> Self {
-        let api::grpc::qdrant::DeleteAlias { alias_name } = value;
+impl From<grpc::DeleteAlias> for AliasOperations {
+    fn from(value: grpc::DeleteAlias) -> Self {
+        let grpc::DeleteAlias { alias_name } = value;
         Self::DeleteAlias(DeleteAliasOperation {
             delete_alias: DeleteAlias { alias_name },
         })
     }
 }
 
-impl From<api::grpc::qdrant::RenameAlias> for AliasOperations {
-    fn from(value: api::grpc::qdrant::RenameAlias) -> Self {
-        let api::grpc::qdrant::RenameAlias {
+impl From<grpc::RenameAlias> for AliasOperations {
+    fn from(value: grpc::RenameAlias) -> Self {
+        let grpc::RenameAlias {
             old_alias_name,
             new_alias_name,
         } = value;
@@ -264,31 +270,25 @@ impl From<api::grpc::qdrant::RenameAlias> for AliasOperations {
     }
 }
 
-impl TryFrom<api::grpc::qdrant::AliasOperations> for AliasOperations {
+impl TryFrom<grpc::AliasOperations> for AliasOperations {
     type Error = Status;
 
-    fn try_from(value: api::grpc::qdrant::AliasOperations) -> Result<Self, Self::Error> {
-        let api::grpc::qdrant::AliasOperations { action } = value;
+    fn try_from(value: grpc::AliasOperations) -> Result<Self, Self::Error> {
+        let grpc::AliasOperations { action } = value;
         match action {
-            Some(api::grpc::qdrant::alias_operations::Action::CreateAlias(create)) => {
-                Ok(create.into())
-            }
-            Some(api::grpc::qdrant::alias_operations::Action::DeleteAlias(delete)) => {
-                Ok(delete.into())
-            }
-            Some(api::grpc::qdrant::alias_operations::Action::RenameAlias(rename)) => {
-                Ok(rename.into())
-            }
-            _ => Err(Status::invalid_argument("Malformed AliasOperation type")),
+            Some(grpc::alias_operations::Action::CreateAlias(create)) => Ok(create.into()),
+            Some(grpc::alias_operations::Action::DeleteAlias(delete)) => Ok(delete.into()),
+            Some(grpc::alias_operations::Action::RenameAlias(rename)) => Ok(rename.into()),
+            None => Err(Status::invalid_argument("Malformed AliasOperation type")),
         }
     }
 }
 
-impl TryFrom<api::grpc::qdrant::ChangeAliases> for CollectionMetaOperations {
+impl TryFrom<grpc::ChangeAliases> for CollectionMetaOperations {
     type Error = Status;
 
-    fn try_from(value: api::grpc::qdrant::ChangeAliases) -> Result<Self, Self::Error> {
-        let api::grpc::qdrant::ChangeAliases {
+    fn try_from(value: grpc::ChangeAliases) -> Result<Self, Self::Error> {
+        let grpc::ChangeAliases {
             actions,
             timeout: _,
         } = value;
@@ -297,5 +297,83 @@ impl TryFrom<api::grpc::qdrant::ChangeAliases> for CollectionMetaOperations {
             .map(|a| a.try_into())
             .collect::<Result<_, _>>()?;
         Ok(Self::ChangeAliases(ChangeAliasesOperation { actions }))
+    }
+}
+
+impl From<grpc::StateRole> for StateRole {
+    fn from(role: grpc::StateRole) -> Self {
+        match role {
+            grpc::StateRole::Follower => StateRole::Follower,
+            grpc::StateRole::Candidate => StateRole::Candidate,
+            grpc::StateRole::Leader => StateRole::Leader,
+            grpc::StateRole::PreCandidate => StateRole::PreCandidate,
+        }
+    }
+}
+
+impl From<StateRole> for grpc::StateRole {
+    fn from(role: StateRole) -> Self {
+        match role {
+            StateRole::Follower => grpc::StateRole::Follower,
+            StateRole::Candidate => grpc::StateRole::Candidate,
+            StateRole::Leader => grpc::StateRole::Leader,
+            StateRole::PreCandidate => grpc::StateRole::PreCandidate,
+        }
+    }
+}
+
+impl TryFrom<grpc::ConsensusThreadStatus> for ConsensusThreadStatus {
+    type Error = Status;
+
+    fn try_from(value: grpc::ConsensusThreadStatus) -> Result<Self, Self::Error> {
+        match value.status {
+            Some(grpc::consensus_thread_status::Status::Working(working)) => {
+                // Convert milliseconds to DateTime<Utc>
+                let timestamp = working.last_update_ms;
+                let datetime =
+                    DateTime::<Utc>::from_timestamp_millis(timestamp).ok_or_else(|| {
+                        Status::invalid_argument("Invalid timestamp for consensus thread status")
+                    })?;
+                Ok(ConsensusThreadStatus::Working {
+                    last_update: datetime,
+                })
+            }
+            Some(grpc::consensus_thread_status::Status::Stopped(_)) => {
+                Ok(ConsensusThreadStatus::Stopped)
+            }
+            Some(grpc::consensus_thread_status::Status::StoppedWithErr(err_status)) => {
+                Ok(ConsensusThreadStatus::StoppedWithErr {
+                    err: err_status.err,
+                })
+            }
+            None => Ok(ConsensusThreadStatus::Stopped),
+        }
+    }
+}
+
+impl From<ConsensusThreadStatus> for grpc::ConsensusThreadStatus {
+    fn from(status: ConsensusThreadStatus) -> Self {
+        match status {
+            ConsensusThreadStatus::Working { last_update } => {
+                let timestamp = last_update.timestamp_millis();
+                grpc::ConsensusThreadStatus {
+                    status: Some(grpc::consensus_thread_status::Status::Working(
+                        grpc::consensus_thread_status::Working {
+                            last_update_ms: timestamp,
+                        },
+                    )),
+                }
+            }
+            ConsensusThreadStatus::Stopped => grpc::ConsensusThreadStatus {
+                status: Some(grpc::consensus_thread_status::Status::Stopped(
+                    grpc::consensus_thread_status::Stopped {},
+                )),
+            },
+            ConsensusThreadStatus::StoppedWithErr { err } => grpc::ConsensusThreadStatus {
+                status: Some(grpc::consensus_thread_status::Status::StoppedWithErr(
+                    grpc::consensus_thread_status::StoppedWithErr { err },
+                )),
+            },
+        }
     }
 }

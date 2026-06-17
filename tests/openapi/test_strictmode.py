@@ -667,6 +667,42 @@ def test_strict_mode_update_vectors_max_batch_size(collection_name):
     assert not search_fail.ok
 
 
+def test_strict_mode_search_max_batch_size(collection_name):
+    def search_batch_request(n: int):
+        return request_with_validation(
+            api='/collections/{collection_name}/points/search/batch',
+            method="POST",
+            path_params={'collection_name': collection_name},
+            body={
+                "searches": [
+                    {
+                        "vector": [0.2, 0.1, 0.9, 0.7],
+                        "limit": 3
+                    } for _ in range(n)
+                ]
+            }
+        )
+
+    search_batch_request(3).raise_for_status()
+
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "search_max_batchsize": 3,
+    })
+
+    search_batch_request(3).raise_for_status()
+
+    set_strict_mode(collection_name, {
+        "enabled": True,
+        "search_max_batchsize": 2,
+    })
+
+    search_fail = search_batch_request(3)
+
+    assert "search batch size" in search_fail.json()['status']['error']
+    assert not search_fail.ok
+
+
 def test_strict_mode_max_collection_size_upsert(collection_name):
     basic_collection_setup(collection_name=collection_name)  # Clear collection to not depend on other tests
 
@@ -678,6 +714,7 @@ def test_strict_mode_max_collection_size_upsert(collection_name):
             api='/collections/{collection_name}/points',
             method="PUT",
             path_params={'collection_name': collection_name},
+            query_params={'wait': 'true'},
             body={
                 "batch": {
                     "ids": ids,
@@ -795,6 +832,7 @@ def test_strict_mode_max_collection_size_upsert_batch(collection_name):
             api='/collections/{collection_name}/points/batch',
             method="POST",
             path_params={'collection_name': collection_name},
+            query_params={'wait': 'true'},
             body={
                 "operations": [
                     {
@@ -1092,6 +1130,7 @@ def test_strict_mode_max_collection_payload_size_upsert_batch(collection_name):
             api='/collections/{collection_name}/points/batch',
             method="POST",
             path_params={'collection_name': collection_name},
+            query_params={'wait': 'true'},
             body={
                 "operations": [
                     {
@@ -1140,6 +1179,7 @@ def test_strict_mode_max_collection_point_count_upsert_batch(collection_name):
             api='/collections/{collection_name}/points/batch',
             method="POST",
             path_params={'collection_name': collection_name},
+            query_params={'wait': 'true'},
             body={
                 "operations": [
                     {

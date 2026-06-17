@@ -2,10 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use bitvec::prelude::BitSlice;
+use common::bitvec::BitSlice;
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::cow::SimpleCow;
+use common::types::ScoreType;
 use sparse::common::types::{DimId, DimWeight};
 
 use crate::data_types::tiny_map;
@@ -25,7 +26,7 @@ pub struct QueryIdfStats {
 
 #[derive(Debug)]
 pub struct QueryContext {
-    /// Total amount of available points in the segment.
+    /// Total amount of available (and visible) points in the segment.
     available_point_count: usize,
 
     /// Parameter, which defines how big a plain segment can be to be considered
@@ -69,6 +70,7 @@ impl QueryContext {
         self
     }
 
+    /// Returns the amount of available (and visible) points.
     pub fn available_point_count(&self) -> usize {
         self.available_point_count
     }
@@ -159,6 +161,10 @@ impl<'a> SegmentQueryContext<'a> {
     pub fn with_deleted_points(mut self, deleted_points: &'a BitSlice) -> Self {
         self.deleted_points = Some(deleted_points);
         self
+    }
+
+    pub fn is_stopped(&self) -> bool {
+        self.query_context.is_stopped()
     }
 
     pub fn fork(&self) -> Self {
@@ -256,5 +262,6 @@ pub struct FormulaContext {
     pub formula: ParsedFormula,
     pub prefetches_results: Vec<Vec<ScoredPoint>>,
     pub limit: usize,
+    pub score_threshold: Option<ScoreType>,
     pub is_stopped: Arc<AtomicBool>,
 }

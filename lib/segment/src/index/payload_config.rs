@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
-use io::file_operations::{atomic_save_json, read_json};
+use common::fs::{atomic_save_json, read_json};
 use serde::{Deserialize, Serialize};
 
 use crate::common::operation_error::OperationResult;
@@ -16,13 +16,6 @@ pub struct PayloadConfig {
     /// Mapping of payload index schemas and types
     #[serde(flatten)]
     pub indices: PayloadIndices,
-
-    /// If true, don't create/initialize RocksDB for payload index
-    /// This is required for migrating away from RocksDB in favor of the
-    /// custom storage engine
-    #[cfg(feature = "rocksdb")]
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub skip_rocksdb: Option<bool>,
 }
 
 impl PayloadConfig {
@@ -49,26 +42,6 @@ pub struct PayloadIndices {
 }
 
 impl PayloadIndices {
-    /// Check if any payload field has no explicit types configured
-    ///
-    /// Returns false if empty.
-    pub fn any_has_no_type(&self) -> bool {
-        self.fields.values().any(|index| index.types.is_empty())
-    }
-
-    /// Check if any payload field used RocksDB
-    ///
-    /// Returns false if empty.
-    #[cfg(feature = "rocksdb")]
-    pub fn any_is_rocksdb(&self) -> bool {
-        self.fields.values().any(|index| {
-            index
-                .types
-                .iter()
-                .any(|t| t.storage_type == StorageType::RocksDb)
-        })
-    }
-
     pub fn to_schemas(&self) -> HashMap<PayloadKeyType, PayloadFieldSchema> {
         self.fields
             .iter()
@@ -199,7 +172,6 @@ pub enum IndexMutability {
 #[serde(rename_all = "snake_case")]
 pub enum StorageType {
     Gridstore,
-    RocksDb,
     Mmap { is_on_disk: bool },
 }
 

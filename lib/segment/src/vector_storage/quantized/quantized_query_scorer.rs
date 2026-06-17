@@ -41,7 +41,7 @@ where
         let original_query_prequantized = TElement::quantization_preprocess(
             quantization_config,
             TMetric::distance(),
-            original_query.as_ref(),
+            original_query,
         );
         let query = quantized_data.encode_query(&original_query_prequantized);
 
@@ -79,6 +79,20 @@ where
     TEncodedVectors: quantization::EncodedVectors,
 {
     type TVector = [VectorElementType];
+
+    fn score_stored_batch(&self, ids: &[PointOffsetType], scores: &mut [ScoreType]) {
+        debug_assert_eq!(ids.len(), scores.len());
+
+        self.hardware_counter
+            .vector_io_read()
+            .incr_delta(ids.len() * self.quantized_data.quantized_vector_size());
+
+        for (idx, vector) in self.quantized_data.iter_batch(ids) {
+            scores[idx] = self
+                .quantized_data
+                .score(&self.query, &vector, &self.hardware_counter);
+        }
+    }
 
     fn score_stored(&self, idx: PointOffsetType) -> ScoreType {
         self.hardware_counter

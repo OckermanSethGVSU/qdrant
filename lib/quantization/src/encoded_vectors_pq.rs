@@ -3,6 +3,7 @@ use std::alloc::Layout;
 use std::arch::aarch64::*;
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::*;
+use std::borrow::Cow;
 use std::iter::repeat_with;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -10,14 +11,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use common::counter::hardware_counter::HardwareCounterCell;
+use common::fs::atomic_save_json;
+use common::mmap::MmapFlusher;
 use common::typelevel::True;
 use common::types::PointOffsetType;
-use io::file_operations::atomic_save_json;
-use memory::mmap_type::MmapFlusher;
+use fs_err as fs;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
-use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder};
+use crate::encoded_storage::{EncodedStorage, EncodedStorageBuilder, validate_storage_vector_size};
 use crate::encoded_vectors::{EncodedVectors, VectorParameters, validate_vector_parameters};
 use crate::kmeans::kmeans;
 use crate::{ConditionalVariable, EncodingError};
@@ -105,7 +107,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
         let metadata = Metadata {
             centroids,
             vector_division,
-            vector_parameters: vector_parameters.clone(),
+            vector_parameters: *vector_parameters,
         };
         if let Some(meta_path) = meta_path {
             meta_path
@@ -116,7 +118,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
                         "Path must have a parent directory",
                     )
                 })
-                .and_then(std::fs::create_dir_all)
+                .and_then(fs::create_dir_all)
                 .map_err(|e| {
                     EncodingError::EncodingError(format!(
                         "Failed to create metadata directory: {e}",
@@ -139,21 +141,20 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
     }
 
     pub fn load(encoded_vectors: TStorage, meta_path: &Path) -> std::io::Result<Self> {
-        let contents = std::fs::read_to_string(meta_path)?;
+        let contents = fs::read_to_string(meta_path)?;
         let metadata: Metadata = serde_json::from_str(&contents)?;
         let result = Self {
             encoded_vectors,
             metadata,
             metadata_path: Some(meta_path.to_path_buf()),
         };
-        Ok(result)
-    }
 
-    pub fn get_quantized_vector_size(
-        vector_parameters: &VectorParameters,
-        chunk_size: usize,
-    ) -> usize {
-        (0..vector_parameters.dim).step_by(chunk_size).count()
+        // Validate the storage's vector size against the metadata once here, so the size
+        // invariant the scoring hot path relies on (it walks the query LUT one entry per stored
+        // byte) also holds in release builds without a per-score check.
+        validate_storage_vector_size(&result.encoded_vectors, result.quantized_vector_size())?;
+
+        Ok(result)
     }
 
     fn get_vector_division(dim: usize, chunk_size: usize) -> Vec<Range<usize>> {
@@ -487,7 +488,7 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
             .sum()
     }
 
-    pub fn get_quantized_vector(&self, i: PointOffsetType) -> &[u8] {
+    pub fn get_quantized_vector(&self, i: PointOffsetType) -> Cow<'_, [u8]> {
         self.encoded_vectors.get_vector_data(i)
     }
 
@@ -502,6 +503,10 @@ impl<TStorage: EncodedStorage> EncodedVectorsPQ<TStorage> {
 
 impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
     type EncodedQuery = EncodedQueryPQ;
+
+    fn is_in_ram_or_mmap() -> bool {
+        TStorage::is_in_ram_or_mmap()
+    }
 
     fn is_on_disk(&self) -> bool {
         self.encoded_vectors.is_on_disk()
@@ -531,6 +536,22 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
         EncodedQueryPQ { lut }
     }
 
+    fn iter_batch(
+        &self,
+        offsets: &[PointOffsetType],
+    ) -> impl Iterator<Item = (usize, Cow<'_, [u8]>)> {
+        self.encoded_vectors.iter_batch(offsets)
+    }
+
+    fn score(
+        &self,
+        query: &Self::EncodedQuery,
+        encoded_vector: &[u8],
+        hw_counter: &HardwareCounterCell,
+    ) -> f32 {
+        self.score_bytes(True, query, encoded_vector, hw_counter)
+    }
+
     fn score_point(
         &self,
         query: &EncodedQueryPQ,
@@ -539,7 +560,7 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
     ) -> f32 {
         let centroids = self.encoded_vectors.get_vector_data(i);
 
-        self.score_bytes(True, query, centroids, hw_counter)
+        self.score_bytes(True, query, &centroids, hw_counter)
     }
 
     /// Score two points inside endoded data by their indexes
@@ -559,7 +580,7 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
             .incr_delta(self.metadata.vector_division.len() * 2);
 
         hw_counter.cpu_counter().incr_delta(
-            centroids_i.len()
+            centroids_i.as_ref().len()
             // Chunk size
                 * self
                     .metadata
@@ -571,7 +592,7 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
 
         let distance: f32 = centroids_i
             .iter()
-            .zip(centroids_j)
+            .zip(centroids_j.as_ref())
             .enumerate()
             .map(|(range_index, (&c_i, &c_j))| {
                 let range = &self.metadata.vector_division[range_index];
@@ -638,6 +659,23 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
         files
     }
 
+    fn heap_size_bytes(&self) -> usize {
+        let storage_heap = self.encoded_vectors.heap_size_bytes();
+        // PQ centroids: Vec<Vec<f32>> — outer Vec holds inner Vec structs,
+        // each inner Vec holds centroid floats
+        let centroids_heap: usize = self.metadata.centroids.capacity()
+            * std::mem::size_of::<Vec<f32>>()
+            + self
+                .metadata
+                .centroids
+                .iter()
+                .map(|c| c.capacity() * std::mem::size_of::<f32>())
+                .sum::<usize>();
+        let vector_division_heap =
+            self.metadata.vector_division.capacity() * std::mem::size_of::<Range<usize>>();
+        storage_heap + centroids_heap + vector_division_heap
+    }
+
     type SupportsBytes = True;
     fn score_bytes(
         &self,
@@ -662,4 +700,8 @@ impl<TStorage: EncodedStorage> EncodedVectors for EncodedVectorsPQ<TStorage> {
 
         self.score_point_simple(query, bytes)
     }
+}
+
+pub fn get_quantized_vector_size(vector_parameters: &VectorParameters, chunk_size: usize) -> usize {
+    (0..vector_parameters.dim).step_by(chunk_size).count()
 }

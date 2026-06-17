@@ -1,16 +1,18 @@
-use std::collections::HashSet;
-use std::fs::File;
 use std::sync::atomic::AtomicBool;
 
 use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::tar_ext;
+use common::types::DeferredBehavior;
+use fs_err::File;
 use segment::data_types::named_vectors::NamedVectors;
 use segment::data_types::query_context::QueryContext;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, QueryVector, only_default_vector};
-use segment::entry::SnapshotEntry as _;
-use segment::payload_json;
+use segment::entry::{
+    NonAppendableSegmentEntry as _, ReadSegmentEntry as _, SegmentEntry as _, SnapshotEntry as _,
+    StorageSegmentEntry as _,
+};
 use segment::types::{FieldCondition, PayloadSchemaType};
-use tempfile::{Builder, TempDir};
+use tempfile::Builder;
 
 use super::*;
 use crate::fixtures::*;
@@ -47,93 +49,139 @@ impl ProxySegment {
     }
 }
 
+/// Regression test for the proxy `deleted_mask` race that drops a live point from scored
+/// search (catalog: "exact dense search + payload filter drops a candidate", optimizer-on).
+///
+/// `deleted_mask` is a snapshot of the wrapped segment's deleted bitvec. If it is synced while
+/// the wrapped segment is still appendable, an upsert can still land afterwards at an internal
+/// offset past the snapshot; the scored search consults `deleted_mask` and treats every
+/// out-of-range offset as deleted (`check_deleted_condition` → `unwrap_or(true)`), silently
+/// excluding the live point even though scroll/retrieve still see it.
+///
+/// [`UnsyncedProxySegment::finalize`] is what reads the mask, so the fix is timing: finalize
+/// only once the wrapped segment is frozen, so the mask covers its full final point range. This
+/// test exercises both orderings on two parallel segments — finalize-before-race (buggy) vs
+/// finalize-after-race (fixed) — entirely at the proxy level, no model-testing harness involved.
 #[test]
-fn test_writing() {
-    let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
-    let original_segment = LockedSegment::new(build_segment_1(dir.path()));
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
+fn test_proxy_deleted_mask_resync_after_race_window_write() {
+    let hw_counter = HardwareCounterCell::new();
+    let query_vector: QueryVector = [1.0, 1.0, 1.0, 1.0].into();
 
-    let mut proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
+    // Build a wrapped segment with 2 points (internal offsets 0 and 1) and an unsynced proxy
+    // around it. Returns `(unsynced_proxy, wrapped_handle)` so the caller controls when the proxy
+    // is finalized (mask synced) relative to the race-window write.
+    let build_unsynced_proxy = |dir: &std::path::Path| -> (UnsyncedProxySegment, LockedSegment) {
+        let original_segment = LockedSegment::new(empty_segment(dir));
+        original_segment
+            .get()
+            .write()
+            .upsert_point(
+                1,
+                1.into(),
+                only_default_vector(&[1.0, 0.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+        original_segment
+            .get()
+            .write()
+            .upsert_point(
+                2,
+                2.into(),
+                only_default_vector(&[0.0, 1.0, 0.0, 0.0]),
+                &hw_counter,
+            )
+            .unwrap();
+
+        // Keep a handle so we can write to the wrapped segment around the proxy lifecycle.
+        let wrapped_handle = original_segment.clone();
+        let proxy = UnsyncedProxySegment::new(original_segment);
+        (proxy, wrapped_handle)
+    };
+
+    // Race-window write: a brand-new point lands at offset 2, past a length-2 `deleted_mask`.
+    let race_window_write = |wrapped: &LockedSegment| {
+        wrapped
+            .get()
+            .write()
+            .upsert_point(
+                11,
+                3.into(),
+                only_default_vector(&[1.0, 1.0, 1.0, 1.0]),
+                &hw_counter,
+            )
+            .unwrap();
+    };
+
+    let search_ids = |proxy: &ProxySegment| -> Vec<PointIdType> {
+        proxy
+            .search(
+                DEFAULT_VECTOR_NAME,
+                &query_vector,
+                &WithPayload::default(),
+                &false.into(),
+                None,
+                10,
+                None,
+            )
+            .unwrap()
+            .into_iter()
+            .map(|scored| scored.id)
+            .collect()
+    };
+
+    // --- Buggy ordering: finalize BEFORE the race write, so the mask snapshot stops at len 2 ---
+    let buggy_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (buggy_unsynced, buggy_wrapped) = build_unsynced_proxy(buggy_dir.path());
+    let mut buggy_proxy = buggy_unsynced.finalize();
+    race_window_write(&buggy_wrapped);
+    // A proxy-level delete makes `deleted_points` non-empty, which is what makes the search
+    // path consult `deleted_mask` instead of the wrapped segment's live deleted state.
+    buggy_proxy.delete_point(10, 1.into(), &hw_counter).unwrap();
+    let buggy_ids = search_ids(&buggy_proxy);
+    assert!(
+        !buggy_ids.contains(&3.into()),
+        "finalizing before the race the point should be (buggily) dropped, got {buggy_ids:?}",
     );
 
-    let hw_counter = HardwareCounterCell::new();
-
-    let vec4 = vec![1.1, 1.0, 0.0, 1.0];
-    proxy_segment
-        .upsert_point(100, 4.into(), only_default_vector(&vec4), &hw_counter)
-        .unwrap();
-    let vec6 = vec![1.0, 1.0, 0.5, 1.0];
-    proxy_segment
-        .upsert_point(101, 6.into(), only_default_vector(&vec6), &hw_counter)
-        .unwrap();
-    proxy_segment
-        .delete_point(102, 1.into(), &hw_counter)
-        .unwrap();
-
-    let query_vector = [1.0, 1.0, 1.0, 1.0].into();
-    let search_result = proxy_segment
-        .search(
-            DEFAULT_VECTOR_NAME,
-            &query_vector,
-            &WithPayload::default(),
-            &false.into(),
-            None,
-            10,
-            None,
-        )
-        .unwrap();
-
-    eprintln!("search_result = {search_result:#?}");
-
-    let mut seen_points: HashSet<PointIdType> = Default::default();
-    for res in search_result {
-        if seen_points.contains(&res.id) {
-            panic!("point {} appears multiple times", res.id);
-        }
-        seen_points.insert(res.id);
-    }
-
-    assert!(seen_points.contains(&4.into()));
-    assert!(seen_points.contains(&6.into()));
-    assert!(!seen_points.contains(&1.into()));
-
-    assert!(!proxy_segment.write_segment.get().read().has_point(2.into()));
-
-    let payload_key = "color".parse().unwrap();
-    proxy_segment
-        .delete_payload(103, 2.into(), &payload_key, &hw_counter)
-        .unwrap();
-
-    assert!(proxy_segment.write_segment.get().read().has_point(2.into()))
+    // --- Fixed ordering: finalize AFTER the race write (segment frozen), so the mask covers it ---
+    let fixed_dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
+    let (fixed_unsynced, fixed_wrapped) = build_unsynced_proxy(fixed_dir.path());
+    race_window_write(&fixed_wrapped);
+    let mut fixed_proxy = fixed_unsynced.finalize();
+    fixed_proxy.delete_point(10, 1.into(), &hw_counter).unwrap();
+    let fixed_ids = search_ids(&fixed_proxy);
+    assert!(
+        fixed_ids.contains(&3.into()),
+        "finalizing after the race the point must be searchable, got {fixed_ids:?}",
+    );
+    assert!(
+        !fixed_ids.contains(&1.into()),
+        "the proxy-deleted point must still be excluded after finalize, got {fixed_ids:?}",
+    );
 }
 
 #[test]
 fn test_search_batch_equivalence_single() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let original_segment = LockedSegment::new(build_segment_1(dir.path()));
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
-
-    let mut proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    );
-
     let hw_counter = HardwareCounterCell::new();
 
     let vec4 = vec![1.1, 1.0, 0.0, 1.0];
-    proxy_segment
+    original_segment
+        .get()
+        .write()
         .upsert_point(100, 4.into(), only_default_vector(&vec4), &hw_counter)
         .unwrap();
     let vec6 = vec![1.0, 1.0, 0.5, 1.0];
-    proxy_segment
+    original_segment
+        .get()
+        .write()
         .upsert_point(101, 6.into(), only_default_vector(&vec6), &hw_counter)
         .unwrap();
+
+    let mut proxy_segment = ProxySegment::new(original_segment);
+
     proxy_segment
         .delete_point(102, 1.into(), &hw_counter)
         .unwrap();
@@ -181,14 +229,8 @@ fn test_search_batch_equivalence_single() {
 fn test_search_batch_equivalence_single_random() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let original_segment = LockedSegment::new(random_segment(dir.path(), 100, 200, 4));
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
 
-    let proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    );
+    let proxy_segment = ProxySegment::new(original_segment);
 
     let query_vector = [1.0, 1.0, 1.0, 1.0].into();
     let search_result = proxy_segment
@@ -231,14 +273,8 @@ fn test_search_batch_equivalence_single_random() {
 fn test_search_batch_equivalence_multi_random() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let original_segment = LockedSegment::new(random_segment(dir.path(), 100, 200, 4));
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
 
-    let proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    );
+    let proxy_segment = ProxySegment::new(original_segment);
 
     let q1 = [1.0, 1.0, 1.0, 0.1];
     let q2 = [1.0, 1.0, 0.1, 0.1];
@@ -286,15 +322,8 @@ fn test_search_batch_equivalence_multi_random() {
     assert_eq!(all_single_results, search_batch_result)
 }
 
-fn wrap_proxy(dir: &TempDir, original_segment: LockedSegment) -> ProxySegment {
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
-
-    ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    )
+fn wrap_proxy(original_segment: LockedSegment) -> ProxySegment {
+    ProxySegment::new(original_segment)
 }
 
 #[test]
@@ -310,23 +339,33 @@ fn test_read_filter() {
         "blue".to_string().into(),
     )));
 
-    let original_points = original_segment.get().read().read_filtered(
-        None,
-        Some(100),
-        None,
-        &is_stopped,
-        &hw_counter,
-    );
+    let original_points = original_segment
+        .get()
+        .read()
+        .read_filtered(
+            None,
+            Some(100),
+            None,
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::Exclude,
+        )
+        .unwrap();
 
-    let original_points_filtered = original_segment.get().read().read_filtered(
-        None,
-        Some(100),
-        Some(&filter),
-        &is_stopped,
-        &hw_counter,
-    );
+    let original_points_filtered = original_segment
+        .get()
+        .read()
+        .read_filtered(
+            None,
+            Some(100),
+            Some(&filter),
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::Exclude,
+        )
+        .unwrap();
 
-    let mut proxy_segment = wrap_proxy(&dir, original_segment);
+    let mut proxy_segment = wrap_proxy(original_segment);
 
     let hw_counter = HardwareCounterCell::new();
 
@@ -334,9 +373,26 @@ fn test_read_filter() {
         .delete_point(100, 2.into(), &hw_counter)
         .unwrap();
 
-    let proxy_res = proxy_segment.read_filtered(None, Some(100), None, &is_stopped, &hw_counter);
-    let proxy_res_filtered =
-        proxy_segment.read_filtered(None, Some(100), Some(&filter), &is_stopped, &hw_counter);
+    let proxy_res = proxy_segment
+        .read_filtered(
+            None,
+            Some(100),
+            None,
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::Exclude,
+        )
+        .unwrap();
+    let proxy_res_filtered = proxy_segment
+        .read_filtered(
+            None,
+            Some(100),
+            Some(&filter),
+            &is_stopped,
+            &hw_counter,
+            DeferredBehavior::Exclude,
+        )
+        .unwrap();
 
     assert_eq!(original_points_filtered.len() - 1, proxy_res_filtered.len());
     assert_eq!(original_points.len() - 1, proxy_res.len());
@@ -352,21 +408,12 @@ fn test_read_range() {
         .read()
         .read_range(None, Some(10.into()));
 
-    let mut proxy_segment = wrap_proxy(&dir, original_segment);
+    let mut proxy_segment = wrap_proxy(original_segment);
 
     let hw_cell = HardwareCounterCell::new();
 
     proxy_segment.delete_point(100, 2.into(), &hw_cell).unwrap();
 
-    proxy_segment
-        .set_payload(
-            101,
-            3.into(),
-            &payload_json! { "color": vec!["red".to_owned()] },
-            &None,
-            &hw_cell,
-        )
-        .unwrap();
     let proxy_res = proxy_segment.read_range(None, Some(10.into()));
 
     assert_eq!(original_points.len() - 1, proxy_res.len());
@@ -389,16 +436,13 @@ fn test_sync_indexes() {
         )
         .unwrap();
 
-    let mut proxy_segment = ProxySegment::new(
-        original_segment.clone(),
-        write_segment.clone(),
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    );
+    let proxy_segment = ProxySegment::new(original_segment.clone());
 
     let hw_cell = HardwareCounterCell::new();
 
-    proxy_segment.replicate_field_indexes(0, &hw_cell).unwrap();
+    proxy_segment
+        .replicate_field_indexes(0, &hw_cell, &write_segment)
+        .unwrap();
 
     assert!(
         write_segment
@@ -425,7 +469,9 @@ fn test_sync_indexes() {
         .delete_field_index(12, &"color".parse().unwrap())
         .unwrap();
 
-    proxy_segment.replicate_field_indexes(0, &hw_cell).unwrap();
+    proxy_segment
+        .replicate_field_indexes(0, &hw_cell, &write_segment)
+        .unwrap();
 
     assert!(
         write_segment
@@ -448,75 +494,35 @@ fn test_take_snapshot() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let original_segment = LockedSegment::new(build_segment_1(dir.path()));
     let original_segment_2 = LockedSegment::new(build_segment_2(dir.path()));
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
-
-    let deleted_points = LockedRmSet::default();
-    let changed_indexes = LockedIndexChanges::default();
 
     let hw_cell = HardwareCounterCell::new();
 
-    let mut proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment.clone(),
-        Arc::clone(&deleted_points),
-        Arc::clone(&changed_indexes),
-    );
+    let mut proxy_segment = ProxySegment::new(original_segment);
 
-    let mut proxy_segment2 = ProxySegment::new(
-        original_segment_2,
-        write_segment,
-        deleted_points,
-        changed_indexes,
-    );
+    let proxy_segment2 = ProxySegment::new(original_segment_2);
 
-    let vec4 = vec![1.1, 1.0, 0.0, 1.0];
-    proxy_segment
-        .upsert_point(100, 4.into(), only_default_vector(&vec4), &hw_cell)
-        .unwrap();
-    let vec6 = vec![1.0, 1.0, 0.5, 1.0];
-    proxy_segment
-        .upsert_point(101, 6.into(), only_default_vector(&vec6), &hw_cell)
-        .unwrap();
     proxy_segment.delete_point(102, 1.into(), &hw_cell).unwrap();
-
-    proxy_segment2
-        .upsert_point(201, 11.into(), only_default_vector(&vec6), &hw_cell)
-        .unwrap();
 
     let snapshot_file = Builder::new().suffix(".snapshot.tar").tempfile().unwrap();
     eprintln!("Snapshot into {:?}", snapshot_file.path());
-    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(&snapshot_file).unwrap());
+    let tar = tar_ext::BuilderExt::new_seekable_owned(File::create(snapshot_file.path()).unwrap());
     let temp_dir = Builder::new().prefix("temp_dir").tempdir().unwrap();
     let temp_dir2 = Builder::new().prefix("temp_dir").tempdir().unwrap();
-    let mut snapshotted_segments = HashSet::new();
     proxy_segment
-        .take_snapshot(
-            temp_dir.path(),
-            &tar,
-            SnapshotFormat::Regular,
-            None,
-            &mut snapshotted_segments,
-        )
+        .take_snapshot(temp_dir.path(), &tar, SnapshotFormat::Regular, None)
         .unwrap();
     proxy_segment2
-        .take_snapshot(
-            temp_dir2.path(),
-            &tar,
-            SnapshotFormat::Regular,
-            None,
-            &mut snapshotted_segments,
-        )
+        .take_snapshot(temp_dir2.path(), &tar, SnapshotFormat::Regular, None)
         .unwrap();
     tar.blocking_finish().unwrap();
 
-    // validate that 3 archives were created:
-    // wrapped_segment1, wrapped_segment2 & shared write_segment
-    let mut tar = tar::Archive::new(File::open(&snapshot_file).unwrap());
+    // validate that 2 archives were created:
+    // wrapped_segment1, wrapped_segment2
+    let mut tar = tar::Archive::new(File::open(snapshot_file.path()).unwrap());
     let archive_count = tar.entries_with_seek().unwrap().count();
-    assert_eq!(archive_count, 3);
-    assert_eq!(snapshotted_segments.len(), 3);
+    assert_eq!(archive_count, 2);
 
-    let mut tar = tar::Archive::new(File::open(&snapshot_file).unwrap());
+    let mut tar = tar::Archive::new(File::open(snapshot_file.path()).unwrap());
     for entry in tar.entries_with_seek().unwrap() {
         let archive_path = entry.unwrap().path().unwrap().into_owned();
         let archive_extension = archive_path.extension().unwrap();
@@ -529,16 +535,10 @@ fn test_take_snapshot() {
 fn test_point_vector_count() {
     let dir = Builder::new().prefix("segment_dir").tempdir().unwrap();
     let original_segment = LockedSegment::new(build_segment_1(dir.path()));
-    let write_segment = LockedSegment::new(empty_segment(dir.path()));
 
     let hw_cell = HardwareCounterCell::new();
 
-    let mut proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    );
+    let mut proxy_segment = ProxySegment::new(original_segment);
 
     // We have 5 points by default, assert counts
     let segment_info = proxy_segment.info();
@@ -558,19 +558,10 @@ fn test_point_vector_count() {
     let segment_info = proxy_segment.info();
     assert_eq!(segment_info.num_points, 4);
     assert_eq!(segment_info.num_vectors, 4);
-
-    // Delete vector of point 2, vector count should now be zero
-    proxy_segment
-        .delete_vector(103, 2.into(), DEFAULT_VECTOR_NAME)
-        .unwrap();
-    let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 4);
-    assert_eq!(segment_info.num_vectors, 3);
 }
 
 #[test]
 fn test_point_vector_count_multivec() {
-    use segment::segment_constructor::build_segment;
     use segment::segment_constructor::simple_segment_constructor::{
         VECTOR1_NAME, VECTOR2_NAME, build_multivec_segment,
     };
@@ -581,7 +572,6 @@ fn test_point_vector_count_multivec() {
     let dim = 1;
 
     let mut original_segment = build_multivec_segment(dir.path(), dim, dim, Distance::Dot).unwrap();
-    let write_segment = build_segment(dir.path(), &original_segment.segment_config, true).unwrap();
 
     let hw_cell = HardwareCounterCell::new();
 
@@ -609,97 +599,25 @@ fn test_point_vector_count_multivec() {
         .unwrap();
 
     let original_segment = LockedSegment::new(original_segment);
-    let write_segment = LockedSegment::new(write_segment);
 
-    let mut proxy_segment = ProxySegment::new(
-        original_segment,
-        write_segment,
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
-    );
+    let mut proxy_segment = ProxySegment::new(original_segment);
 
     // Assert counts from original segment
     let segment_info = proxy_segment.info();
     assert_eq!(segment_info.num_points, 2);
     assert_eq!(segment_info.num_vectors, 4);
 
-    // Insert point ID 8 and 10 partially, assert counts
-    proxy_segment
-        .upsert_point(
-            102,
-            8.into(),
-            NamedVectors::from_pairs([(VECTOR1_NAME.into(), vec![0.0])]),
-            &hw_cell,
-        )
-        .unwrap();
-    proxy_segment
-        .upsert_point(
-            103,
-            10.into(),
-            NamedVectors::from_pairs([(VECTOR2_NAME.into(), vec![1.0])]),
-            &hw_cell,
-        )
-        .unwrap();
-    let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 4);
-    assert_eq!(segment_info.num_vectors, 6);
-
     // Delete nonexistent point, counts should remain the same
     proxy_segment.delete_point(104, 1.into(), &hw_cell).unwrap();
     let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 4);
-    assert_eq!(segment_info.num_vectors, 6);
+    assert_eq!(segment_info.num_points, 2);
+    assert_eq!(segment_info.num_vectors, 4);
 
     // Delete point 4, counts should decrease by 1
     proxy_segment.delete_point(105, 4.into(), &hw_cell).unwrap();
     let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 3);
-    assert_eq!(segment_info.num_vectors, 4);
-
-    // Delete vector 'a' of point 6, vector count should decrease by 1
-    proxy_segment
-        .delete_vector(106, 6.into(), VECTOR1_NAME)
-        .unwrap();
-    let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 3);
-    assert_eq!(segment_info.num_vectors, 3);
-
-    // Deleting it again shouldn't chain anything
-    proxy_segment
-        .delete_vector(107, 6.into(), VECTOR1_NAME)
-        .unwrap();
-    let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 3);
-    assert_eq!(segment_info.num_vectors, 3);
-
-    // Replace vector 'a' for point 8, counts should remain the same
-    proxy_segment
-        .upsert_point(
-            108,
-            8.into(),
-            NamedVectors::from_pairs([(VECTOR1_NAME.into(), vec![0.0])]),
-            &hw_cell,
-        )
-        .unwrap();
-    let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 3);
-    assert_eq!(segment_info.num_vectors, 3);
-
-    // Replace both vectors for point 8, adding a new vector
-    proxy_segment
-        .upsert_point(
-            109,
-            8.into(),
-            NamedVectors::from_pairs([
-                (VECTOR1_NAME.into(), vec![0.0]),
-                (VECTOR2_NAME.into(), vec![0.0]),
-            ]),
-            &hw_cell,
-        )
-        .unwrap();
-    let segment_info = proxy_segment.info();
-    assert_eq!(segment_info.num_points, 3);
-    assert_eq!(segment_info.num_vectors, 4);
+    assert_eq!(segment_info.num_points, 1);
+    assert_eq!(segment_info.num_vectors, 2);
 }
 
 #[test]
@@ -710,108 +628,86 @@ fn test_proxy_segment_flush() {
         .unwrap();
 
     let locked_wrapped_segment = LockedSegment::new(build_segment_1(tmp_dir.path()));
-    let locked_write_segment = LockedSegment::new(empty_segment(tmp_dir.path()));
 
-    let mut proxy_segment = ProxySegment::new(
-        locked_wrapped_segment.clone(),
-        locked_write_segment.clone(),
-        LockedRmSet::default(),
-        LockedIndexChanges::default(),
+    let mut proxy_segment = ProxySegment::new(locked_wrapped_segment.clone());
+
+    let flushed_version_1 = proxy_segment.flush(false).unwrap();
+
+    proxy_segment
+        .delete_point(100, 2.into(), &HardwareCounterCell::new())
+        .unwrap();
+
+    let flushed_version_2 = proxy_segment.flush(false).unwrap();
+
+    assert_eq!(flushed_version_2, flushed_version_1);
+
+    let version_after_delete = proxy_segment.version();
+
+    // We can never fully persist proxy segment, as list of deleted points is always in-memory only.
+    // So we have to keep WAL for deleted points.
+    assert!(version_after_delete > flushed_version_2);
+}
+
+#[test]
+fn test_proxy_deferred() {
+    let hw_counter = HardwareCounterCell::new();
+
+    let tmp_dir = tempfile::Builder::new()
+        .prefix("segment_dir")
+        .tempdir()
+        .unwrap();
+
+    let mut wrapped_segment = build_segment_with_deferred_1(tmp_dir.path());
+
+    let initial_estimation = wrapped_segment.estimate_point_count(None, &hw_counter);
+
+    let initial_deferred_point_count = wrapped_segment.size_info().num_deferred_points.unwrap();
+
+    wrapped_segment
+        .delete_point_internal(3, &hw_counter)
+        .unwrap();
+
+    assert_eq!(
+        wrapped_segment.size_info().num_deferred_points.unwrap(),
+        initial_deferred_point_count - 1
     );
 
-    // Unwrapped `LockedSegment`s for convenient access
-    let LockedSegment::Original(wrapped_segment) = locked_wrapped_segment else {
-        unreachable!();
-    };
+    let mut proxy_segment = ProxySegment::new(LockedSegment::new(wrapped_segment));
 
-    let LockedSegment::Original(write_segment) = locked_write_segment else {
-        unreachable!()
-    };
+    assert_eq!(
+        proxy_segment.size_info().num_deferred_points.unwrap(),
+        initial_deferred_point_count - 1
+    );
 
-    // - `wrapped_segment` has unflushed data
-    // - `write_segment` has no data
-    // - `proxy_segment` has no in-memory data
-    // - flush `proxy_segment`, ensure:
-    //   - `wrapped_segment` is flushed
-    //   - `ProxySegment::flush` returns `wrapped_segment`'s persisted version
-
-    let flushed_version = proxy_segment.flush(true, false).unwrap();
-    let wrapped_segment_persisted_version = *wrapped_segment.read().persisted_version.lock();
-    assert_eq!(Some(flushed_version), wrapped_segment_persisted_version);
-
-    // - `wrapped_segment` has unflushed data
-    // - `write_segment` has unflushed data
-    // - `proxy_segment` has no in-memory data
-    // - flush `proxy_segment`, ensure:
-    //   - `wrapped_segment` is flushed
-    //   - `write_segment` is flushed
-    //   - `ProxySegment::flush` returns `write_segment`'s persisted version
-
-    let current_version = proxy_segment.version();
-
-    let hw_cell = HardwareCounterCell::new();
-
-    wrapped_segment
-        .write()
-        .upsert_point(
-            current_version + 1,
-            42.into(),
-            only_default_vector(&[4.0, 2.0, 0.0, 0.0]),
-            &hw_cell,
-        )
-        .unwrap();
+    assert_eq!(proxy_segment.available_point_count_without_deferred(), 3);
 
     proxy_segment
-        .upsert_point(
-            current_version + 2,
-            69.into(),
-            only_default_vector(&[6.0, 9.0, 0.0, 0.0]),
-            &hw_cell,
-        )
+        .delete_point(7, 5.into(), &hw_counter)
         .unwrap();
 
-    let flushed_version = proxy_segment.flush(true, false).unwrap();
-    let wrapped_segment_persisted_version = *wrapped_segment.read().persisted_version.lock();
-    let write_segment_persisted_version = *write_segment.read().persisted_version.lock();
+    assert_eq!(
+        proxy_segment.size_info().num_deferred_points.unwrap(),
+        initial_deferred_point_count - 2
+    );
 
-    assert_eq!(wrapped_segment_persisted_version, Some(current_version + 1));
-    assert_eq!(write_segment_persisted_version, Some(current_version + 2));
-    assert_eq!(Some(flushed_version), write_segment_persisted_version);
+    assert_eq!(proxy_segment.available_point_count_without_deferred(), 3);
 
-    // - `wrapped_segment` has unflushed data
-    // - `write_segment` has unflushed data
-    // - `proxy_segment` has in-memory data
-    // - flush `proxy_segment`, ensure:
-    //   - `wrapped_segment` is flushed
-    //   - `write_segment` is flushed
-    //   - `ProxySegment::flush` returns `wrapped_segment`'s persisted version
+    // We didn't touch normal points so estimation should not change.
+    assert_eq!(
+        proxy_segment.estimate_point_count(None, &hw_counter),
+        initial_estimation
+    );
 
-    let current_version = proxy_segment.version();
-
-    wrapped_segment
-        .write()
-        .upsert_point(
-            current_version + 1,
-            666.into(),
-            only_default_vector(&[6.0, 6.0, 6.0, 0.0]),
-            &hw_cell,
-        )
-        .unwrap();
-
+    // Touch normal points
     proxy_segment
-        .upsert_point(
-            current_version + 2,
-            42.into(),
-            only_default_vector(&[0.0, 0.0, 4.0, 2.0]),
-            &hw_cell,
-        )
+        .delete_point(6, 1.into(), &hw_counter)
         .unwrap();
 
-    let flushed_version = proxy_segment.flush(true, false).unwrap();
-    let wrapped_segment_persisted_version = *wrapped_segment.read().persisted_version.lock();
-    let write_segment_persisted_version = *write_segment.read().persisted_version.lock();
+    // Now we must see a difference in estimation.
+    assert_ne!(
+        proxy_segment.estimate_point_count(None, &hw_counter),
+        initial_estimation
+    );
 
-    assert_eq!(wrapped_segment_persisted_version, Some(current_version + 1));
-    assert_eq!(write_segment_persisted_version, Some(current_version + 2));
-    assert_eq!(Some(flushed_version), wrapped_segment_persisted_version);
+    assert_eq!(proxy_segment.available_point_count_without_deferred(), 2);
 }

@@ -1,20 +1,20 @@
 use std::collections::HashSet;
-use std::fs::File;
 use std::path::Path;
-use std::sync::Arc;
 
+use common::fs::read_json;
+use common::storage_version::StorageVersion as _;
 use common::tar_ext::BuilderExt;
-use common::tempfile_ext::MaybeTempPath;
-use io::file_operations::read_json;
-use io::storage_version::StorageVersion as _;
-use segment::common::validate_snapshot_archive::open_snapshot_archive_with_validation;
-use segment::data_types::manifest::SnapshotManifest;
+use common::tar_unpack::tar_unpack_file;
+use fs_err::File;
 use segment::types::SnapshotFormat;
+use segment::utils::fs::move_all;
+use shard::files::PAYLOAD_INDEX_CONFIG_FILE;
+use shard::snapshots::snapshot_data::SnapshotData;
+use shard::snapshots::snapshot_manifest::{RecoveryType, SnapshotManifest};
 use tokio::sync::OwnedRwLockReadGuard;
 
 use super::Collection;
 use crate::collection::CollectionVersion;
-use crate::collection::payload_index_schema::PAYLOAD_INDEX_CONFIG_FILE;
 use crate::common::snapshot_stream::SnapshotStream;
 use crate::common::snapshots_manager::SnapshotStorageManager;
 use crate::config::{COLLECTION_CONFIG_FILE, CollectionConfigInternal, ShardingMethod};
@@ -23,9 +23,9 @@ use crate::operations::types::{CollectionError, CollectionResult, NodeType};
 use crate::shards::local_shard::LocalShard;
 use crate::shards::remote_shard::RemoteShard;
 use crate::shards::replica_set::ShardReplicaSet;
-use crate::shards::replica_set::snapshots::RecoveryType;
 use crate::shards::shard::{PeerId, ShardId};
 use crate::shards::shard_config::{self, ShardConfig};
+use crate::shards::shard_holder::recovery_guard::RecoveryProgressHandle;
 use crate::shards::shard_holder::shard_mapping::ShardKeyMapping;
 use crate::shards::shard_holder::{SHARD_KEY_MAPPING_FILE, ShardHolder, shard_not_found_error};
 use crate::shards::shard_path;
@@ -94,32 +94,41 @@ impl Collection {
                         global_temp_dir.display(),
                     ))
                 })?;
-            let shards_holder = self.shards_holder.read().await;
-            // Create snapshot of each shard
-            for (shard_id, replica_set) in shards_holder.get_shards() {
-                let shard_snapshot_path = shard_path(Path::new(""), shard_id);
 
-                // If node is listener, we can save whatever currently is in the storage
-                let save_wal = self.shared_storage_config.node_type != NodeType::Listener;
-                replica_set
-                    .create_snapshot(
-                        snapshot_temp_temp_dir.path(),
-                        &tar.descend(&shard_snapshot_path)?,
-                        SnapshotFormat::Regular,
-                        None,
-                        save_wal,
-                    )
-                    .await
-                    .map_err(|err| {
-                        CollectionError::service_error(format!("failed to create snapshot: {err}"))
-                    })?;
+            let mut futures = Vec::new();
+            {
+                let shards_holder = self.shards_holder.read().await;
+
+                // Create snapshot of each shard
+                for (shard_id, replica_set) in shards_holder.get_shards() {
+                    let shard_snapshot_path = shard_path(Path::new(""), shard_id);
+
+                    // If node is listener, we can save whatever currently is in the storage
+                    let save_wal = self.shared_storage_config.node_type != NodeType::Listener;
+                    let future = replica_set
+                        .create_snapshot(
+                            snapshot_temp_temp_dir.path(),
+                            tar.descend(&shard_snapshot_path)?,
+                            SnapshotFormat::Regular,
+                            None,
+                            save_wal,
+                        )
+                        .await?;
+                    futures.push(future);
+                }
+            }
+
+            for future in futures {
+                future.await.map_err(|err| {
+                    CollectionError::service_error(format!("failed to create snapshot: {err}"))
+                })?;
             }
         }
 
         // Save collection config and version
         tar.append_data(
             CollectionVersion::current_raw().as_bytes().to_vec(),
-            Path::new(io::storage_version::VERSION_FILE),
+            Path::new(common::storage_version::VERSION_FILE),
         )
         .await?;
 
@@ -159,14 +168,22 @@ impl Collection {
     ///
     /// This method performs blocking IO.
     pub fn restore_snapshot(
-        snapshot_path: &Path,
+        snapshot_data: SnapshotData,
         target_dir: &Path,
         this_peer_id: PeerId,
         is_distributed: bool,
     ) -> CollectionResult<()> {
-        // decompress archive
-        let mut ar = open_snapshot_archive_with_validation(snapshot_path)?;
-        ar.unpack(target_dir)?;
+        match snapshot_data {
+            SnapshotData::Packed(snapshot_path) => {
+                tar_unpack_file(&snapshot_path, target_dir)?;
+                snapshot_path.close()?;
+            }
+            SnapshotData::Unpacked(snapshot_dir) => {
+                // already unpacked snapshot, validate files and move to target dir
+                let snapshot_dir_path = snapshot_dir.path();
+                move_all(snapshot_dir_path, target_dir)?;
+            }
+        }
 
         let config = CollectionConfigInternal::load(target_dir)?;
         config.validate_and_warn();
@@ -272,11 +289,16 @@ impl Collection {
         shard_id: ShardId,
         temp_dir: &Path,
     ) -> CollectionResult<SnapshotDescription> {
-        self.shards_holder
+        let snapshot_creator = self
+            .shards_holder
             .read()
             .await
-            .create_shard_snapshot(&self.snapshots_path, &self.name(), shard_id, temp_dir)
-            .await
+            .create_shard_snapshot(&self.snapshots_path, self.name(), shard_id, temp_dir)
+            .await?;
+        // We don't hold shards_holder lock here on purpose,
+        // because snapshot creation may take a long time,
+        // and we don't want to block other operations on the collection.
+        snapshot_creator.await
     }
 
     pub async fn stream_shard_snapshot(
@@ -286,12 +308,12 @@ impl Collection {
         temp_dir: &Path,
     ) -> CollectionResult<SnapshotStream> {
         let shard = OwnedRwLockReadGuard::try_map(
-            Arc::clone(&self.shards_holder).read_owned().await,
-            |x| x.get_shard(shard_id),
+            self.shards_holder.clone().read_owned().await,
+            |shard_holder| shard_holder.get_shard(shard_id),
         )
         .map_err(|_| shard_not_found_error(shard_id))?;
 
-        ShardHolder::stream_shard_snapshot(shard, &self.name(), shard_id, manifest, temp_dir).await
+        ShardHolder::stream_shard_snapshot(shard, self.name(), shard_id, manifest, temp_dir).await
     }
 
     /// # Cancel safety
@@ -301,35 +323,29 @@ impl Collection {
     pub async fn restore_shard_snapshot(
         &self,
         shard_id: ShardId,
-        snapshot_path: MaybeTempPath,
+        snapshot_data: SnapshotData,
         recovery_type: RecoveryType,
         this_peer_id: PeerId,
         is_distributed: bool,
         temp_dir: &Path,
+        recovery_progress: Option<RecoveryProgressHandle>,
         cancel: cancel::CancellationToken,
     ) -> CollectionResult<impl Future<Output = CollectionResult<()>> + 'static> {
         // `ShardHolder::validate_shard_snapshot` is cancel safe, so we explicitly cancel it
         // when token is triggered
-        let shard_holder = cancel::future::cancel_on_token(cancel.clone(), async {
-            let shard_holder = self.shards_holder.clone().read_owned().await;
-
-            shard_holder.validate_shard_snapshot(&snapshot_path).await?;
-
-            CollectionResult::Ok(shard_holder)
-        })
-        .await??;
+        let shard_holder = self.shards_holder.clone().read_owned().await;
 
         let collection_path = self.path.clone();
-        let collection_name = self.name();
+        let collection_name = self.name().to_string();
 
         let temp_dir = temp_dir.to_path_buf();
 
         // `ShardHolder::restore_shard_snapshot` is *not* cancel safe, so we spawn it onto runtime,
         // so that it won't be cancelled if current future is dropped
-        let restore = tokio::spawn(async move {
+        let restore = self.update_runtime.spawn(async move {
             shard_holder
                 .restore_shard_snapshot(
-                    &snapshot_path,
+                    snapshot_data,
                     recovery_type,
                     &collection_path,
                     &collection_name,
@@ -337,13 +353,10 @@ impl Collection {
                     this_peer_id,
                     is_distributed,
                     &temp_dir,
+                    recovery_progress,
                     cancel,
                 )
                 .await?;
-
-            if let Err(err) = snapshot_path.close() {
-                log::error!("Failed to remove downloaded snapshot archive after recovery: {err}");
-            }
 
             CollectionResult::Ok(())
         });
@@ -362,6 +375,23 @@ impl Collection {
             .read()
             .await
             .assert_shard_exists(shard_id)
+    }
+
+    /// Drop the local shard and clear its on-disk data, before a shard snapshot
+    /// transfer downloads a replacement snapshot. See
+    /// [`ShardReplicaSet::clear_local_for_snapshot_recovery`] for details and safety
+    /// constraints.
+    pub async fn clear_local_shard_for_snapshot_recovery(
+        &self,
+        shard_id: ShardId,
+    ) -> CollectionResult<()> {
+        self.shards_holder
+            .read()
+            .await
+            .get_shard(shard_id)
+            .ok_or_else(|| shard_not_found_error(shard_id))?
+            .clear_local_for_snapshot_recovery(&self.path)
+            .await
     }
 
     pub async fn try_take_partial_snapshot_recovery_lock(

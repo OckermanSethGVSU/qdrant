@@ -1,3 +1,4 @@
+pub mod audit;
 pub mod auth;
 pub mod collections;
 pub mod debugger;
@@ -17,3 +18,4 @@ pub mod telemetry;
 pub mod telemetry_ops;
 pub mod telemetry_reporting;
 pub mod update;
+pub mod validate_vectors;

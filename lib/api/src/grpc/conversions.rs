@@ -8,18 +8,22 @@ use common::counter::hardware_accumulator::HwMeasurementAcc;
 use common::counter::hardware_data::HardwareData;
 use common::types::ScoreType;
 use itertools::Itertools;
+use ordered_float::OrderedFloat;
 use segment::common::operation_error::OperationError;
 use segment::data_types::index::{
     BoolIndexType, DatetimeIndexType, FloatIndexType, GeoIndexType, IntegerIndexType,
     KeywordIndexType, SnowballLanguage, TextIndexType, UuidIndexType,
 };
+use segment::data_types::modifier::Modifier;
 use segment::data_types::vectors::{DEFAULT_VECTOR_NAME, NamedMultiDenseVector, VectorInternal};
 use segment::data_types::{facets as segment_facets, vectors as segment_vectors};
 use segment::index::query_optimization::rescore_formula::parsed_formula::{
     DatetimeExpression, DecayKind, ParsedExpression, ParsedFormula,
 };
-use segment::types::{DateTimePayloadType, FloatPayloadType, default_quantization_ignore_value};
-use segment::vector_storage::query as segment_query;
+use segment::types::{
+    DateTimePayloadType, FloatPayloadType, VectorStorageDatatype, default_quantization_ignore_value,
+};
+use segment::vector_storage::query::{self as segment_query, NaiveFeedbackCoefficients};
 use sparse::common::sparse_vector::validate_sparse_vector_impl;
 use tonic::Status;
 use uuid::Uuid;
@@ -32,7 +36,8 @@ use super::qdrant::{
     MultiVectorConfig, OrderBy, OrderValue, Range, RawVector, RecommendStrategy, RetrievedPoint,
     SearchMatrixPair, SearchPointGroups, SearchPoints, ShardKeySelector, StartFrom,
     StrictModeMultivector, StrictModeMultivectorConfig, StrictModeSparse, StrictModeSparseConfig,
-    UuidIndexParams, VectorsOutput, WithLookup, raw_query, start_from,
+    TurboQuantBitSize, TurboQuantization, UuidIndexParams, VectorsOutput, WithLookup, raw_query,
+    start_from,
 };
 use super::stemming_algorithm::StemmingParams;
 use super::{Expression, Formula, RecoQuery, SnowballParams, StemmingAlgorithm, Usage};
@@ -43,14 +48,15 @@ use crate::grpc::qdrant::payload_index_params::IndexParams;
 use crate::grpc::qdrant::point_id::PointIdOptions;
 use crate::grpc::qdrant::with_payload_selector::SelectorOptions;
 use crate::grpc::qdrant::{
-    CollectionDescription, CollectionOperationResponse, Condition, Distance, FieldCondition,
-    Filter, GeoBoundingBox, GeoPoint, GeoPolygon, GeoRadius, HasIdCondition, HealthCheckReply,
-    HnswConfigDiff, IntegerIndexParams, IsEmptyCondition, IsNullCondition, ListCollectionsResponse,
-    Match, MinShould, NamedVectors, NestedCondition, PayloadExcludeSelector,
-    PayloadIncludeSelector, PayloadIndexParams, PayloadSchemaInfo, PayloadSchemaType, PointId,
-    PointStruct, PointsOperationResponse, PointsOperationResponseInternal, ProductQuantization,
-    QuantizationConfig, QuantizationSearchParams, QuantizationType, RepeatedIntegers,
-    RepeatedStrings, ScalarQuantization, ScoredPoint, SearchParams, ShardKey, StopwordsSet,
+    AcornSearchParams, CollectionDescription, CollectionOperationResponse, Condition, Distance,
+    FieldCondition, Filter, GeoBoundingBox, GeoPoint, GeoPolygon, GeoRadius, HasIdCondition,
+    HealthCheckReply, HnswConfigDiff, IntegerIndexParams, IsEmptyCondition, IsNullCondition,
+    ListCollectionsResponse, ListShardKeysResponse, Match, MinShould, NamedVectors,
+    NestedCondition, PayloadExcludeSelector, PayloadIncludeSelector, PayloadIndexParams,
+    PayloadSchemaInfo, PayloadSchemaType, PointId, PointStruct, PointsOperationResponse,
+    PointsOperationResponseInternal, ProductQuantization, QuantizationConfig,
+    QuantizationSearchParams, QuantizationType, RepeatedIntegers, RepeatedStrings,
+    ScalarQuantization, ScoredPoint, SearchParams, ShardKey, ShardKeyDescription, StopwordsSet,
     StrictModeConfig, TextIndexParams, TokenizerType, UpdateResult, UpdateResultInternal,
     ValuesCount, VectorsSelector, WithPayloadSelector, WithVectorsSelector, shard_key,
     with_vectors_selector,
@@ -59,7 +65,7 @@ use crate::grpc::{
     self, BinaryQuantizationEncoding, BinaryQuantizationQueryEncoding, DecayParamsExpression,
     DivExpression, GeoDistance, MultExpression, PowExpression, SumExpression,
 };
-use crate::rest::models::{CollectionsResponse, VersionInfo};
+use crate::rest::models::{CollectionsResponse, ShardKeysResponse, VersionInfo};
 use crate::rest::schema as rest;
 
 pub fn convert_shard_key_to_grpc(value: segment::types::ShardKey) -> ShardKey {
@@ -89,18 +95,57 @@ pub fn convert_shard_key_from_grpc_opt(
         shard_key::Key::Number(number) => segment::types::ShardKey::Number(number),
     })
 }
-impl From<ShardKeySelector> for rest::ShardKeySelector {
-    fn from(value: ShardKeySelector) -> Self {
-        let ShardKeySelector { shard_keys } = value;
+impl TryFrom<ShardKeySelector> for rest::ShardKeySelector {
+    type Error = Status;
+    fn try_from(value: ShardKeySelector) -> Result<Self, Self::Error> {
+        let ShardKeySelector {
+            shard_keys,
+            fallback,
+        } = value;
         let shard_keys: Vec<_> = shard_keys
             .into_iter()
             .filter_map(convert_shard_key_from_grpc)
             .collect();
 
         if shard_keys.len() == 1 {
-            rest::ShardKeySelector::ShardKey(shard_keys.into_iter().next().unwrap())
+            let key = shard_keys.into_iter().next().unwrap();
+
+            match fallback.and_then(convert_shard_key_from_grpc) {
+                Some(fallback) => Ok(rest::ShardKeySelector::ShardKeyWithFallback(
+                    rest::ShardKeyWithFallback {
+                        target: key,
+                        fallback,
+                    },
+                )),
+                None => Ok(rest::ShardKeySelector::ShardKey(key)),
+            }
         } else {
-            rest::ShardKeySelector::ShardKeys(shard_keys)
+            if fallback.is_some() {
+                return Err(Status::invalid_argument(format!(
+                    "Fallback shard key {fallback:?} can only be set when a single shard key is provided",
+                )));
+            }
+
+            Ok(rest::ShardKeySelector::ShardKeys(shard_keys))
+        }
+    }
+}
+
+impl From<(Instant, ShardKeysResponse)> for ListShardKeysResponse {
+    fn from(value: (Instant, ShardKeysResponse)) -> Self {
+        let (timing, response) = value;
+        let ShardKeysResponse { shard_keys } = response;
+        let shard_keys = shard_keys
+            .into_iter()
+            .flatten()
+            .map(|key_desc| {
+                let key = Some(convert_shard_key_to_grpc(key_desc.key));
+                ShardKeyDescription { key }
+            })
+            .collect();
+        Self {
+            shard_keys,
+            time: timing.elapsed().as_secs_f64(),
         }
     }
 }
@@ -152,11 +197,13 @@ impl From<segment::data_types::index::KeywordIndexParams> for PayloadIndexParams
             r#type: _,
             is_tenant,
             on_disk,
+            enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::KeywordIndexParams(KeywordIndexParams {
                 is_tenant,
                 on_disk,
+                enable_hnsw,
             })),
         }
     }
@@ -170,6 +217,7 @@ impl From<segment::data_types::index::IntegerIndexParams> for PayloadIndexParams
             range,
             on_disk,
             is_principal,
+            enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::IntegerIndexParams(IntegerIndexParams {
@@ -177,6 +225,7 @@ impl From<segment::data_types::index::IntegerIndexParams> for PayloadIndexParams
                 range,
                 is_principal,
                 on_disk,
+                enable_hnsw,
             })),
         }
     }
@@ -188,11 +237,13 @@ impl From<segment::data_types::index::FloatIndexParams> for PayloadIndexParams {
             r#type: _,
             on_disk,
             is_principal,
+            enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::FloatIndexParams(FloatIndexParams {
                 on_disk,
                 is_principal,
+                enable_hnsw,
             })),
         }
     }
@@ -200,9 +251,16 @@ impl From<segment::data_types::index::FloatIndexParams> for PayloadIndexParams {
 
 impl From<segment::data_types::index::GeoIndexParams> for PayloadIndexParams {
     fn from(params: segment::data_types::index::GeoIndexParams) -> Self {
-        let segment::data_types::index::GeoIndexParams { r#type: _, on_disk } = params;
+        let segment::data_types::index::GeoIndexParams {
+            r#type: _,
+            on_disk,
+            enable_hnsw,
+        } = params;
         PayloadIndexParams {
-            index_params: Some(IndexParams::GeoIndexParams(GeoIndexParams { on_disk })),
+            index_params: Some(IndexParams::GeoIndexParams(GeoIndexParams {
+                on_disk,
+                enable_hnsw,
+            })),
         }
     }
 }
@@ -215,10 +273,12 @@ impl From<segment::data_types::index::TextIndexParams> for PayloadIndexParams {
             min_token_len,
             max_token_len,
             lowercase,
+            ascii_folding,
             phrase_matching,
             on_disk,
             stopwords,
             stemmer,
+            enable_hnsw,
         } = params;
         let tokenizer = TokenizerType::from(tokenizer);
 
@@ -231,12 +291,14 @@ impl From<segment::data_types::index::TextIndexParams> for PayloadIndexParams {
             index_params: Some(IndexParams::TextIndexParams(TextIndexParams {
                 tokenizer: tokenizer as i32,
                 lowercase,
+                ascii_folding,
                 min_token_len: min_token_len.map(|x| x as u64),
                 max_token_len: max_token_len.map(|x| x as u64),
                 phrase_matching,
                 on_disk,
                 stopwords: stopwords_set,
                 stemmer: stemming_algo,
+                enable_hnsw,
             })),
         }
     }
@@ -244,9 +306,16 @@ impl From<segment::data_types::index::TextIndexParams> for PayloadIndexParams {
 
 impl From<segment::data_types::index::BoolIndexParams> for PayloadIndexParams {
     fn from(params: segment::data_types::index::BoolIndexParams) -> Self {
-        let segment::data_types::index::BoolIndexParams { r#type: _, on_disk } = params;
+        let segment::data_types::index::BoolIndexParams {
+            r#type: _,
+            on_disk,
+            enable_hnsw,
+        } = params;
         PayloadIndexParams {
-            index_params: Some(IndexParams::BoolIndexParams(BoolIndexParams { on_disk })),
+            index_params: Some(IndexParams::BoolIndexParams(BoolIndexParams {
+                on_disk,
+                enable_hnsw,
+            })),
         }
     }
 }
@@ -257,11 +326,13 @@ impl From<segment::data_types::index::UuidIndexParams> for PayloadIndexParams {
             r#type: _,
             is_tenant,
             on_disk,
+            enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::UuidIndexParams(UuidIndexParams {
                 is_tenant,
                 on_disk,
+                enable_hnsw,
             })),
         }
     }
@@ -273,11 +344,13 @@ impl From<segment::data_types::index::DatetimeIndexParams> for PayloadIndexParam
             r#type: _,
             on_disk,
             is_principal,
+            enable_hnsw,
         } = params;
         PayloadIndexParams {
             index_params: Some(IndexParams::DatetimeIndexParams(DatetimeIndexParams {
                 on_disk,
                 is_principal,
+                enable_hnsw,
             })),
         }
     }
@@ -292,7 +365,7 @@ impl From<segment::types::PayloadIndexInfo> for PayloadSchemaInfo {
         } = schema;
         PayloadSchemaInfo {
             data_type: PayloadSchemaType::from(data_type) as i32,
-            params: params.map(|p| p.into()),
+            params: params.map(Into::into),
             points: Some(points as u64),
         }
     }
@@ -410,11 +483,16 @@ impl From<segment::types::PayloadSchemaParams> for PayloadIndexParams {
 impl TryFrom<KeywordIndexParams> for segment::data_types::index::KeywordIndexParams {
     type Error = Status;
     fn try_from(params: KeywordIndexParams) -> Result<Self, Self::Error> {
-        let KeywordIndexParams { is_tenant, on_disk } = params;
+        let KeywordIndexParams {
+            is_tenant,
+            on_disk,
+            enable_hnsw,
+        } = params;
         Ok(segment::data_types::index::KeywordIndexParams {
             r#type: KeywordIndexType::Keyword,
             is_tenant,
             on_disk,
+            enable_hnsw,
         })
     }
 }
@@ -427,6 +505,7 @@ impl TryFrom<IntegerIndexParams> for segment::data_types::index::IntegerIndexPar
             range,
             is_principal,
             on_disk,
+            enable_hnsw,
         } = params;
         Ok(segment::data_types::index::IntegerIndexParams {
             r#type: IntegerIndexType::Integer,
@@ -434,6 +513,7 @@ impl TryFrom<IntegerIndexParams> for segment::data_types::index::IntegerIndexPar
             range,
             is_principal,
             on_disk,
+            enable_hnsw,
         })
     }
 }
@@ -444,11 +524,13 @@ impl TryFrom<FloatIndexParams> for segment::data_types::index::FloatIndexParams 
         let FloatIndexParams {
             on_disk,
             is_principal,
+            enable_hnsw,
         } = params;
         Ok(segment::data_types::index::FloatIndexParams {
             r#type: FloatIndexType::Float,
             on_disk,
             is_principal,
+            enable_hnsw,
         })
     }
 }
@@ -456,10 +538,14 @@ impl TryFrom<FloatIndexParams> for segment::data_types::index::FloatIndexParams 
 impl TryFrom<GeoIndexParams> for segment::data_types::index::GeoIndexParams {
     type Error = Status;
     fn try_from(params: GeoIndexParams) -> Result<Self, Self::Error> {
-        let GeoIndexParams { on_disk } = params;
+        let GeoIndexParams {
+            on_disk,
+            enable_hnsw,
+        } = params;
         Ok(segment::data_types::index::GeoIndexParams {
             r#type: GeoIndexType::Geo,
             on_disk,
+            enable_hnsw,
         })
     }
 }
@@ -482,16 +568,10 @@ impl TryFrom<StopwordsSet> for segment::data_types::index::StopwordsInterface {
             )
         };
 
-        let result_custom = if custom.is_empty() {
-            None
-        } else {
-            Some(custom.into_iter().map(|word| word.to_lowercase()).collect())
-        };
-
         Ok(segment::data_types::index::StopwordsInterface::Set(
             segment::data_types::index::StopwordsSet {
                 languages: result_languages,
-                custom: result_custom,
+                custom: (!custom.is_empty()).then_some(custom.into_iter().collect()),
             },
         ))
     }
@@ -503,12 +583,14 @@ impl TryFrom<TextIndexParams> for segment::data_types::index::TextIndexParams {
         let TextIndexParams {
             tokenizer,
             lowercase,
+            ascii_folding,
             min_token_len,
             max_token_len,
             phrase_matching,
             on_disk,
             stopwords,
             stemmer,
+            enable_hnsw,
         } = params;
 
         // Convert stopwords if present
@@ -531,12 +613,14 @@ impl TryFrom<TextIndexParams> for segment::data_types::index::TextIndexParams {
                 .map(|x| x.try_into())
                 .unwrap_or_else(|_| Err(Status::invalid_argument("unknown tokenizer type")))?,
             lowercase,
+            ascii_folding,
             min_token_len: min_token_len.map(|x| x as usize),
             max_token_len: max_token_len.map(|x| x as usize),
             phrase_matching,
             on_disk,
             stopwords: stopwords_converted,
             stemmer,
+            enable_hnsw,
         })
     }
 }
@@ -564,10 +648,14 @@ impl TryFrom<StemmingParams> for segment::data_types::index::StemmingAlgorithm {
 impl TryFrom<BoolIndexParams> for segment::data_types::index::BoolIndexParams {
     type Error = Status;
     fn try_from(params: BoolIndexParams) -> Result<Self, Self::Error> {
-        let BoolIndexParams { on_disk } = params;
+        let BoolIndexParams {
+            on_disk,
+            enable_hnsw,
+        } = params;
         Ok(segment::data_types::index::BoolIndexParams {
             r#type: BoolIndexType::Bool,
             on_disk,
+            enable_hnsw,
         })
     }
 }
@@ -578,11 +666,13 @@ impl TryFrom<DatetimeIndexParams> for segment::data_types::index::DatetimeIndexP
         let DatetimeIndexParams {
             on_disk,
             is_principal,
+            enable_hnsw,
         } = params;
         Ok(segment::data_types::index::DatetimeIndexParams {
             r#type: DatetimeIndexType::Datetime,
             on_disk,
             is_principal,
+            enable_hnsw,
         })
     }
 }
@@ -590,11 +680,16 @@ impl TryFrom<DatetimeIndexParams> for segment::data_types::index::DatetimeIndexP
 impl TryFrom<UuidIndexParams> for segment::data_types::index::UuidIndexParams {
     type Error = Status;
     fn try_from(params: UuidIndexParams) -> Result<Self, Self::Error> {
-        let UuidIndexParams { is_tenant, on_disk } = params;
+        let UuidIndexParams {
+            is_tenant,
+            on_disk,
+            enable_hnsw,
+        } = params;
         Ok(segment::data_types::index::UuidIndexParams {
             r#type: UuidIndexType::Uuid,
             is_tenant,
             on_disk,
+            enable_hnsw,
         })
     }
 }
@@ -692,7 +787,10 @@ impl From<(Instant, bool)> for CollectionOperationResponse {
 impl From<segment::types::GeoPoint> for GeoPoint {
     fn from(geo: segment::types::GeoPoint) -> Self {
         let segment::types::GeoPoint { lon, lat } = geo;
-        Self { lon, lat }
+        Self {
+            lon: lon.0,
+            lat: lat.0,
+        }
     }
 }
 
@@ -782,6 +880,32 @@ impl From<segment::types::QuantizationSearchParams> for QuantizationSearchParams
     }
 }
 
+impl From<AcornSearchParams> for segment::types::AcornSearchParams {
+    fn from(params: AcornSearchParams) -> Self {
+        let AcornSearchParams {
+            enable,
+            max_selectivity,
+        } = params;
+        Self {
+            enable: enable.unwrap_or(false),
+            max_selectivity: max_selectivity.map(OrderedFloat),
+        }
+    }
+}
+
+impl From<segment::types::AcornSearchParams> for AcornSearchParams {
+    fn from(params: segment::types::AcornSearchParams) -> Self {
+        let segment::types::AcornSearchParams {
+            enable,
+            max_selectivity,
+        } = params;
+        Self {
+            enable: Some(enable),
+            max_selectivity: max_selectivity.map(|OrderedFloat(x)| x),
+        }
+    }
+}
+
 impl From<SearchParams> for segment::types::SearchParams {
     fn from(params: SearchParams) -> Self {
         let SearchParams {
@@ -789,12 +913,14 @@ impl From<SearchParams> for segment::types::SearchParams {
             exact,
             quantization,
             indexed_only,
+            acorn,
         } = params;
         Self {
             hnsw_ef: hnsw_ef.map(|x| x as usize),
             exact: exact.unwrap_or(false),
-            quantization: quantization.map(|q| q.into()),
+            quantization: quantization.map(QuantizationSearchParams::into),
             indexed_only: indexed_only.unwrap_or(false),
+            acorn: acorn.map(segment::types::AcornSearchParams::from),
         }
     }
 }
@@ -806,12 +932,14 @@ impl From<segment::types::SearchParams> for SearchParams {
             exact,
             quantization,
             indexed_only,
+            acorn,
         } = params;
         Self {
             hnsw_ef: hnsw_ef.map(|x| x as u64),
             exact: Some(exact),
-            quantization: quantization.map(|q| q.into()),
+            quantization: quantization.map(Into::into),
             indexed_only: Some(indexed_only),
+            acorn: acorn.map(AcornSearchParams::from),
         }
     }
 }
@@ -882,13 +1010,13 @@ impl TryFrom<rest::Record> for RetrievedPoint {
 
 impl From<segment::data_types::order_by::OrderValue> for OrderValue {
     fn from(value: segment::data_types::order_by::OrderValue) -> Self {
-        use segment::data_types::order_by as segment;
+        use segment::data_types::order_by as segment_;
 
         use crate::grpc::qdrant::order_value::Variant;
 
         let variant = match value {
-            segment::OrderValue::Float(value) => Variant::Float(value),
-            segment::OrderValue::Int(value) => Variant::Int(value),
+            segment_::OrderValue::Float(value) => Variant::Float(value),
+            segment_::OrderValue::Int(value) => Variant::Int(value),
         };
 
         Self {
@@ -901,7 +1029,7 @@ impl TryFrom<OrderValue> for segment::data_types::order_by::OrderValue {
     type Error = Status;
 
     fn try_from(value: OrderValue) -> Result<Self, Self::Error> {
-        use segment::data_types::order_by as segment;
+        use segment::data_types::order_by as segment_;
 
         use crate::grpc::qdrant::order_value::Variant;
 
@@ -912,8 +1040,8 @@ impl TryFrom<OrderValue> for segment::data_types::order_by::OrderValue {
         })?;
 
         let value = match variant {
-            Variant::Float(value) => segment::OrderValue::Float(value),
-            Variant::Int(value) => segment::OrderValue::Int(value),
+            Variant::Float(value) => segment_::OrderValue::Float(value),
+            Variant::Int(value) => segment_::OrderValue::Int(value),
         };
 
         Ok(value)
@@ -1211,6 +1339,53 @@ impl TryFrom<BinaryQuantization> for segment::types::BinaryQuantization {
     }
 }
 
+impl From<segment::types::TurboQuantBitSize> for TurboQuantBitSize {
+    fn from(value: segment::types::TurboQuantBitSize) -> Self {
+        match value {
+            segment::types::TurboQuantBitSize::Bits1 => TurboQuantBitSize::Bits1,
+            segment::types::TurboQuantBitSize::Bits1_5 => TurboQuantBitSize::Bits15,
+            segment::types::TurboQuantBitSize::Bits2 => TurboQuantBitSize::Bits2,
+            segment::types::TurboQuantBitSize::Bits4 => TurboQuantBitSize::Bits4,
+        }
+    }
+}
+
+fn turbo_quant_bit_size_from_i32(value: i32) -> Result<segment::types::TurboQuantBitSize, Status> {
+    let grpc_bits = TurboQuantBitSize::try_from(value)
+        .map_err(|_| Status::invalid_argument("Unknown turbo quantization bit size"))?;
+    Ok(match grpc_bits {
+        TurboQuantBitSize::Bits1 => segment::types::TurboQuantBitSize::Bits1,
+        TurboQuantBitSize::Bits15 => segment::types::TurboQuantBitSize::Bits1_5,
+        TurboQuantBitSize::Bits2 => segment::types::TurboQuantBitSize::Bits2,
+        TurboQuantBitSize::Bits4 => segment::types::TurboQuantBitSize::Bits4,
+    })
+}
+
+impl From<segment::types::TurboQuantization> for TurboQuantization {
+    fn from(value: segment::types::TurboQuantization) -> Self {
+        let segment::types::TurboQuantization { turbo } = value;
+        let segment::types::TurboQuantQuantizationConfig { always_ram, bits } = turbo;
+
+        TurboQuantization {
+            always_ram,
+            bits: bits.map(|b| i32::from(TurboQuantBitSize::from(b))),
+        }
+    }
+}
+
+impl TryFrom<TurboQuantization> for segment::types::TurboQuantization {
+    type Error = Status;
+
+    fn try_from(value: TurboQuantization) -> Result<Self, Self::Error> {
+        let TurboQuantization { always_ram, bits } = value;
+        let bits = bits.map(turbo_quant_bit_size_from_i32).transpose()?;
+
+        Ok(segment::types::TurboQuantization {
+            turbo: segment::types::TurboQuantQuantizationConfig { always_ram, bits },
+        })
+    }
+}
+
 impl From<segment::types::QuantizationConfig> for QuantizationConfig {
     fn from(value: segment::types::QuantizationConfig) -> Self {
         match value {
@@ -1228,6 +1403,11 @@ impl From<segment::types::QuantizationConfig> for QuantizationConfig {
                 quantization: Some(super::qdrant::quantization_config::Quantization::Binary(
                     binary.into(),
                 )),
+            },
+            segment::types::QuantizationConfig::Turbo(turbo) => Self {
+                quantization: Some(
+                    super::qdrant::quantization_config::Quantization::Turboquant(turbo.into()),
+                ),
             },
         }
     }
@@ -1249,6 +1429,9 @@ impl TryFrom<QuantizationConfig> for segment::types::QuantizationConfig {
             ),
             super::qdrant::quantization_config::Quantization::Binary(config) => Ok(
                 segment::types::QuantizationConfig::Binary(config.try_into()?),
+            ),
+            super::qdrant::quantization_config::Quantization::Turboquant(config) => Ok(
+                segment::types::QuantizationConfig::Turbo(config.try_into()?),
             ),
         }
     }
@@ -1632,7 +1815,7 @@ impl TryFrom<FieldCondition> for segment::types::FieldCondition {
         let geo_radius = geo_radius.map_or_else(|| Ok(None), |g| g.try_into().map(Some))?;
         let geo_polygon = geo_polygon.map_or_else(|| Ok(None), |g| g.try_into().map(Some))?;
 
-        let mut range = range.map(Into::into);
+        let mut range = range.map(Range::into);
         if range.is_none() {
             range = datetime_range
                 .map(segment::types::RangeInterface::try_from)
@@ -1646,7 +1829,7 @@ impl TryFrom<FieldCondition> for segment::types::FieldCondition {
             geo_bounding_box,
             geo_radius,
             geo_polygon,
-            values_count: values_count.map(Into::into),
+            values_count: values_count.map(ValuesCount::into),
             is_empty,
             is_null,
         })
@@ -1668,7 +1851,7 @@ impl From<segment::types::FieldCondition> for FieldCondition {
         } = value;
 
         let (range, datetime_range) = match range {
-            Some(segment::types::RangeInterface::Float(range)) => (Some(range.into()), None),
+            Some(segment::types::RangeInterface::Float(range)) => (Some(Range::from(range)), None),
             Some(segment::types::RangeInterface::DateTime(range)) => (None, Some(range.into())),
             None => (None, None),
         };
@@ -1727,8 +1910,8 @@ impl TryFrom<GeoRadius> for segment::types::GeoRadius {
                 center: Some(c),
                 radius,
             } => Ok(Self {
-                center: c.into(),
-                radius: radius.into(),
+                center: segment::types::GeoPoint::from(c),
+                radius: OrderedFloat(FloatPayloadType::from(radius)),
             }),
             _ => Err(Status::invalid_argument("Malformed GeoRadius type")),
         }
@@ -1740,7 +1923,7 @@ impl From<segment::types::GeoRadius> for GeoRadius {
         let segment::types::GeoRadius { center, radius } = value;
         Self {
             center: Some(center.into()),
-            radius: radius as f32, // TODO lossy ok?
+            radius: radius.0 as f32, // TODO lossy ok?
         }
     }
 }
@@ -1755,7 +1938,7 @@ impl TryFrom<GeoPolygon> for segment::types::GeoPolygon {
                 interiors,
             } => Ok(Self {
                 exterior: e.into(),
-                interiors: Some(interiors.into_iter().map(Into::into).collect()),
+                interiors: Some(interiors.into_iter().map(GeoLineString::into).collect()),
             }),
             _ => Err(Status::invalid_argument(
                 "Malformed GeoPolygon type - field `exterior` is required",
@@ -1784,7 +1967,10 @@ impl From<segment::types::GeoPolygon> for GeoPolygon {
 impl From<GeoPoint> for segment::types::GeoPoint {
     fn from(value: GeoPoint) -> Self {
         let GeoPoint { lon, lat } = value;
-        Self { lon, lat }
+        Self {
+            lon: OrderedFloat(lon),
+            lat: OrderedFloat(lat),
+        }
     }
 }
 
@@ -1792,7 +1978,7 @@ impl From<GeoLineString> for segment::types::GeoLineString {
     fn from(value: GeoLineString) -> Self {
         let GeoLineString { points } = value;
         Self {
-            points: points.into_iter().map(Into::into).collect(),
+            points: points.into_iter().map(GeoPoint::into).collect(),
         }
     }
 }
@@ -1806,17 +1992,27 @@ impl From<segment::types::GeoLineString> for GeoLineString {
     }
 }
 
-impl From<Range> for segment::types::Range<FloatPayloadType> {
+impl From<Range> for segment::types::Range<OrderedFloat<FloatPayloadType>> {
     fn from(value: Range) -> Self {
         let Range { lt, gt, gte, lte } = value;
-        Self { lt, gt, gte, lte }
+        Self {
+            lt: lt.map(OrderedFloat::from),
+            gt: gt.map(OrderedFloat::from),
+            gte: gte.map(OrderedFloat::from),
+            lte: lte.map(OrderedFloat::from),
+        }
     }
 }
 
-impl From<segment::types::Range<FloatPayloadType>> for Range {
-    fn from(value: segment::types::Range<FloatPayloadType>) -> Self {
+impl From<segment::types::Range<OrderedFloat<FloatPayloadType>>> for Range {
+    fn from(value: segment::types::Range<OrderedFloat<FloatPayloadType>>) -> Self {
         let segment::types::Range { lt, gt, gte, lte } = value;
-        Self { lt, gt, gte, lte }
+        Self {
+            lt: lt.map(FloatPayloadType::from),
+            gt: gt.map(FloatPayloadType::from),
+            gte: gte.map(FloatPayloadType::from),
+            lte: lte.map(FloatPayloadType::from),
+        }
     }
 }
 
@@ -2023,7 +2219,7 @@ impl From<segment::data_types::order_by::OrderBy> for OrderBy {
         Self {
             key: key.to_string(),
             direction: direction.map(|d| Direction::from(d) as i32),
-            start_from: start_from.map(|start_from| start_from.into()),
+            start_from: start_from.map(Into::into),
         }
     }
 }
@@ -2126,7 +2322,7 @@ impl From<HnswConfigDiff> for segment::types::HnswConfig {
             max_indexing_threads,
             on_disk,
             payload_m,
-            copy_vectors,
+            inline_storage,
         } = hnsw_config;
         Self {
             m: m.unwrap_or_default() as usize,
@@ -2135,7 +2331,7 @@ impl From<HnswConfigDiff> for segment::types::HnswConfig {
             max_indexing_threads: max_indexing_threads.unwrap_or_default() as usize,
             on_disk,
             payload_m: payload_m.map(|x| x as usize),
-            copy_vectors,
+            inline_storage,
         }
     }
 }
@@ -2152,6 +2348,7 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfig {
             search_allow_exact,
             search_max_oversampling,
             upsert_max_batchsize,
+            search_max_batchsize,
             max_collection_vector_size_bytes,
             read_rate_limit,
             write_rate_limit,
@@ -2162,6 +2359,8 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfig {
             multivector_config,
             sparse_config,
             max_payload_index_count,
+            max_resident_memory_percent,
+            max_disk_usage_percent,
         } = value;
         Self {
             enabled,
@@ -2173,6 +2372,7 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfig {
             search_allow_exact,
             search_max_oversampling: search_max_oversampling.map(f64::from),
             upsert_max_batchsize: upsert_max_batchsize.map(|i| i as usize),
+            search_max_batchsize: search_max_batchsize.map(|i| i as usize),
             max_collection_vector_size_bytes: max_collection_vector_size_bytes.map(|i| i as usize),
             read_rate_limit: read_rate_limit.map(|i| i as usize),
             write_rate_limit: write_rate_limit.map(|i| i as usize),
@@ -2185,6 +2385,8 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfig {
                 .map(segment::types::StrictModeMultivectorConfig::from),
             sparse_config: sparse_config.map(segment::types::StrictModeSparseConfig::from),
             max_payload_index_count: max_payload_index_count.map(|i| i as usize),
+            max_resident_memory_percent: max_resident_memory_percent.map(|i| i as u8),
+            max_disk_usage_percent: max_disk_usage_percent.map(|i| i as u8),
         }
     }
 }
@@ -2277,6 +2479,7 @@ impl From<segment::types::StrictModeConfigOutput> for StrictModeConfig {
             search_allow_exact,
             search_max_oversampling,
             upsert_max_batchsize,
+            search_max_batchsize,
             max_collection_vector_size_bytes,
             read_rate_limit,
             write_rate_limit,
@@ -2287,6 +2490,8 @@ impl From<segment::types::StrictModeConfigOutput> for StrictModeConfig {
             multivector_config,
             sparse_config,
             max_payload_index_count,
+            max_resident_memory_percent,
+            max_disk_usage_percent,
         } = value;
         Self {
             enabled,
@@ -2298,6 +2503,7 @@ impl From<segment::types::StrictModeConfigOutput> for StrictModeConfig {
             search_allow_exact,
             search_max_oversampling: search_max_oversampling.map(|i| i as f32),
             upsert_max_batchsize: upsert_max_batchsize.map(|i| i as u64),
+            search_max_batchsize: search_max_batchsize.map(|i| i as u64),
             max_collection_vector_size_bytes: max_collection_vector_size_bytes.map(|i| i as u64),
             read_rate_limit: read_rate_limit.map(|i| i as u32),
             write_rate_limit: write_rate_limit.map(|i| i as u32),
@@ -2308,6 +2514,8 @@ impl From<segment::types::StrictModeConfigOutput> for StrictModeConfig {
             sparse_config: sparse_config.map(StrictModeSparseConfig::from),
             max_points_count: max_points_count.map(|i| i as u64),
             max_payload_index_count: max_payload_index_count.map(|i| i as u64),
+            max_resident_memory_percent: max_resident_memory_percent.map(u32::from),
+            max_disk_usage_percent: max_disk_usage_percent.map(u32::from),
         }
     }
 }
@@ -2324,6 +2532,7 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfigOutput {
             search_allow_exact,
             search_max_oversampling,
             upsert_max_batchsize,
+            search_max_batchsize,
             max_collection_vector_size_bytes,
             read_rate_limit,
             write_rate_limit,
@@ -2334,6 +2543,8 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfigOutput {
             multivector_config,
             sparse_config,
             max_payload_index_count,
+            max_resident_memory_percent,
+            max_disk_usage_percent,
         } = value;
         Self {
             enabled,
@@ -2345,6 +2556,7 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfigOutput {
             search_allow_exact,
             search_max_oversampling: search_max_oversampling.map(f64::from),
             upsert_max_batchsize: upsert_max_batchsize.map(|i| i as usize),
+            search_max_batchsize: search_max_batchsize.map(|i| i as usize),
             max_collection_vector_size_bytes: max_collection_vector_size_bytes.map(|i| i as usize),
             read_rate_limit: read_rate_limit.map(|i| i as usize),
             write_rate_limit: write_rate_limit.map(|i| i as usize),
@@ -2357,6 +2569,8 @@ impl From<StrictModeConfig> for segment::types::StrictModeConfigOutput {
                 .map(segment::types::StrictModeMultivectorConfigOutput::from),
             sparse_config: sparse_config.map(segment::types::StrictModeSparseConfigOutput::from),
             max_payload_index_count: max_payload_index_count.map(|i| i as usize),
+            max_resident_memory_percent: max_resident_memory_percent.map(|i| i as u8),
+            max_disk_usage_percent: max_disk_usage_percent.map(|i| i as u8),
         }
     }
 }
@@ -2446,7 +2660,7 @@ pub fn try_date_time_from_proto(
     date_time: prost_wkt_types::Timestamp,
 ) -> Result<DateTimePayloadType, Status> {
     chrono::DateTime::from_timestamp(date_time.seconds, date_time.nanos.try_into().unwrap_or(0))
-        .map(|date_time| date_time.into())
+        .map(DateTimePayloadType::from)
         .ok_or_else(|| Status::invalid_argument(format!("Unable to parse timestamp: {date_time}")))
 }
 
@@ -2552,7 +2766,7 @@ impl From<PointsOperationResponse> for PointsOperationResponseInternal {
             inference,
         } = usage.unwrap_or_default();
         Self {
-            result: result.map(Into::into),
+            result: result.map(UpdateResult::into),
             time,
             hardware_usage: hardware,
             inference_usage: inference,
@@ -2731,9 +2945,9 @@ impl TryFrom<raw_query::Context> for segment_query::ContextQuery<segment_vectors
     }
 }
 
-impl From<segment_query::DiscoveryQuery<segment_vectors::VectorInternal>> for raw_query::Discovery {
-    fn from(value: segment_query::DiscoveryQuery<segment_vectors::VectorInternal>) -> Self {
-        let segment_query::DiscoveryQuery { target, pairs } = value;
+impl From<segment_query::DiscoverQuery<segment_vectors::VectorInternal>> for raw_query::Discovery {
+    fn from(value: segment_query::DiscoverQuery<segment_vectors::VectorInternal>) -> Self {
+        let segment_query::DiscoverQuery { target, pairs } = value;
         Self {
             target: Some(RawVector::from(target)),
             context: pairs
@@ -2745,7 +2959,7 @@ impl From<segment_query::DiscoveryQuery<segment_vectors::VectorInternal>> for ra
 }
 
 impl TryFrom<raw_query::Discovery>
-    for segment_query::DiscoveryQuery<segment_vectors::VectorInternal>
+    for segment_query::DiscoverQuery<segment_vectors::VectorInternal>
 {
     type Error = Status;
     fn try_from(value: raw_query::Discovery) -> Result<Self, Self::Error> {
@@ -2759,6 +2973,50 @@ impl TryFrom<raw_query::Discovery>
                 .into_iter()
                 .map(segment_query::ContextPair::try_from)
                 .try_collect()?,
+        })
+    }
+}
+
+impl From<segment_query::NaiveFeedbackQuery<VectorInternal>> for raw_query::Feedback {
+    fn from(value: segment_query::NaiveFeedbackQuery<VectorInternal>) -> Self {
+        let segment_query::NaiveFeedbackQuery {
+            target,
+            feedback,
+            coefficients,
+        } = value;
+
+        Self {
+            target: Some(target.into()),
+            feedback: feedback.into_iter().map_into().collect(),
+            strategy: Some(grpc::FeedbackStrategy {
+                variant: Some(grpc::feedback_strategy::Variant::Naive(coefficients.into())),
+            }),
+        }
+    }
+}
+
+impl From<segment_query::FeedbackItem<VectorInternal>> for raw_query::RawFeedbackItem {
+    fn from(value: segment_query::FeedbackItem<VectorInternal>) -> Self {
+        let segment_query::FeedbackItem { vector, score } = value;
+
+        Self {
+            vector: Some(vector.into()),
+            score: score.into(),
+        }
+    }
+}
+
+impl TryFrom<raw_query::RawFeedbackItem>
+    for segment_query::FeedbackItem<segment_vectors::VectorInternal>
+{
+    type Error = Status;
+    fn try_from(value: raw_query::RawFeedbackItem) -> Result<Self, Self::Error> {
+        let raw_query::RawFeedbackItem { vector, score } = value;
+        Ok(Self {
+            vector: segment_vectors::VectorInternal::try_from(
+                vector.ok_or_else(|| Status::invalid_argument("No vector provided"))?,
+            )?,
+            score: OrderedFloat(score),
         })
     }
 }
@@ -2801,13 +3059,13 @@ impl TryFrom<SearchPoints> for rest::SearchRequestInternal {
         Ok(Self {
             vector,
             filter: filter.map(|f| f.try_into()).transpose()?,
-            params: params.map(|p| p.into()),
+            params: params.map(SearchParams::into),
             limit: limit as usize,
             offset: offset.map(|x| x as usize),
             with_payload: with_payload.map(|wp| wp.try_into()).transpose()?,
             with_vector: Some(
                 with_vectors
-                    .map(|with_vectors| with_vectors.into())
+                    .map(WithVectorsSelector::into)
                     .unwrap_or_default(),
             ),
             score_threshold,
@@ -2918,23 +3176,26 @@ impl TryFrom<WithLookup> for rest::WithLookup {
                 .map(|wp| wp.try_into())
                 .transpose()?
                 .or_else(with_default_payload),
-            with_vectors: with_vectors.map(|wv| wv.into()),
+            with_vectors: with_vectors.map(WithVectorsSelector::into),
         })
     }
 }
 
-impl From<LookupLocation> for rest::LookupLocation {
-    fn from(value: LookupLocation) -> Self {
+impl TryFrom<LookupLocation> for rest::LookupLocation {
+    type Error = Status;
+    fn try_from(value: LookupLocation) -> Result<Self, Self::Error> {
         let LookupLocation {
             collection_name,
             vector_name,
             shard_key_selector,
         } = value;
-        Self {
+        Ok(Self {
             collection: collection_name,
             vector: vector_name,
-            shard_key: shard_key_selector.map(rest::ShardKeySelector::from),
-        }
+            shard_key: shard_key_selector
+                .map(rest::ShardKeySelector::try_from)
+                .transpose()?,
+        })
     }
 }
 
@@ -3043,14 +3304,24 @@ impl From<rest::SearchMatrixPair> for SearchMatrixPair {
 
 impl From<HwMeasurementAcc> for HardwareUsage {
     fn from(value: HwMeasurementAcc) -> Self {
+        let HardwareData {
+            cpu,
+            payload_io_read,
+            payload_io_write,
+            payload_index_io_read,
+            payload_index_io_write,
+            vector_io_read,
+            vector_io_write,
+        } = value.hw_data();
+
         Self {
-            cpu: value.get_cpu() as u64,
-            payload_io_read: value.get_payload_io_read() as u64,
-            payload_io_write: value.get_payload_io_write() as u64,
-            payload_index_io_read: value.get_payload_index_io_read() as u64,
-            payload_index_io_write: value.get_payload_index_io_write() as u64,
-            vector_io_read: value.get_vector_io_read() as u64,
-            vector_io_write: value.get_vector_io_write() as u64,
+            cpu: cpu as u64,
+            payload_io_read: payload_io_read as u64,
+            payload_io_write: payload_io_write as u64,
+            payload_index_io_read: payload_index_io_read as u64,
+            payload_index_io_write: payload_index_io_write as u64,
+            vector_io_read: vector_io_read as u64,
+            vector_io_write: vector_io_write as u64,
         }
     }
 }
@@ -3075,6 +3346,30 @@ impl From<HardwareUsage> for HardwareData {
             payload_index_io_write: payload_index_io_write as usize,
             vector_io_read: vector_io_read as usize,
             vector_io_write: vector_io_write as usize,
+        }
+    }
+}
+
+impl From<NaiveFeedbackCoefficients> for grpc::NaiveFeedbackStrategy {
+    fn from(value: NaiveFeedbackCoefficients) -> Self {
+        let NaiveFeedbackCoefficients { a, b, c } = value;
+
+        Self {
+            a: a.0,
+            b: b.0,
+            c: c.0,
+        }
+    }
+}
+
+impl From<grpc::NaiveFeedbackStrategy> for NaiveFeedbackCoefficients {
+    fn from(value: grpc::NaiveFeedbackStrategy) -> Self {
+        let grpc::NaiveFeedbackStrategy { a, b, c } = value;
+
+        Self {
+            a: OrderedFloat(a),
+            b: OrderedFloat(b),
+            c: OrderedFloat(c),
         }
     }
 }
@@ -3200,5 +3495,145 @@ fn unparse_expression(
 
     Expression {
         variant: Some(variant),
+    }
+}
+
+impl From<grpc::Modifier> for Modifier {
+    fn from(value: grpc::Modifier) -> Self {
+        match value {
+            grpc::Modifier::None => Modifier::None,
+            grpc::Modifier::Idf => Modifier::Idf,
+        }
+    }
+}
+
+impl From<Modifier> for grpc::Modifier {
+    fn from(value: Modifier) -> Self {
+        match value {
+            Modifier::None => grpc::Modifier::None,
+            Modifier::Idf => grpc::Modifier::Idf,
+        }
+    }
+}
+
+impl TryFrom<grpc::create_vector_name_request::VectorConfig>
+    for segment::data_types::vector_name_config::VectorNameConfig
+{
+    type Error = Status;
+
+    fn try_from(
+        config: grpc::create_vector_name_request::VectorConfig,
+    ) -> Result<Self, Self::Error> {
+        use segment::data_types::vector_name_config::{
+            DenseVectorConfig, SparseVectorConfig, VectorNameConfig,
+        };
+
+        match config {
+            grpc::create_vector_name_request::VectorConfig::DenseConfig(p) => {
+                let grpc::DenseVectorCreationConfig {
+                    size,
+                    distance,
+                    multivector_config,
+                    datatype,
+                } = p;
+
+                Ok(VectorNameConfig::dense(DenseVectorConfig {
+                    size: size as usize,
+                    distance: from_grpc_dist(distance)?,
+                    multivector_config: multivector_config.map(|c| c.try_into()).transpose()?,
+                    datatype: convert_datatype_from_proto(datatype)?,
+                }))
+            }
+            grpc::create_vector_name_request::VectorConfig::SparseConfig(p) => {
+                let grpc::SparseVectorCreationConfig { modifier, datatype } = p;
+
+                Ok(VectorNameConfig::sparse(SparseVectorConfig {
+                    modifier: modifier
+                        .map(|m| {
+                            grpc::Modifier::try_from(m).map_err(|_| {
+                                Status::invalid_argument(format!(
+                                    "Cannot convert sparse modifier: {m}"
+                                ))
+                            })
+                        })
+                        .transpose()?
+                        .map(Modifier::from),
+                    datatype: convert_datatype_from_proto(datatype)?,
+                }))
+            }
+        }
+    }
+}
+
+fn convert_datatype_from_proto(
+    datatype: Option<i32>,
+) -> Result<Option<VectorStorageDatatype>, Status> {
+    let Some(dt) = datatype else {
+        return Ok(None);
+    };
+    let grpc_dt = grpc::Datatype::try_from(dt)
+        .map_err(|_| Status::invalid_argument(format!("Cannot convert datatype: {dt}")))?;
+    match grpc_dt {
+        grpc::Datatype::Default => Ok(None),
+        grpc::Datatype::Float32 => Ok(Some(VectorStorageDatatype::Float32)),
+        grpc::Datatype::Float16 => Ok(Some(VectorStorageDatatype::Float16)),
+        grpc::Datatype::Uint8 => Ok(Some(VectorStorageDatatype::Uint8)),
+        grpc::Datatype::Turbo4 => Ok(Some(VectorStorageDatatype::Turbo4)),
+    }
+}
+
+impl From<segment::data_types::vector_name_config::VectorNameConfig>
+    for grpc::create_vector_name_request::VectorConfig
+{
+    fn from(config: segment::data_types::vector_name_config::VectorNameConfig) -> Self {
+        use segment::data_types::vector_name_config::{
+            DenseVectorConfig, DenseVectorNameConfig, SparseVectorConfig, SparseVectorNameConfig,
+            VectorNameConfig,
+        };
+        use segment::types::Distance;
+
+        match config {
+            VectorNameConfig::Dense(DenseVectorNameConfig {
+                dense:
+                    DenseVectorConfig {
+                        size,
+                        distance,
+                        multivector_config,
+                        datatype,
+                    },
+            }) => {
+                let distance = match distance {
+                    Distance::Cosine => grpc::Distance::Cosine,
+                    Distance::Euclid => grpc::Distance::Euclid,
+                    Distance::Dot => grpc::Distance::Dot,
+                    Distance::Manhattan => grpc::Distance::Manhattan,
+                };
+                grpc::create_vector_name_request::VectorConfig::DenseConfig(
+                    grpc::DenseVectorCreationConfig {
+                        size: size as u64,
+                        distance: i32::from(distance),
+                        multivector_config: multivector_config.map(grpc::MultiVectorConfig::from),
+                        datatype: datatype.map(|dt| i32::from(datatype_to_grpc(dt))),
+                    },
+                )
+            }
+            VectorNameConfig::Sparse(SparseVectorNameConfig {
+                sparse: SparseVectorConfig { modifier, datatype },
+            }) => grpc::create_vector_name_request::VectorConfig::SparseConfig(
+                grpc::SparseVectorCreationConfig {
+                    modifier: modifier.map(|m| i32::from(grpc::Modifier::from(m))),
+                    datatype: datatype.map(|dt| i32::from(datatype_to_grpc(dt))),
+                },
+            ),
+        }
+    }
+}
+
+fn datatype_to_grpc(dt: VectorStorageDatatype) -> grpc::Datatype {
+    match dt {
+        VectorStorageDatatype::Float32 => grpc::Datatype::Float32,
+        VectorStorageDatatype::Float16 => grpc::Datatype::Float16,
+        VectorStorageDatatype::Uint8 => grpc::Datatype::Uint8,
+        VectorStorageDatatype::Turbo4 => grpc::Datatype::Turbo4,
     }
 }

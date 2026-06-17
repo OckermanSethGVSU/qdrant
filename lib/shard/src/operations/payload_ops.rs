@@ -1,12 +1,12 @@
 use std::fmt;
 
-use api::rest::ShardKeySelector;
+#[cfg(feature = "api")]
 use schemars::JsonSchema;
 use segment::json_path::JsonPath;
 use segment::types::{Filter, Payload, PayloadKeyType, PointIdType};
-use serde;
-use serde::{Deserialize, Serialize};
+use serde::{self, Deserialize, Serialize};
 use strum::{EnumDiscriminants, EnumIter};
+#[cfg(feature = "api")]
 use validator::Validate;
 
 /// Define operations description for point payloads manipulation
@@ -27,16 +27,6 @@ pub enum PayloadOps {
 }
 
 impl PayloadOps {
-    pub fn is_write_operation(&self) -> bool {
-        match self {
-            PayloadOps::SetPayload(_) => true,
-            PayloadOps::DeletePayload(_) => false,
-            PayloadOps::ClearPayload { .. } => false,
-            PayloadOps::ClearPayloadByFilter(_) => false,
-            PayloadOps::OverwritePayload(_) => true,
-        }
-    }
-
     pub fn point_ids(&self) -> Option<Vec<PointIdType>> {
         match self {
             Self::SetPayload(op) => op.points.clone(),
@@ -71,6 +61,7 @@ where
 }
 
 /// This data structure is used in API interface and applied across multiple shards
+#[cfg(feature = "api")]
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 #[serde(try_from = "SetPayloadShadow")]
 pub struct SetPayload {
@@ -81,7 +72,7 @@ pub struct SetPayload {
     #[validate(nested)]
     pub filter: Option<Filter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shard_key: Option<ShardKeySelector>,
+    pub shard_key: Option<api::rest::ShardKeySelector>,
     /// Assigns payload to each point that satisfy this path of property
     pub key: Option<JsonPath>,
 }
@@ -103,6 +94,7 @@ pub struct SetPayloadOp {
 }
 
 /// This data structure is used in API interface and applied across multiple shards
+#[cfg(feature = "api")]
 #[derive(Debug, Deserialize, Serialize, JsonSchema, Validate, Clone)]
 #[serde(try_from = "DeletePayloadShadow")]
 pub struct DeletePayload {
@@ -114,7 +106,7 @@ pub struct DeletePayload {
     #[validate(nested)]
     pub filter: Option<Filter>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub shard_key: Option<ShardKeySelector>,
+    pub shard_key: Option<api::rest::ShardKeySelector>,
 }
 
 /// This data structure is used inside shard operations queue
@@ -132,15 +124,17 @@ pub struct DeletePayloadOp {
     pub filter: Option<Filter>,
 }
 
+#[cfg(feature = "api")]
 #[derive(Deserialize)]
 struct SetPayloadShadow {
     pub payload: Payload,
     pub points: Option<Vec<PointIdType>>,
     pub filter: Option<Filter>,
-    pub shard_key: Option<ShardKeySelector>,
+    pub shard_key: Option<api::rest::ShardKeySelector>,
     pub key: Option<JsonPath>,
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<SetPayloadShadow> for SetPayload {
     type Error = PointsSelectorValidationError;
 
@@ -167,14 +161,16 @@ impl TryFrom<SetPayloadShadow> for SetPayload {
     }
 }
 
+#[cfg(feature = "api")]
 #[derive(Deserialize)]
 struct DeletePayloadShadow {
     pub keys: Vec<PayloadKeyType>,
     pub points: Option<Vec<PointIdType>>,
     pub filter: Option<Filter>,
-    pub shard_key: Option<ShardKeySelector>,
+    pub shard_key: Option<api::rest::ShardKeySelector>,
 }
 
+#[cfg(feature = "api")]
 impl TryFrom<DeletePayloadShadow> for DeletePayload {
     type Error = PointsSelectorValidationError;
 
@@ -209,6 +205,8 @@ impl fmt::Display for PointsSelectorValidationError {
 
 #[cfg(test)]
 mod tests {
+    #![expect(clippy::wildcard_enum_match_arm, reason = "test code")]
+
     use segment::types::{Payload, PayloadContainer};
     use serde_json::Value;
 

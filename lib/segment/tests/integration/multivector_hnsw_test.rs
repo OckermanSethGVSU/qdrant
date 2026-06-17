@@ -5,16 +5,19 @@ use atomic_refcell::AtomicRefCell;
 use common::budget::ResourcePermit;
 use common::counter::hardware_counter::HardwareCounterCell;
 use common::flags::FeatureFlags;
+use common::mmap::AdviceSetting;
+use common::progress_tracker::ProgressTracker;
 use rand::SeedableRng;
 use rand::prelude::StdRng;
 use segment::data_types::vectors::{
     DEFAULT_VECTOR_NAME, MultiDenseVectorInternal, QueryVector, TypedMultiDenseVectorRef,
     VectorElementType, VectorRef, only_default_vector,
 };
-use segment::entry::entry_point::SegmentEntry;
+use segment::entry::{NonAppendableSegmentEntry, SegmentEntry};
 use segment::fixtures::index_fixtures::random_vector;
 use segment::fixtures::payload_fixtures::random_int_payload;
-use segment::index::VectorIndex;
+use segment::id_tracker::IdTrackerRead;
+use segment::index::VectorIndexRead;
 use segment::index::hnsw_index::hnsw::{HNSWIndex, HnswIndexOpenArgs};
 use segment::json_path::JsonPath;
 use segment::payload_json;
@@ -25,7 +28,7 @@ use segment::types::{
     PayloadSchemaType, SeqNumberType,
 };
 use segment::vector_storage::VectorStorage;
-use segment::vector_storage::multi_dense::appendable_mmap_multi_dense_vector_storage::open_appendable_in_ram_multi_vector_storage_full;
+use segment::vector_storage::multi_dense::appendable_mmap_multi_dense_vector_storage::open_appendable_memmap_multi_vector_storage_full;
 use tempfile::Builder;
 
 #[test]
@@ -55,11 +58,13 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
         .unwrap();
 
     let dir = Builder::new().prefix("storage_dir").tempdir().unwrap();
-    let mut multi_storage = open_appendable_in_ram_multi_vector_storage_full(
+    let mut multi_storage = open_appendable_memmap_multi_vector_storage_full(
         dir.path(),
         dim,
         distance,
         MultiVectorConfig::default(),
+        AdviceSetting::Global,
+        true,
     )
     .unwrap();
 
@@ -109,7 +114,7 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
         max_indexing_threads: 2,
         on_disk: Some(false),
         payload_m: None,
-        copy_vectors: None,
+        inline_storage: None,
     };
 
     // single threaded mode to guarantee equivalency between single and multi hnsw
@@ -124,7 +129,7 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
             vector_storage: vector_storage.clone(),
             quantized_vectors: quantized_vectors.clone(),
             payload_index: segment.payload_index.clone(),
-            hnsw_config: hnsw_config.clone(),
+            hnsw_config,
         },
         VectorIndexBuildArgs {
             permit: permit.clone(),
@@ -134,6 +139,7 @@ fn test_single_multi_and_dense_hnsw_equivalency() {
             stopped: &stopped,
             hnsw_global_config: &HnswGlobalConfig::default(),
             feature_flags: FeatureFlags::default(),
+            progress: ProgressTracker::new_for_test(),
         },
     )
     .unwrap();

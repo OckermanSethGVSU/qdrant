@@ -16,7 +16,7 @@ FROM --platform=${BUILDPLATFORM:-linux/amd64} tonistiigi/xx AS xx
 # Note: using bookworm base image to match GPU runtime image, otherwise we're
 # seeing runtime errors due to libc version mismatch.
 # See: <https://github.com/qdrant/qdrant/pull/7334>
-FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.90-bookworm  AS chef
+FROM --platform=${BUILDPLATFORM:-linux/amd64} lukemathwalker/cargo-chef:latest-rust-1.96.0-bookworm  AS chef
 
 
 FROM chef AS planner
@@ -41,7 +41,8 @@ COPY --from=xx / /
 
 RUN apt-get update \
     && apt-get install -y clang lld cmake protobuf-compiler jq \
-    && rustup component add rustfmt
+    && rustup component add rustfmt \
+    && cargo install cargo-sbom
 
 # `ARG`/`ENV` pair is a workaround for `docker build` backward-compatibility.
 #
@@ -49,7 +50,7 @@ RUN apt-get update \
 ARG BUILDPLATFORM
 ENV BUILDPLATFORM=${BUILDPLATFORM:-linux/amd64}
 
-ARG MOLD_VERSION=2.36.0
+ARG MOLD_VERSION=2.41.0
 
 RUN case "$BUILDPLATFORM" in \
         */amd64 ) PLATFORM=x86_64 ;; \
@@ -85,13 +86,22 @@ ARG RUSTFLAGS
 # Select linker (e.g., `mold`, `lld` or an empty string for the default linker)
 ARG LINKER=mold
 
+# Select target CPU; use `rustc --print target-cpus` to see available values
+ARG TARGET_CPU
+
+# Select jemalloc's allocator page size
+#
+# Specified as base 2 log, e.g.:
+# 12 = 2^12 = 4k
+# 14 = 2^14 = 16k
+# 16 = 2^16 = 64k
+#
+# https://github.com/tikv/jemallocator/tree/main/jemalloc-sys#environment-variables
+# https://github.com/jemalloc/jemalloc/blob/dev/INSTALL.md?plain=1#L225-L232
+ARG JEMALLOC_SYS_WITH_LG_PAGE
+
 # Enable GPU support
 ARG GPU
-
-# Download and extract web UI
-COPY tools/ tools/
-COPY docs/ docs/
-RUN mkdir /static && STATIC_DIR=/static ./tools/sync-web-ui.sh
 
 COPY --from=planner /qdrant/recipe.json recipe.json
 # `PKG_CONFIG=...` is a workaround for `xx-cargo` bug for crates using `pkg-config`!
@@ -100,7 +110,8 @@ COPY --from=planner /qdrant/recipe.json recipe.json
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
-    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER $RUSTFLAGS" \
+    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
+    ${JEMALLOC_SYS_WITH_LG_PAGE:+env JEMALLOC_SYS_WITH_LG_PAGE="${JEMALLOC_SYS_WITH_LG_PAGE}"} \
     xx-cargo chef cook --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --recipe-path recipe.json
 
 COPY . .
@@ -112,13 +123,18 @@ ARG GIT_COMMIT_ID
 # https://github.com/tonistiigi/xx/pull/108
 RUN PKG_CONFIG="/usr/bin/$(xx-info)-pkg-config" \
     PATH="$PATH:/opt/mold/bin" \
-    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER $RUSTFLAGS" \
+    RUSTFLAGS="${LINKER:+-C link-arg=-fuse-ld=}$LINKER ${TARGET_CPU:+-C target-cpu=}$TARGET_CPU $RUSTFLAGS" \
+    ${JEMALLOC_SYS_WITH_LG_PAGE:+env JEMALLOC_SYS_WITH_LG_PAGE="${JEMALLOC_SYS_WITH_LG_PAGE}"} \
     xx-cargo build --profile $PROFILE ${FEATURES:+--features} $FEATURES --features=stacktrace ${GPU:+--features=gpu} --bin qdrant \
     && PROFILE_DIR=$(if [ "$PROFILE" = dev ]; then echo debug; else echo $PROFILE; fi) \
     && mv target/$(xx-cargo --print-target-triple)/$PROFILE_DIR/qdrant /qdrant/qdrant
 
-RUN xx-cargo install cargo-sbom && \
-    cargo sbom > qdrant.spdx.json
+# Download and extract web UI
+RUN mkdir /static && STATIC_DIR=/static ./tools/sync-web-ui.sh
+
+# Generate SBOM
+RUN cargo sbom > qdrant.spdx.json
+
 
 # Dockerfile does not support conditional `FROM` directly.
 # To workaround this limitation, we use a multi-stage build with a different base images which have equal name to ARG value.

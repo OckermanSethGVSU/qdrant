@@ -8,7 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  POETRY_VERSION: 2.1.3
+  UV_VERSION: 0.9.17
 
 jobs:
   integration-tests:
@@ -17,29 +17,27 @@ jobs:
 
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: actions/checkout@v5
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.11'
+          python-version: '3.13'
       - name: Install dependencies
         run: |
           sudo apt-get install clang
-          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
-
-          poetry -C tests check --lock
-          poetry -C tests install --no-root
+          curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          uv --project tests lock --check
+          uv --project tests sync
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check" --locked
+        run: cargo build --features "service_debug data-consistency-check staging" --locked
       - name: Run integration tests
-        run: poetry --project tests run bash ./tests/integration-tests.sh
+        run: uv --project tests run bash ./tests/integration-tests.sh
         shell: bash
 
   integration-tests-consensus:
@@ -47,36 +45,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: actions/checkout@v5
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
-      - uses: Swatinem/rust-cache@v2
+        uses: ./.github/actions/setup-protoc
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
       - name: Install dependencies
         run: sudo apt-get install clang
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.11'
-      - name: Install dependencies
+          python-version: '3.13'
+      - name: Install uv and Python dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
-
-          poetry -C tests check --lock
-          poetry -C tests install --no-root
+          curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          uv --project tests lock --check
+          uv --project tests sync
       - name: Build
-        run: cargo build --features "service_debug data-consistency-check" --locked
+        run: cargo build --features "service_debug data-consistency-check staging" --locked
       - name: Run integration tests - 1 peer
-        run: poetry --project tests run bash ./tests/integration-tests.sh distributed
+        run: uv --project tests run bash ./tests/integration-tests.sh distributed
         shell: bash
       - name: Run integration tests - multiple peers - pytest
-        run: poetry --project tests run pytest tests/consensus_tests --durations=10
+        run: uv --project tests run pytest -n auto --dist=loadfile -v tests/consensus_tests --durations=10
         timeout-minutes: 60
       - name: upload logs
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: always()
         with:
           path: consensus_test_logs
@@ -88,32 +84,33 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.11'
-      - name: Install dependencies
+          python-version: '3.13'
+      - name: Install uv and Python dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
-
-          poetry -C tests check --lock
-          poetry -C tests install --no-root
+          curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
+          echo "$HOME/.local/bin" >> $GITHUB_PATH
+          uv --project tests lock --check
+          uv --project tests sync
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - name: Docker build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           tags: qdrant_consensus
           cache-from: |
-            type=gha,scope=${{ github.ref }}
-            type=gha,scope=${{ github.base_ref }}
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}
+            type=gha,scope=${{ github.base_ref || github.ref_name }}-consensus
+            type=gha,scope=dev-consensus
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope={0}-consensus', github.ref_name) || '' }}
           load: true
           build-args: |
             PROFILE=ci
+            FEATURES=staging
       - name: Run integration tests - multiple peers - compose
-        run: poetry run bash ./test_restart.sh
+        run: uv --project tests run bash ./test_restart.sh
         working-directory: ./tests/consensus_tests
 
   test-consistency:
@@ -122,17 +119,17 @@ jobs:
 
     steps:
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: actions/checkout@v5
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
       - name: Install dependencies
         run: sudo apt-get install -y clang jq
       - name: Docker build
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: tools/schema2openapi
           tags: schema2openapi
@@ -143,10 +140,9 @@ jobs:
           load: true
           build-args: |
             PROFILE=ci
+            FEATURES=staging
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/setup-protoc
       - name: gRPC file consistency check
         run: ./tests/grpc_consistency_check.sh
       - name: OpenAPI file consistency check
@@ -171,23 +167,21 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
       - name: Install minimal stable
-        uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: integration-tests
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
       - name: Install Protoc
-        uses: arduino/setup-protoc@v3
-        with:
-          repo-token: ${{ secrets.GITHUB_TOKEN }}
+        uses: ./.github/actions/setup-protoc
       - name: Install dependencies
         run: sudo apt-get install clang jq
       - name: Build
-        run: cargo build --bin qdrant --locked
+        run: cargo build --bin qdrant --features "staging" --locked
       - name: Run Shard Snapshot API Tests (local)
         shell: bash
         run: |
-          cargo run &
+          cargo run --features "staging" &
           trap 'kill $(jobs -p) &>/dev/null || :' EXIT
           sleep 10
 
@@ -202,7 +196,7 @@ jobs:
           export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__SECRET_KEY=minioadmin
           export QDRANT__STORAGE__SNAPSHOTS_CONFIG__S3_CONFIG__ENDPOINT_URL=http://127.0.0.1:9000
 
-          cargo run &
+          cargo run --features "staging" &
           trap 'kill $(jobs -p) &>/dev/null || :' EXIT
           sleep 10
 
@@ -229,42 +223,41 @@ jobs:
           AWS_EC2_METADATA_DISABLED: "true"
         run: echo $(aws --endpoint-url http://127.0.0.1:9000/ s3 mb s3://test-bucket)
 
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           lfs: true  # Fetch LFS files automatically
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
-          python-version: '3.11'
+          python-version: '3.13'
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-      - name: Install Poetry
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+      - name: Install uv and Python dependencies
         run: |
-          curl -sSL https://install.python-poetry.org | python3 - --version $POETRY_VERSION
+          curl -LsSf https://astral.sh/uv/$UV_VERSION/install.sh | sh
           echo "$HOME/.local/bin" >> $GITHUB_PATH
-      - name: Install Python dependencies
-        run: |
-          poetry -C tests check --lock
-          poetry -C tests install --no-root
+          uv --project tests lock --check
+          uv --project tests sync
       - name: Build Qdrant Docker image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
         with:
           context: .
           tags: qdrant/qdrant:e2e-tests
           cache-from: |
-            type=gha,scope=${{ github.ref }}-e2e
-            type=gha,scope=${{ github.base_ref }}-e2e
-          cache-to: type=gha,mode=max,scope=${{ github.ref }}-e2e
+            type=gha,scope=${{ github.base_ref || github.ref_name }}-e2e
+            type=gha,scope=dev-e2e
+          cache-to: ${{ github.event_name == 'push' && format('type=gha,mode=max,scope={0}-e2e', github.ref_name) || '' }}
           load: true
           build-args: |
             PROFILE=ci
+            FEATURES=data-consistency-check,staging
       - name: Verify Docker image
         run: docker images | grep qdrant
       - name: Run e2e tests
-        run: poetry --project tests run pytest -n 4 tests/e2e_tests -v --tb=short --durations=5
+        run: uv --project tests run pytest -n 4 --dist=loadgroup tests/e2e_tests -v --tb=short --durations=5 -m "not longrunning"
         shell: bash
-        timeout-minutes: 5
+        timeout-minutes: 20
       - name: Upload test logs on failure
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure()
         with:
           name: e2e-test-logs

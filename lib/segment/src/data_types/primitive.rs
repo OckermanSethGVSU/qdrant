@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 
+use bytemuck::Pod;
 use half::f16;
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
@@ -7,7 +8,9 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use super::named_vectors::CowMultiVector;
 use super::vectors::TypedMultiDenseVector;
-use crate::data_types::vectors::{VectorElementType, VectorElementTypeByte, VectorElementTypeHalf};
+use crate::data_types::vectors::{
+    TypedDenseVector, VectorElementType, VectorElementTypeByte, VectorElementTypeHalf,
+};
 use crate::types::{Distance, QuantizationConfig, VectorStorageDatatype};
 
 pub trait PrimitiveVectorElement
@@ -15,15 +18,20 @@ where
     Self: Copy + Clone + Default + Send + Sync + 'static,
     Self: Serialize + for<'a> Deserialize<'a>,
     Self: FromBytes + Immutable + IntoBytes + KnownLayout,
+    Self: Pod,
 {
+    type QueryType;
+
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]>;
 
     fn slice_to_float_cow(vector: Cow<[Self]>) -> Cow<[VectorElementType]>;
 
+    fn query_from_float_cow(vector: Cow<[VectorElementType]>) -> Self::QueryType;
+
     fn quantization_preprocess<'a>(
         quantization_config: &QuantizationConfig,
         distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]>;
 
     fn datatype() -> VectorStorageDatatype;
@@ -38,6 +46,8 @@ where
 }
 
 impl PrimitiveVectorElement for VectorElementType {
+    type QueryType = TypedDenseVector<Self>;
+
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]> {
         vector
     }
@@ -46,12 +56,16 @@ impl PrimitiveVectorElement for VectorElementType {
         vector
     }
 
+    fn query_from_float_cow(vector: Cow<[VectorElementType]>) -> Self::QueryType {
+        TypedDenseVector::from(vector)
+    }
+
     fn quantization_preprocess<'a>(
         _quantization_config: &QuantizationConfig,
         _distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
-        Cow::Borrowed(vector)
+        vector
     }
 
     fn datatype() -> VectorStorageDatatype {
@@ -72,6 +86,8 @@ impl PrimitiveVectorElement for VectorElementType {
 }
 
 impl PrimitiveVectorElement for VectorElementTypeHalf {
+    type QueryType = TypedDenseVector<Self>;
+
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]> {
         Cow::Owned(vector.iter().map(|&x| f16::from_f32(x)).collect())
     }
@@ -80,10 +96,14 @@ impl PrimitiveVectorElement for VectorElementTypeHalf {
         Cow::Owned(vector.iter().map(|&x| f16::to_f32(x)).collect_vec())
     }
 
+    fn query_from_float_cow(vector: Cow<[VectorElementType]>) -> Self::QueryType {
+        TypedDenseVector::from(vector.iter().map(|&x| f16::from_f32(x)).collect::<Vec<_>>())
+    }
+
     fn quantization_preprocess<'a>(
         _quantization_config: &QuantizationConfig,
         _distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
         Cow::Owned(vector.iter().map(|&x| f16::to_f32(x)).collect_vec())
     }
@@ -122,6 +142,8 @@ impl PrimitiveVectorElement for VectorElementTypeHalf {
 }
 
 impl PrimitiveVectorElement for VectorElementTypeByte {
+    type QueryType = TypedDenseVector<Self>;
+
     fn slice_from_float_cow(vector: Cow<[VectorElementType]>) -> Cow<[Self]> {
         Cow::Owned(vector.iter().map(|&x| x as u8).collect())
     }
@@ -135,13 +157,17 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
         )
     }
 
+    fn query_from_float_cow(vector: Cow<[VectorElementType]>) -> Self::QueryType {
+        TypedDenseVector::from(vector.iter().map(|&x| x as u8).collect::<Vec<_>>())
+    }
+
     fn quantization_preprocess<'a>(
         quantization_config: &QuantizationConfig,
         distance: Distance,
-        vector: &'a [Self],
+        vector: Cow<'a, [Self]>,
     ) -> Cow<'a, [f32]> {
         if let QuantizationConfig::Binary(_) = quantization_config {
-            Cow::from(
+            Cow::Owned(
                 vector
                     .iter()
                     .map(|&x| VectorElementType::from(x) - 127.0)
@@ -152,7 +178,7 @@ impl PrimitiveVectorElement for VectorElementTypeByte {
                 .iter()
                 .map(|&x| VectorElementType::from(x))
                 .collect_vec();
-            Cow::from(distance.preprocess_vector::<VectorElementType>(vector))
+            Cow::Owned(distance.preprocess_vector::<VectorElementType>(vector))
         }
     }
 
